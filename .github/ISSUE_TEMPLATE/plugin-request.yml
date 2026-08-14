@@ -1,0 +1,32 @@
+name: Plugin request
+description: Suggest a user problem that a community plugin could solve.
+title: "[Plugin request] "
+labels: ["plugin-request"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: User problem
+      description: Describe the recurring task or missing integration without prescribing an implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: example
+    attributes:
+      label: Example prompt and expected result
+    validations:
+      required: true
+  - type: textarea
+    id: systems
+    attributes:
+      label: External systems or data
+      description: List accounts, APIs, local tools, sensitive data, and likely network destinations.
+    validations:
+      required: true
+  - type: checkboxes
+    id: public
+    attributes:
+      label: Public information
+      options:
+        - label: I removed credentials, private URLs, personal data, and confidential product information.
+          required: true

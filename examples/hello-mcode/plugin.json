@@ -1,0 +1,11 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "hello-mcode",
+  "version": "0.1.0",
+  "description": "A minimal Skill-only plugin for testing MiniMax Code plugin packaging.",
+  "author": {
+    "name": "MCode Plugins contributors"
+  },
+  "license": "Apache-2.0",
+  "keywords": ["mcode", "example", "skill"]
+}

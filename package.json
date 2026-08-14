@@ -1,0 +1,18 @@
+{
+  "name": "mcode-plugins-registry",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Community registry and contribution toolkit for MiniMax Code plugins.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "add": "node scripts/add-plugin.mjs",
+    "check": "npm run validate && npm test",
+    "test": "node --test",
+    "validate": "node scripts/validate.mjs",
+    "verify": "node scripts/verify-plugin.mjs"
+  },
+  "license": "Apache-2.0"
+}

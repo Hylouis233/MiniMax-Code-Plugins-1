@@ -1,0 +1,11 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "hello-mcode-mcp",
+  "version": "0.1.0",
+  "description": "A dependency-free stdio MCP example for MiniMax Code plugin authors.",
+  "author": {
+    "name": "MCode Plugins contributors"
+  },
+  "license": "Apache-2.0",
+  "keywords": ["mcode", "example", "mcp"]
+}
