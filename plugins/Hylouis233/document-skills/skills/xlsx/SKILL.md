@@ -1,0 +1,63 @@
+---
+name: xlsx
+description: Read, edit, create, or fix spreadsheet files - .xlsx, .xlsm, .xltx, .csv, .tsv. Use this Skill whenever a spreadsheet is the primary input or output: opening and inspecting workbooks, editing cells or adding sheets, writing real formulas instead of pasted values, cleaning messy data, adding charts and formatting, converting between tabular formats, or diagnosing corrupted or slow-opening files.
+---
+
+# XLSX workbench
+
+Spreadsheets are where agents do the most damage by being clever: pasted values where formulas
+belong, dates written as text, whole-number floats displayed as `3.0000000001`. Follow the
+contracts below.
+
+## Step 0 - Check the toolchain
+
+```bash
+python -c "import openpyxl; print(openpyxl.__version__)"
+```
+
+- `.csv`/`.tsv` -> standard library `csv` module is fine and often better (streaming).
+- `.xlsx`/`.xlsm`/`.xltx` -> openpyxl.
+- Macro preservation: openpyxl keeps VBA in `.xlsm` only with `keep_vba=True` on load and save.
+
+## Step 1 - Classify the task
+
+| Request | Route |
+|---|---|
+| Open, inspect, profile a workbook | [references/read.md](references/read.md) |
+| Edit cells, add sheets, fix formatting | [references/edit.md](references/edit.md) |
+| Build a new workbook (data + formulas + chart) | [references/create.md](references/create.md) |
+| CSV/TSV in or out, messy data cleanup | [references/csv.md](references/csv.md) |
+
+## Step 2 - Contracts that always apply
+
+1. **Formulas are formulas.** If the user asks for a total/average/lookup, write `=SUM(B2:B10)`
+   in the cell - never the computed number - unless the user explicitly asked to freeze values.
+   openpyxl writes the formula; Excel/WPS/LibreOffice calculate on open.
+2. **`data_only=True` reads cached values** (last calculated by a real app) and **loses
+   formulas on save**. Use it only for reading values; never load, edit, and save with it.
+3. **Types**: write `int`/`float`/`datetime`/`bool`, never formatted strings. Dates go in as
+   `datetime` with `number_format='yyyy-mm-dd'`; currency as float plus
+   `number_format='#,##0.00'` (or the locale-appropriate currency format string).
+4. **Formulas are not recalculated by openpyxl.** After writing formulas you cannot read their
+   results back without opening the file in a real spreadsheet app; verify formula strings and
+   ranges structurally instead (see postcheck).
+5. **Dimensions**: `ws.max_row`/`ws.max_column` reflect used range - trust them over guesses;
+   but scan for trailing blank-but-formatted rows when a file "looks" bigger than its data.
+6. Save to a new path first; overwrite only on explicit request.
+
+## Step 3 - Postcheck (mandatory)
+
+```python
+import openpyxl
+wb = openpyxl.load_workbook("output.xlsx")
+print("sheets:", wb.sheetnames)
+ws = wb["Summary"]
+print("dims:", ws.dimensions)
+formulas = [(c.coordinate, c.value) for row in ws.iter_rows() for c in row
+            if isinstance(c.value, str) and c.value.startswith("=")]
+print("formula cells:", formulas[:10])
+```
+
+Confirm: expected sheet names exist; used range matches expectations; intended formula cells
+contain formula strings; number formats survive. Report what was verified and note that final
+rendered values require opening in a spreadsheet application.
