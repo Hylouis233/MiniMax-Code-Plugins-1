@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="360" viewBox="0 0 1200 360" role="img" aria-labelledby="title desc">
+  <title id="title">MiniMax Code Plugins</title>
+  <desc id="desc">One folder, one pull request, a new agent superpower.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#090b18"/>
+      <stop offset="0.48" stop-color="#16122d"/>
+      <stop offset="1" stop-color="#071b25"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#8b5cf6"/>
+      <stop offset="0.5" stop-color="#ec4899"/>
+      <stop offset="1" stop-color="#22d3ee"/>
+    </linearGradient>
+    <filter id="glow" x="-100%" y="-100%" width="300%" height="300%">
+      <feGaussianBlur stdDeviation="9" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M32 0H0V32" fill="none" stroke="#ffffff" stroke-opacity="0.035"/>
+    </pattern>
+  </defs>
+  <rect width="1200" height="360" rx="24" fill="url(#bg)"/>
+  <rect width="1200" height="360" rx="24" fill="url(#grid)"/>
+  <circle cx="108" cy="72" r="90" fill="#8b5cf6" fill-opacity="0.13" filter="url(#glow)"/>
+  <circle cx="1100" cy="280" r="120" fill="#22d3ee" fill-opacity="0.1" filter="url(#glow)"/>
+  <path d="M120 272C278 210 330 298 454 226S710 113 832 184s168 40 250-26" fill="none" stroke="url(#accent)" stroke-width="2" stroke-opacity="0.55"/>
+  <g filter="url(#glow)">
+    <circle cx="120" cy="272" r="6" fill="#8b5cf6"/>
+    <circle cx="454" cy="226" r="6" fill="#ec4899"/>
+    <circle cx="832" cy="184" r="6" fill="#22d3ee"/>
+    <circle cx="1082" cy="158" r="6" fill="#34d399"/>
+  </g>
+  <text x="600" y="128" text-anchor="middle" fill="#f8fafc" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="56" font-weight="760" letter-spacing="-2">MiniMax Code Plugins</text>
+  <text x="600" y="174" text-anchor="middle" fill="#b9c2d0" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="21">One folder. One pull request. A new agent superpower.</text>
+  <g font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="13" font-weight="700" letter-spacing="1.4">
+    <rect x="418" y="212" width="104" height="38" rx="19" fill="#8b5cf6" fill-opacity="0.16" stroke="#a78bfa" stroke-opacity="0.65"/>
+    <text x="470" y="236" text-anchor="middle" fill="#c4b5fd">SKILLS</text>
+    <rect x="542" y="212" width="92" height="38" rx="19" fill="#ec4899" fill-opacity="0.14" stroke="#f472b6" stroke-opacity="0.62"/>
+    <text x="588" y="236" text-anchor="middle" fill="#f9a8d4">MCP</text>
+    <rect x="654" y="212" width="128" height="38" rx="19" fill="#22d3ee" fill-opacity="0.12" stroke="#67e8f9" stroke-opacity="0.58"/>
+    <text x="718" y="236" text-anchor="middle" fill="#a5f3fc">OPEN SOURCE</text>
+  </g>
+  <rect x="1" y="1" width="1198" height="358" rx="23" fill="none" stroke="#ffffff" stroke-opacity="0.09" stroke-width="2"/>
+</svg>

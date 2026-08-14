@@ -5,19 +5,8 @@ export const PLUGIN_SCHEMA = 'https://agent-plugins.org/schemas/1.0.0/plugin.sch
 export const MCP_SCHEMA = 'https://agent-plugins.org/schemas/1.0.0/mcp.schema.json';
 
 const PLUGIN_NAME = /^(?!.*(?:--|\.\.))[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/u;
+const OWNER_NAME = /^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$/u;
 const SKILL_NAME = /^(?!.*--)[a-z0-9]+(?:-[a-z0-9]+)*$/u;
-const SHA = /^[0-9a-f]{40}$/u;
-const GITHUB_REPOSITORY = /^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u;
-const CATEGORIES = new Set([
-  'coding',
-  'data',
-  'design',
-  'developer-tools',
-  'productivity',
-  'research',
-  'other',
-]);
-const PLATFORMS = new Set(['macos', 'windows', 'linux']);
 const PLUGIN_FIELDS = new Set([
   '$schema',
   'name',
@@ -113,51 +102,6 @@ export function validateMcp(value, label = 'mcp.json') {
   return entries.map(([name]) => name).sort();
 }
 
-function stringArray(value, label, { min = 0, allowed } = {}) {
-  assert(Array.isArray(value) && value.length >= min, `${label}: must be an array with at least ${min} item(s)`);
-  assert(value.every((item) => typeof item === 'string' && item.length > 0), `${label}: must contain non-empty strings`);
-  assert(new Set(value).size === value.length, `${label}: duplicate values are not allowed`);
-  if (allowed) assert(value.every((item) => allowed.has(item)), `${label}: contains an unsupported value`);
-}
-
-export function validateRegistryEntry(value, label = 'registry entry') {
-  assert(isRecord(value), `${label}: root must be an object`);
-  const fields = new Set(['schemaVersion', 'name', 'repository', 'commit', 'path', 'summary', 'license', 'maintainers', 'categories', 'capabilities', 'requirements', 'dataAndNetwork', 'lifecycle']);
-  assert(Object.keys(value).every((key) => fields.has(key)), `${label}: unknown field`);
-  assert(Object.keys(value).length === fields.size, `${label}: required fields are missing`);
-  assert(value.schemaVersion === 1, `${label}: schemaVersion must be 1`);
-  assert(typeof value.name === 'string' && PLUGIN_NAME.test(value.name) && value.name.length <= 64, `${label}: invalid name`);
-  assert(typeof value.repository === 'string' && GITHUB_REPOSITORY.test(value.repository), `${label}: repository must be a canonical public GitHub URL`);
-  assert(typeof value.commit === 'string' && SHA.test(value.commit), `${label}: commit must be a full lowercase SHA`);
-  assert(typeof value.path === 'string' && (value.path === '.' || /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9._/-]+$/u.test(value.path)), `${label}: invalid plugin path`);
-  assert(typeof value.summary === 'string' && value.summary.length >= 20 && value.summary.length <= 280, `${label}: summary must be 20-280 characters`);
-  assert(typeof value.license === 'string' && value.license.length >= 1 && value.license.length <= 100, `${label}: license is required`);
-  stringArray(value.maintainers, `${label}.maintainers`, { min: 1 });
-  stringArray(value.categories, `${label}.categories`, { min: 1, allowed: CATEGORIES });
-  assert(isRecord(value.capabilities), `${label}.capabilities: must be an object`);
-  assert(Object.keys(value.capabilities).sort().join(',') === 'mcpServers,skills', `${label}.capabilities: requires only mcpServers and skills`);
-  stringArray(value.capabilities.skills, `${label}.capabilities.skills`);
-  stringArray(value.capabilities.mcpServers, `${label}.capabilities.mcpServers`);
-  assert(value.capabilities.skills.length + value.capabilities.mcpServers.length > 0, `${label}: at least one MCode capability is required`);
-  assert(isRecord(value.requirements), `${label}.requirements: must be an object`);
-  assert(Object.keys(value.requirements).sort().join(',') === 'accounts,executables,platforms', `${label}.requirements: invalid fields`);
-  stringArray(value.requirements.executables, `${label}.requirements.executables`);
-  stringArray(value.requirements.accounts, `${label}.requirements.accounts`);
-  stringArray(value.requirements.platforms, `${label}.requirements.platforms`, { min: 1, allowed: PLATFORMS });
-  assert(isRecord(value.dataAndNetwork), `${label}.dataAndNetwork: must be an object`);
-  assert(Object.keys(value.dataAndNetwork).sort().join(',') === 'dataHandled,destinations,networkAccess', `${label}.dataAndNetwork: invalid fields`);
-  assert(typeof value.dataAndNetwork.networkAccess === 'boolean', `${label}.dataAndNetwork.networkAccess: must be boolean`);
-  stringArray(value.dataAndNetwork.destinations, `${label}.dataAndNetwork.destinations`);
-  stringArray(value.dataAndNetwork.dataHandled, `${label}.dataAndNetwork.dataHandled`);
-  assert(value.dataAndNetwork.networkAccess || value.dataAndNetwork.destinations.length === 0, `${label}: destinations require networkAccess=true`);
-  assert(isRecord(value.lifecycle), `${label}.lifecycle: must be an object`);
-  assert(Object.keys(value.lifecycle).sort().join(',') === 'disableBehavior,uninstallBehavior', `${label}.lifecycle: invalid fields`);
-  for (const key of ['disableBehavior', 'uninstallBehavior']) {
-    assert(typeof value.lifecycle[key] === 'string' && value.lifecycle[key].length >= 20 && value.lifecycle[key].length <= 500, `${label}.lifecycle.${key}: must be 20-500 characters`);
-  }
-  return value;
-}
-
 function isBareCommand(value) {
   return !/[\\/]/u.test(value);
 }
@@ -205,4 +149,40 @@ export async function validatePluginDirectory(root) {
   }
   assert(skills.length + mcpServers.length > 0, `${root}: plugin must expose at least one Skill or MCP server`);
   return { manifest, skills: skills.sort(), mcpServers };
+}
+
+export async function validateHostedPluginDirectory(root, { owner, pluginName }) {
+  assert(OWNER_NAME.test(owner), `${root}: invalid GitHub owner directory ${owner}`);
+  assert(PLUGIN_NAME.test(pluginName) && pluginName.length <= 64, `${root}: invalid Plugin directory ${pluginName}`);
+  await assertNoSymlinks(root);
+  const result = await validatePluginDirectory(root);
+  assert(result.manifest.name === pluginName, `${root}: plugin.json name must equal directory name ${pluginName}`);
+  assert(typeof result.manifest.license === 'string' && result.manifest.license.length > 0, `${root}: plugin.json must declare a license`);
+  for (const file of ['README.md', 'LICENSE']) {
+    const contents = await readFile(path.join(root, file), 'utf8');
+    assert(contents.trim().length > 0, `${root}: ${file} must not be empty`);
+  }
+  for (const file of await listTextContractFiles(root)) {
+    const contents = await readFile(file, 'utf8');
+    assert(!/\bTODO\b/u.test(contents), `${file}: replace every TODO before submission`);
+  }
+  return { id: `${owner}/${pluginName}`, ...result };
+}
+
+async function assertNoSymlinks(root) {
+  for (const child of await readdir(root, { withFileTypes: true })) {
+    const file = path.join(root, child.name);
+    assert(!child.isSymbolicLink(), `${file}: symlinks are not allowed in hosted Plugins`);
+    if (child.isDirectory()) await assertNoSymlinks(file);
+  }
+}
+
+async function listTextContractFiles(root) {
+  const files = [];
+  for (const child of await readdir(root, { withFileTypes: true })) {
+    const file = path.join(root, child.name);
+    if (child.isDirectory()) files.push(...await listTextContractFiles(file));
+    else if (child.isFile() && (child.name.endsWith('.md') || ['plugin.json', 'mcp.json'].includes(child.name))) files.push(file);
+  }
+  return files;
 }

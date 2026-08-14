@@ -1,35 +1,38 @@
-import { readdir, readFile } from 'node:fs/promises';
+import { readdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { parseJson, validatePluginDirectory, validateRegistryEntry } from './lib/validation.mjs';
+import { validateHostedPluginDirectory, validatePluginDirectory } from './lib/validation.mjs';
 
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const rootOption = process.argv.indexOf('--root');
+const root = rootOption === -1
+  ? path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+  : path.resolve(process.argv[rootOption + 1] ?? '');
 const failures = [];
-const identities = new Set();
+let hostedPluginCount = 0;
 
-for (const child of await readdir(path.join(root, 'examples'), { withFileTypes: true })) {
+for (const child of await readDirectory(path.join(root, 'examples'))) {
   if (!child.isDirectory()) continue;
   await check(`example ${child.name}`, () => validatePluginDirectory(path.join(root, 'examples', child.name)));
 }
 
-for (const child of await readdir(path.join(root, 'registry'), { withFileTypes: true })) {
-  if (!child.isFile() || !child.name.endsWith('.json')) continue;
-  await check(`registry/${child.name}`, async () => {
-    const file = path.join(root, 'registry', child.name);
-    const entry = validateRegistryEntry(parseJson(await readFile(file, 'utf8'), file), file);
-    if (child.name !== `${entry.name}.json`) throw new Error(`${file}: filename must match plugin name`);
-    const identity = `${entry.repository}#${entry.path}`.toLowerCase();
-    if (identities.has(identity)) throw new Error(`${file}: duplicate repository and path`);
-    identities.add(identity);
-  });
+for (const owner of await readDirectory(path.join(root, 'plugins'))) {
+  if (!owner.isDirectory()) continue;
+  for (const plugin of await readDirectory(path.join(root, 'plugins', owner.name))) {
+    if (!plugin.isDirectory()) continue;
+    await check(`plugin ${owner.name}/${plugin.name}`, () => validateHostedPluginDirectory(
+      path.join(root, 'plugins', owner.name, plugin.name),
+      { owner: owner.name, pluginName: plugin.name },
+    ));
+    hostedPluginCount += 1;
+  }
 }
 
 if (failures.length > 0) {
   for (const failure of failures) console.error(`FAIL ${failure}`);
   process.exitCode = 1;
 } else {
-  console.log(`Validated examples and ${identities.size} registry entr${identities.size === 1 ? 'y' : 'ies'}.`);
+  console.log(`Validated ${hostedPluginCount} hosted Plugin${hostedPluginCount === 1 ? '' : 's'} and all examples.`);
 }
 
 async function check(label, task) {
@@ -38,5 +41,14 @@ async function check(label, task) {
     console.log(`OK   ${label}`);
   } catch (error) {
     failures.push(error.message);
+  }
+}
+
+async function readDirectory(directory) {
+  try {
+    return await readdir(directory, { withFileTypes: true });
+  } catch (error) {
+    if (error.code === 'ENOENT') return [];
+    throw error;
   }
 }

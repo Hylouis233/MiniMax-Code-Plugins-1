@@ -1,102 +1,123 @@
-# MCode Plugins
+<p align="center">
+  <img src="assets/hero.svg" alt="MiniMax Code Plugins — one folder, one pull request, a new agent superpower" width="100%" />
+</p>
 
-[简体中文](README.zh-CN.md)
+<p align="center">
+  <a href="README.zh-CN.md">简体中文</a> ·
+  <a href="CONTRIBUTING.md">Contribute</a> ·
+  <a href="docs/plugin-compatibility.md">Plugin contract</a> ·
+  <a href="SECURITY.md">Security</a>
+</p>
 
-MCode Plugins is the community registry and contribution toolkit for plugins that run in MiniMax
-Code. Plugin authors keep their source and release history in their own GitHub repositories. This
-repository provides a searchable catalog, a pinned and reviewable submission format, offline
-validation, compatibility guidance, and a shared contribution process.
+<p align="center">
+  <a href="https://github.com/hetaoBackend/MiniMax-Code-Plugins/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/hetaoBackend/MiniMax-Code-Plugins/ci.yml?branch=main&amp;style=flat-square&amp;label=build" alt="Build status" /></a>
+  <img src="https://img.shields.io/badge/Agent_Plugins-1.0-8b5cf6?style=flat-square" alt="Agent Plugins 1.0" />
+  <img src="https://img.shields.io/github/license/hetaoBackend/MiniMax-Code-Plugins?style=flat-square&amp;color=22c55e" alt="Apache-2.0 license" />
+  <img src="https://img.shields.io/badge/PRs-welcome-ec4899?style=flat-square" alt="Pull requests welcome" />
+</p>
 
-> Status: community preview. A catalog entry means the package passed automated compatibility
-> checks at the pinned commit. It is not an endorsement, security audit, or guarantee by MiniMax.
+## One folder is the release
 
-## Why this repository exists
-
-A useful plugin ecosystem needs more than a list of links. It needs a complete path from creation to
-real use:
+MiniMax Code Plugins is the community home for Agent Plugins that run in MiniMax Code. Put a
+portable Plugin under `plugins/<github-owner>/<plugin-name>`, open a pull request, and let CI check
+the package users will actually install.
 
 ```text
-create -> validate -> submit -> review -> discover -> install -> feedback -> maintain
+fork  →  create  →  build  →  check  →  pull request  →  discover
 ```
 
-MCode Plugins keeps that path open and auditable:
+No second repository. No catalog JSON. No commit pin to copy. Your Plugin source, docs, review, and
+history live together.
 
-- Authors own their plugin repository, issues, license, and release cadence.
-- Catalog entries pin a full commit SHA, so review and installation refer to immutable source.
-- CI validates the exact MCode-compatible surface instead of inferring support from a README.
-- Capability and security metadata make dependencies and network access visible before install.
-- Users report problems to the plugin author; registry policy issues stay in this repository.
+## Ship your first Plugin
 
-## Supported plugin surface
+```bash
+git clone https://github.com/<you>/MiniMax-Code-Plugins.git
+cd MiniMax-Code-Plugins
+npm install
+npm run create -- <you>/my-first-plugin
+```
 
-The first public contract intentionally stays small:
-
-- `plugin.json` using [Agent Plugins 1.0](https://agent-plugins.org/schemas/1.0.0/plugin.schema.json)
-- zero or more Agent Skills at `skills/<skill-name>/SKILL.md`
-- an optional `mcp.json` with `stdio`, `streamable-http`, or `sse` servers
-
-MiniMax Code does not currently promise Plugin Hooks, custom Agents, Commands, LSP servers, Apps,
-generic OAuth configuration, or arbitrary `extensions`. A cross-client plugin may contain those
-components, but its catalog entry must describe only the capabilities that MCode can load. See
-[Plugin compatibility](docs/plugin-compatibility.md).
-
-## Create a plugin
-
-Start from the Skill-only [`examples/hello-mcode`](examples/hello-mcode) or the dependency-free
-stdio [`examples/hello-mcode-mcp`](examples/hello-mcode-mcp):
+The scaffold gives you a Skill-first Plugin:
 
 ```text
-my-plugin/
+plugins/<you>/my-first-plugin/
 ├── plugin.json
-├── mcp.json                  # optional
+├── README.md
+├── LICENSE
 └── skills/
-    └── my-skill/
+    └── my-first-plugin/
         └── SKILL.md
 ```
 
-Keep the plugin in its own public GitHub repository. Then fork this registry and generate a pinned
-entry:
+Replace every `TODO`, then run:
 
 ```bash
-npm install
-npm run add -- https://github.com/you/my-plugin --path optional/subdirectory
 npm run check
-npm run verify -- registry/my-plugin.json
 ```
 
-The generator resolves the repository's current default-branch commit, reads the package, and writes
-a draft registry entry. Review the generated categories and security metadata before opening a pull
-request.
+If it passes, open one pull request for that Plugin. Start with
+[`CONTRIBUTING.md`](CONTRIBUTING.md) when you want the full review checklist.
 
-## Submit an existing plugin
+## What can a Plugin add?
 
-1. Make the plugin source public and add a recognized open-source license.
-2. Ensure the root (or declared subdirectory) contains a valid `plugin.json`.
-3. Generate a registry entry pinned to a 40-character Git commit SHA.
-4. Run `npm run check` and `npm run verify -- registry/<plugin>.json`.
-5. Open a pull request using the checklist in [CONTRIBUTING.md](CONTRIBUTING.md).
+### Skills
 
-Review focuses on reproducibility, MCode compatibility, transparent dependencies, least privilege,
-and a runnable example. It does not transfer maintenance ownership to the registry maintainers.
+Package reusable instructions, workflows, and domain knowledge. Skills are the fastest path from a
+good prompt pattern to a capability anyone can install.
 
-## Trust model
+### MCP servers
 
-Catalog packages are community code. Read the plugin source and requested capabilities before use.
-Never put credentials directly in `plugin.json`, `mcp.json`, a Skill, or a registry entry. A plugin
-may invoke local executables or remote services; those dependencies remain the plugin author's
-responsibility. See [Security](SECURITY.md) and the [security model](docs/security-model.md).
+Connect MiniMax Code to local tools or remote services with `stdio`, `streamable-http`, or `sse`.
+Dependencies, accounts, network destinations, and data handling must be visible before install.
 
-## Project layout
+### Both
+
+Use a Skill to teach the workflow and MCP to provide the tools. The portable package stays small:
 
 ```text
-registry/      pinned plugin catalog entries
-schemas/       machine-readable registry entry contract
-scripts/       dependency-free validation and submission tools
-examples/      known-good plugin packages
-docs/          compatibility, architecture, governance, and security notes
+plugin-root/
+├── plugin.json
+├── mcp.json                  # optional
+└── skills/                   # optional
 ```
+
+This repository is for **Agent capabilities**. TUI Extensions are a separate system and are not
+loaded from this package format.
+
+## The gate is simple
+
+A contribution must:
+
+- live at `plugins/<github-owner>/<plugin-name>`;
+- include `plugin.json`, `README.md`, and `LICENSE`;
+- expose at least one valid Skill or MCP server;
+- document a copyable example, requirements, network access, and data use;
+- contain no secrets, private endpoints, hidden telemetry, native binaries, or symlinks;
+- pass `npm run check` and human review.
+
+Passing review means the Plugin is available as community software. It is not a MiniMax endorsement
+or a complete security audit. Read the source and requested capabilities before installing.
+
+## Explore the project
+
+- [`plugins/`](plugins/) — community Plugin source
+- [`examples/hello-mcode`](examples/hello-mcode/) — smallest Skill Plugin
+- [`examples/hello-mcode-mcp`](examples/hello-mcode-mcp/) — dependency-free stdio MCP
+- [`docs/plugin-compatibility.md`](docs/plugin-compatibility.md) — exact supported contract
+- [`docs/security-model.md`](docs/security-model.md) — validation and trust model
+- [`docs/architecture.md`](docs/architecture.md) — hosted contribution architecture
+- [`GOVERNANCE.md`](GOVERNANCE.md) — decisions and maintainer responsibilities
+
+## Community preview
+
+The contract is intentionally narrow while MiniMax Code's public Plugin surface stabilizes. Hooks,
+custom Agents, Commands, LSP, Apps, generic OAuth, and TUI Extensions are not advertised as current
+Agent Plugin capabilities.
+
+Bring one useful capability. Make the example undeniable. Ship it in one pull request.
 
 ## License
 
-Registry code and documentation are licensed under Apache-2.0. Every external plugin keeps its own
-license; inclusion in the catalog does not relicense it.
+Repository tooling and documentation use Apache-2.0. Every hosted Plugin includes and declares its
+own open-source license.

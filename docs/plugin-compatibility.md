@@ -6,6 +6,8 @@ MiniMax Code reads the portable subset of Agent Plugins 1.0:
 
 ```text
 plugin-root/
+├── README.md                 # required by this community repository
+├── LICENSE                   # required by this community repository
 ├── plugin.json
 ├── mcp.json                  # optional
 └── skills/
@@ -63,5 +65,6 @@ The following are not currently public MCode Plugin capabilities:
 - generic OAuth setup
 - host-specific fields hidden in `extensions`
 
-Cross-client repositories may contain extra assets, but catalog metadata and examples must not imply
-that MiniMax Code loads unsupported components.
+Hosted contributions may contain extra assets, but documentation must not imply that MiniMax Code
+loads unsupported components. TUI Extensions are a separate product extension system, not an Agent
+Plugin capability.

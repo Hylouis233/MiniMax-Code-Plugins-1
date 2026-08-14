@@ -1,66 +1,66 @@
 # Contributing
 
-Thank you for helping the MCode plugin ecosystem grow. Contributions may improve the registry
-tooling and documentation or submit a plugin that you maintain in another public repository.
+One folder is one Plugin. One pull request is one contribution.
 
-## Submit a plugin
+## 1. Create your Plugin
 
-Your plugin must:
-
-- be hosted in a public GitHub repository;
-- include a recognized open-source license;
-- pin a full 40-character Git commit SHA in the registry entry;
-- use the MCode-compatible Agent Plugins surface documented in
-  [`docs/plugin-compatibility.md`](docs/plugin-compatibility.md);
-- contain no embedded credentials, private endpoints, telemetry without disclosure, installers, or
-  native binaries;
-- document required executables, accounts, paid services, network access, and operating-system
-  limits; and
-- expose at least one Skill or MCP server that a reviewer can understand and exercise.
-
-Generate the first draft instead of writing catalog metadata by hand:
+Fork this repository, install dependencies, and run:
 
 ```bash
 npm install
-npm run add -- https://github.com/<owner>/<repository> --path <plugin-subdirectory>
+npm run create -- <github-owner>/<plugin-name>
 ```
 
-Then edit the generated entry, run:
+The command creates `plugins/<github-owner>/<plugin-name>` with a portable `plugin.json`, README,
+Apache-2.0 license, and starter Skill.
+
+## 2. Make it real
+
+Replace every scaffold `TODO`. Your Plugin must:
+
+- expose at least one Skill or MCP server;
+- use the supported package shape in [`docs/plugin-compatibility.md`](docs/plugin-compatibility.md);
+- include `README.md`, `LICENSE`, and a matching open-source license in `plugin.json`;
+- explain the user problem, an example prompt, and the expected result;
+- disclose required executables, accounts, paid services, platforms, network destinations, and data;
+- contain no credentials, private endpoints, hidden telemetry, installers, native binaries, or symlinks.
+
+Keep source and docs inside your Plugin directory. Do not edit another contributor's Plugin in the
+same pull request.
+
+## 3. Check it
 
 ```bash
 npm run check
-npm run verify -- registry/<plugin-name>.json
 ```
 
-and open a pull request. Include the user problem, an example prompt, expected result, dependencies,
-network destinations, data handled by the plugin, and test evidence. One pull request should add or
-update one plugin unless the entries are inseparable.
+The validator checks the hosted directory, Manifest, Skills, MCP transports, required docs,
+placeholders, and path safety. CI runs the same command.
 
-## Registry review
+## 4. Open the pull request
 
-Reviewers verify the pinned source rather than a mutable branch. Automated checks cover package
-shape and declared capabilities. Human review covers usefulness, clear ownership, dependency and
-data-flow disclosure, obvious credential or supply-chain risks, and whether the example can be
-reproduced.
+Include:
 
-Acceptance means “listed as community software.” It is not an audit or product endorsement. A
-plugin can be removed or marked unavailable if its pinned source disappears, changes ownership
-without explanation, becomes malicious, or is no longer maintained.
+- the problem your Plugin solves;
+- a copyable example prompt;
+- the expected result;
+- dependencies and supported platforms;
+- network and data behavior;
+- automated and manual test evidence.
 
-## Update a plugin
+Review covers usefulness, reproducibility, clear ownership, data flow, dependency risk, and obvious
+supply-chain issues. Acceptance means “available as community software”; it is not a MiniMax
+endorsement or a complete security audit.
 
-Open a pull request that changes the pinned commit and any metadata affected by that release. Include
-a short changelog and rerun both local and remote verification. Never replace source at an existing
-tag to bypass registry review.
+## Update or remove a Plugin
 
-## Improve this repository
+The owner directory identifies the maintainer. Submit changes under the same path and explain user
+impact. A Plugin may be quarantined or removed if it becomes malicious, abandoned, misleading, or
+unsafe.
 
-For validator, schema, example, documentation, or workflow changes:
+## Improve the platform
 
-1. Open an issue for contract-breaking changes.
-2. Keep the change focused and add or update automated tests.
-3. Run `npm run check`.
-4. Explain user impact and migration requirements in the pull request.
+Validator, documentation, example, and workflow changes are welcome. Open an issue before a
+contract-breaking change, add focused tests, and describe migration impact.
 
-Contributions to this repository are licensed under Apache-2.0. External plugin repositories retain
-their own licenses.
+Repository contributions are licensed under Apache-2.0. Each hosted Plugin carries its own license.

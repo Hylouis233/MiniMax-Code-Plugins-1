@@ -1,6 +1,6 @@
 ## What changes
 
-<!-- Describe the plugin or registry/tooling change. -->
+<!-- Name the Plugin or repository tooling change. -->
 
 ## User value
 
@@ -8,13 +8,15 @@
 
 ## Plugin submission checklist
 
-- [ ] Source is public, open-source licensed, and pinned to a full commit SHA.
-- [ ] Declared Skills and MCP servers match the pinned source.
+- [ ] Plugin lives at `plugins/<github-owner>/<plugin-name>`.
+- [ ] `plugin.json` name matches the Plugin directory.
+- [ ] `README.md` includes a real example prompt and expected result.
+- [ ] `LICENSE` and `plugin.json` declare an open-source license.
 - [ ] Required executables, accounts, paid services, and supported platforms are disclosed.
 - [ ] Network destinations and data handled by the plugin are disclosed.
-- [ ] No credentials, private endpoints, installers, or native binaries are included.
+- [ ] No credentials, private endpoints, hidden telemetry, installers, symlinks, or native binaries are included.
+- [ ] Every scaffold `TODO` has been replaced.
 - [ ] `npm run check` passes.
-- [ ] `npm run verify -- registry/<plugin>.json` passes for a registry change.
 
 ## Evidence
 

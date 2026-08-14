@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { validateMcp, validatePluginManifest, validateRegistryEntry, validateSkillText } from '../scripts/lib/validation.mjs';
+import { validateMcp, validatePluginManifest, validateSkillText } from '../scripts/lib/validation.mjs';
 
 test('accepts the portable Agent Plugins manifest', () => {
   const value = validatePluginManifest({
@@ -40,35 +40,5 @@ test('validates supported MCP transports and reserved environment variables', ()
   assert.throws(
     () => validateMcp({ ...base, mcpServers: { local: { type: 'stdio', command: 'node', env: { PLUGIN_ROOT: 'bad' } } } }),
     /env is invalid/u,
-  );
-});
-
-test('requires immutable source and at least one capability in registry entries', () => {
-  const entry = {
-    schemaVersion: 1,
-    name: 'example-plugin',
-    repository: 'https://github.com/example/example-plugin',
-    commit: 'a'.repeat(40),
-    path: '.',
-    summary: 'A useful example plugin for registry tests.',
-    license: 'Apache-2.0',
-    maintainers: ['example'],
-    categories: ['developer-tools'],
-    capabilities: { skills: ['example-skill'], mcpServers: [] },
-    requirements: { executables: [], accounts: [], platforms: ['macos', 'windows', 'linux'] },
-    dataAndNetwork: { networkAccess: false, destinations: [], dataHandled: [] },
-    lifecycle: {
-      disableBehavior: 'Stops exposing the plugin capabilities to future turns.',
-      uninstallBehavior: 'Removes the package while leaving author-owned remote data unchanged.',
-    },
-  };
-  assert.equal(validateRegistryEntry(entry).name, 'example-plugin');
-  assert.throws(
-    () => validateRegistryEntry({ ...entry, commit: 'main' }),
-    /full lowercase SHA/u,
-  );
-  assert.throws(
-    () => validateRegistryEntry({ ...entry, capabilities: { skills: [], mcpServers: [] } }),
-    /at least one MCode capability/u,
   );
 });

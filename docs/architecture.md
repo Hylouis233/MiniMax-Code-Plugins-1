@@ -1,27 +1,25 @@
-# Registry architecture
+# Hosted Plugin architecture
 
-MCode Plugins separates plugin ownership from discovery.
+MiniMax Code Plugins keeps contribution and review in one repository.
 
 ```text
-author repository
-  plugin.json + Skills + optional MCP + license + releases
-          |
-          | immutable repository URL + commit SHA + path
-          v
-MCode Plugins registry
-  metadata -> static validation -> remote source verification -> human review
+plugins/<owner>/<plugin>
+  plugin.json + README + LICENSE + Skills and/or MCP
           |
           v
-catalog consumers / MiniMax Code discovery
+local validation -> pull request CI -> human review
+          |
+          v
+main branch -> catalog consumers / MiniMax Code discovery
 ```
 
-This keeps the contribution path lightweight without turning one repository into the owner of every
-plugin. It also lets reviewers inspect the same immutable source users are told about.
+The hosted directory is the publication unit. Reviewers inspect the exact files that enter `main`;
+contributors do not create a second repository or maintain a separate catalog record.
 
-Registry entries are intentionally declarative. They do not execute plugin code during static
-validation. Remote verification reads `plugin.json`, declared Skill files, and optional `mcp.json`
-from GitHub at the pinned commit. Runtime behavior and external service quality require separate
-review and testing.
+Static validation reads package metadata and text contracts without executing Plugin code. Human
+review covers usefulness, dependencies, data flow, and reproducibility. MCP runtime behavior and
+external service quality still require explicit test evidence.
 
-The initial catalog does not claim a direct production Marketplace publishing API. Consumers may
-use the registry as a source of reviewed metadata while MiniMax Code distribution evolves.
+The first version intentionally optimizes for a low-friction community path. External source
+registries, release mirroring, and Marketplace publishing interfaces can be proposed later without
+changing the portable Agent Plugin package itself.
