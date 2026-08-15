@@ -3,6 +3,7 @@
 ```python
 import openpyxl
 from datetime import date
+from openpyxl.styles import Font
 
 wb = openpyxl.load_workbook("input.xlsx")   # NOT data_only: that would drop all formulas
 ws = wb["Data"]
@@ -24,17 +25,28 @@ summary["B1"] = "Total"
 summary["A2"] = "EU"
 summary["B2"] = "=SUMIF(Data!A:A,A2,Data!C:C)"
 
+header_font = Font(bold=True)
+for row in summary["A1:B1"]:
+    for cell in row:
+        cell.font = header_font
+
+# References to the shifted region may live on any sheet; inspect every formula
+for formula_ws in wb.worksheets:
+    for row in formula_ws.iter_rows():
+        for cell in row:
+            if isinstance(cell.value, str) and cell.value.startswith("="):
+                print(f"{formula_ws.title}!{cell.coordinate}: {cell.value}")
+
 wb.save("input-edited.xlsx")
 ```
 
 ## Rules
 
 - `insert_rows`/`delete_rows` move cells but do **not** rewrite range references for you.
-  After structural edits, audit every formula that references the shifted region:
-  `for row in ws.iter_rows(): for c in row: ...` checking `c.value` is a str starting with
-  `=`.
-- Styling: set on the range once (`ws["A1:F1"].font = Font(bold=True)`), not per cell in a
-  loop.
+  After structural edits, traverse `wb.worksheets` as above and update every formula that
+  references the shifted region, including formulas on other sheets.
+- Styling: import `Font` and assign the style to each cell. A range such as `ws["A1:F1"]`
+  returns tuples of cells and cannot be styled as one object.
 - Column widths: `ws.column_dimensions["A"].width = 28` - set after writing data, from the
   longest value you wrote, not a fixed guess.
 - Freeze panes and autofilter improve usability cheaply:

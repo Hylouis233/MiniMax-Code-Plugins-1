@@ -24,11 +24,27 @@ layouts where the title placeholder is missing.)
 
 | Symptom | Check | Fix |
 |---|---|---|
-Text overflows the slide edge | shape left+width vs `prs.slide_width` | move/resize the shape, or shrink font |
-Everything shifted | slide size changed between sources | normalize slide size or re-layout on the target size |
-Fonts look wrong elsewhere | non-embedded fonts (pptx rarely embeds) | report referenced fonts (`run.font.name`) |
-File will not open | broken ZIP / part mismatch | same programmatic health check as DOCX: `zipfile.testzip()`, parse every `.xml` part |
-Pictures blank | media parts missing or rels broken | verify `ppt/media/*` present and slide rels reference them |
+| Shape crosses the slide edge | compare all four shape bounds with the slide bounds | move or resize the shape |
+| Text is clipped or overflows its box | render every slide and inspect right/left and bottom/vertical fit; shape bounds do not measure laid-out text | reflow, resize the box, or reduce text/font size, then render again |
+| Everything shifted | slide size changed between sources | normalize slide size or re-layout on the target size |
+| Fonts look wrong elsewhere | non-embedded fonts (pptx rarely embeds) | report referenced fonts (`run.font.name`) |
+| File will not open | broken ZIP / part mismatch | same programmatic health check as DOCX: `zipfile.testzip()`, parse every `.xml` part |
+| Pictures blank | media parts missing or rels broken | verify `ppt/media/*` present and slide rels reference them |
+
+## Text-fit verification
+
+`python-pptx` exposes a text box's geometry, not the renderer's final glyph and line layout.
+After any text or layout change, render all slides with the fonts used in production:
+
+```bash
+python -c "from pathlib import Path; Path('deck-render').mkdir(exist_ok=True)"
+soffice --headless --convert-to pdf --outdir deck-render input.pptx
+```
+
+Inspect every page of `deck-render/input.pdf` for horizontal clipping and for the final line being
+clipped or missing at the bottom. Rasterize the PDF when image inspection is easier. If this must
+be an automated gate, use measured text bounds from a native renderer in both axes;
+`shape.left + shape.width` is only a slide-boundary check, not an overflow test.
 
 ## Report contract
 

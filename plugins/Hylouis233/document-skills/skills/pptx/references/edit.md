@@ -4,28 +4,40 @@
 
 ```python
 from pptx import Presentation
-from pptx.util import Pt
 
 prs = Presentation("input.pptx")
 
-target_slide, target_shape = None, None
-for slide in prs.slides:
+old, new = "old wording", "new wording"
+slide_index = None                 # Set this and shape_name when repeated text is expected.
+shape_name = None
+
+candidates = []
+for i, slide in enumerate(prs.slides):
     for shape in slide.shapes:
-        if shape.has_text_frame and "old wording" in shape.text_frame.text:
-            target_slide, target_shape = slide, shape
+        if slide_index is not None and i != slide_index:
+            continue
+        if shape_name is not None and shape.name != shape_name:
+            continue
+        if shape.has_text_frame and old in shape.text_frame.text:
+            candidates.append((i, shape.name, shape))
 
-assert target_shape is not None, "target text not found - report instead of guessing"
+locations = [(i, name) for i, name, _ in candidates]
+assert len(candidates) == 1, f"expected one matching shape, found {locations}"
+_, _, target_shape = candidates[0]
 
-# Replace whole-paragraph text but keep the first run's formatting
+# Replace inside one existing run so its formatting and hyperlink are retained.
 tf = target_shape.text_frame
-for par in tf.paragraphs:
-    if "old wording" in par.text:
-        template_run = par.runs[0] if par.runs else None
-        par.text = par.text.replace("old wording", "new wording")
-        if template_run is not None:
-            for run in par.runs:
-                run.font.size = template_run.font.size
-                run.font.bold = template_run.font.bold
+assert tf.text.count(old) == 1, "target occurs more than once in the selected shape"
+run_hits = [
+    run
+    for paragraph in tf.paragraphs
+    for run in paragraph.runs
+    if old in run.text
+]
+assert len(run_hits) == 1 and run_hits[0].text.count(old) == 1, (
+    "target is duplicated or split across runs; report it instead of flattening the paragraph"
+)
+run_hits[0].text = run_hits[0].text.replace(old, new, 1)
 
 prs.save("input-edited.pptx")
 ```
@@ -34,13 +46,16 @@ prs.save("input-edited.pptx")
 
 1. **Never rebuild the file to make a small change.** Rewriting slides from scratch loses the
    template, masters, notes, and animations. Edit in place, save to a new path.
-2. Address shapes by slide index + shape name or matched text, and **assert the match** - a
-   silent no-op edit is worse than a loud failure.
-3. Table cells: `table.cell(r, c).text = ...`; keep the change inside the cell's text frame so
+2. Address shapes by slide index + shape name or matched text, and **assert exactly one match**.
+   If copy repeats, set both selectors rather than silently choosing the last shape.
+3. For formatted text, change `run.text` only when the target is wholly inside one run. Assigning
+   `paragraph.text` or `text_frame.text` rebuilds runs and can discard run formatting and links.
+   If the target spans runs, stop and make an explicitly reviewed run/XML edit.
+4. Table cells: `table.cell(r, c).text = ...`; keep the change inside the cell's text frame so
    its formatting survives.
-4. Chart data: `chart.replace_data(CategoryChartData(...))` updates the embedded workbook and
+5. Chart data: `chart.replace_data(CategoryChartData(...))` updates the embedded workbook and
    the plot together - do not hand-edit the XML series.
-5. Reordering slides means moving the underlying `sldIdLst` entries; do it only on request and
+6. Reordering slides means moving the underlying `sldIdLst` entries; do it only on request and
    verify order in the postcheck.
-6. Group shapes: iterate `shape.shapes` recursively to reach members; python-pptx will not
+7. Group shapes: iterate `shape.shapes` recursively to reach members; python-pptx will not
    ungroup for you - do not try to flatten groups.

@@ -1,31 +1,44 @@
 # Create a deck (python-pptx)
 
-## Skeleton with the seven workhorse slide patterns
+## Skeleton using semantic layouts and placeholders
 
 ```python
 from pptx import Presentation
-from pptx.util import Inches, Pt, Emu
-from pptx.dml.color import RGBColor
-from pptx.enum.text import PP_ALIGN
+from pptx.enum.shapes import PP_PLACEHOLDER
+from pptx.util import Inches, Pt
 
-prs = Presentation()               # 16:9 default in modern python-pptx; else set slide size
-prs.slide_width, prs.slide_height = Inches(13.333), Inches(7.5)
+prs = Presentation()
+# Keep this template's slide size and layout geometry together. For 16:9 output, start with a
+# real 16:9 template instead of changing only slide_width/slide_height after loading layouts.
 
-blank = prs.slide_layouts[6]       # index 6 = Blank in the default template
+# Built-in template convention: 0=Title, 1=Title and Content, 5=Title Only.
+# With a supplied template, inspect [(i, x.name) for i, x in enumerate(prs.slide_layouts)]
+# and map these roles to its layouts instead of assuming the same indices.
+title_layout = prs.slide_layouts[0]
+content_layout = prs.slide_layouts[1]
+title_only_layout = prs.slide_layouts[5]
 
-def add_slide():
-    return prs.slides.add_slide(blank)
+def add_slide(layout):
+    return prs.slides.add_slide(layout)
+
+def placeholder_of_type(slide, *types):
+    matches = [
+        ph for ph in slide.placeholders
+        if ph.placeholder_format.type in types
+    ]
+    assert len(matches) == 1, f"expected one placeholder of {types}, found {len(matches)}"
+    return matches[0]
 
 # P1 title slide
-s = add_slide()
-box = s.shapes.add_textbox(Inches(0.8), Inches(2.6), Inches(11.7), Inches(1.6))
-tf = box.text_frame; tf.word_wrap = True
-p = tf.paragraphs[0]; p.text = "Service Reliability Review"; p.font.size = Pt(44); p.font.bold = True
+s = add_slide(title_layout)
+s.shapes.title.text = "Service Reliability Review"
+placeholder_of_type(s, PP_PLACEHOLDER.SUBTITLE).text = "Quarterly operations review"
 
 # P2 bullet slide
-s = add_slide()
-box = s.shapes.add_textbox(Inches(0.8), Inches(1.2), Inches(11.7), Inches(5.6))
-tf = box.text_frame; tf.word_wrap = True
+s = add_slide(content_layout)
+s.shapes.title.text = "Executive summary"
+tf = placeholder_of_type(s, PP_PLACEHOLDER.BODY, PP_PLACEHOLDER.OBJECT).text_frame
+tf.clear(); tf.word_wrap = True
 lines = ["Uptime 99.97% (+0.04 vs last quarter)", "MTTR down to 42 minutes", "Two Sev-2 incidents, both capacity-driven"]
 for i, line in enumerate(lines):
     par = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
@@ -33,10 +46,10 @@ for i, line in enumerate(lines):
     par.space_after = Pt(12)
 
 # P3 table slide
-from pptx.util import Inches
-s = add_slide()
+s = add_slide(title_only_layout)
+s.shapes.title.text = "Regional service health"
 rows, cols = 4, 3
-tbl_shape = s.shapes.add_table(rows, cols, Inches(0.8), Inches(1.5), Inches(11.7), Inches(3.5))
+tbl_shape = s.shapes.add_table(rows, cols, Inches(0.5), Inches(1.5), Inches(9), Inches(3.5))
 table = tbl_shape.table
 hdr = ["Region", "Error rate", "P99 latency"]
 for j, text in enumerate(hdr):
@@ -47,12 +60,13 @@ for j, text in enumerate(hdr):
 # P4 chart slide (real chart part, not a picture)
 from pptx.chart.data import CategoryChartData
 from pptx.enum.chart import XL_CHART_TYPE
-s = add_slide()
+s = add_slide(title_only_layout)
+s.shapes.title.text = "Deployment volume"
 cd = CategoryChartData()
 cd.categories = ["Jul", "Aug", "Sep"]
 cd.add_series("Deploy count", (18, 22, 31))
 graphic = s.shapes.add_chart(XL_CHART_TYPE.COLUMN_CLUSTERED,
-                             Inches(1.5), Inches(1.5), Inches(10), Inches(5), cd)
+                             Inches(0.75), Inches(1.5), Inches(8.5), Inches(5), cd)
 chart = graphic.chart
 chart.has_legend = False
 
@@ -63,17 +77,20 @@ prs.save("deck.pptx")
 
 | Pattern | Build with |
 |---|---|
-| Title / section divider | one large textbox, 40-48pt |
-| Agenda / list | single textbox, 22-28pt, space_after 10-14pt |
-| Bullets + callout | two textboxes: bullets left, highlight right |
-| Image + text | `add_picture` (aspect-true) + textbox beside it |
-| Data table | `add_table`, bold header row, zebra fills optional |
-| Chart | `add_chart` with `CategoryChartData` |
-| Quote / closing | centered italic 28-32pt + attribution 16pt |
+| Title / section divider | Title or Section Header layout; title/subtitle placeholders |
+| Agenda / list | Title and Content layout; body placeholder |
+| Bullets + callout | Two Content layout; use both content placeholders |
+| Image + text | Picture/Content with Caption layout and its placeholders |
+| Data table | Title Only layout + `add_table` when no table placeholder exists |
+| Chart | Title Only layout + `add_chart` with `CategoryChartData` |
+| Quote / closing | Section Header or Title Only layout; add only the missing quote box |
 
 ## Rules
 
-- Set slide size once up front (16:9 = 13.333 x 7.5 in) and stay inside 0.6in margins.
+- Select a template with the requested aspect ratio before adding slides, then keep its slide
+  size and layout geometry unchanged. Stay inside 0.5in margins.
+- Choose a layout for the slide's purpose and populate its title/body placeholders. Use Blank
+  only when no template layout can express the design, then measure every added shape.
 - Title top-left at a consistent y-position across content slides; consistency reads as design.
 - Max ~6 bullets per slide, one line each at the chosen size - if a bullet wraps twice, split
   the slide or cut.

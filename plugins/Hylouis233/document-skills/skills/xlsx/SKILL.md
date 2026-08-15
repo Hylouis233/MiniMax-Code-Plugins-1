@@ -47,15 +47,26 @@ python -c "import openpyxl; print(openpyxl.__version__)"
 
 ## Step 3 - Postcheck (mandatory)
 
+Save this as `postcheck.py`, then pass the output path followed by every sheet the task should
+produce, for example `python postcheck.py output.xlsx Sales Summary`:
+
 ```python
 import openpyxl
-wb = openpyxl.load_workbook("output.xlsx")
+import sys
+
+if len(sys.argv) < 3:
+    raise SystemExit("usage: python postcheck.py OUTPUT.xlsx EXPECTED_SHEET [...]")
+output_path, *expected_sheets = sys.argv[1:]
+wb = openpyxl.load_workbook(output_path)
 print("sheets:", wb.sheetnames)
-ws = wb["Summary"]
-print("dims:", ws.dimensions)
-formulas = [(c.coordinate, c.value) for row in ws.iter_rows() for c in row
-            if isinstance(c.value, str) and c.value.startswith("=")]
-print("formula cells:", formulas[:10])
+missing = set(expected_sheets) - set(wb.sheetnames)
+assert not missing, f"missing expected sheets: {sorted(missing)}"
+for ws in wb.worksheets:
+    print(f"{ws.title} dims:", ws.dimensions)
+    formulas = [(c.coordinate, c.value) for row in ws.iter_rows() for c in row
+                if isinstance(c.value, str) and c.value.startswith("=")]
+    print(f"{ws.title} formula cells:", formulas[:10])
+wb.close()
 ```
 
 Confirm: expected sheet names exist; used range matches expectations; intended formula cells

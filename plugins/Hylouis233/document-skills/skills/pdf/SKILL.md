@@ -52,9 +52,27 @@ file is not.
 import pypdf
 r = pypdf.PdfReader("output.pdf")
 page_count = len(r.pages)
-first_text = (r.pages[0].extract_text() or "").strip()
+page_texts = {
+    number: (page.extract_text() or "").strip()
+    for number, page in enumerate(r.pages, start=1)
+}
+intentionally_raster_only_pages = set()
+missing_text_pages = [
+    number for number, text in page_texts.items()
+    if number not in intentionally_raster_only_pages and not text
+]
+assert not missing_text_pages, f"pages without extractable text: {missing_text_pages}"
+# Add task-specific checks when exact copy matters, for example
+# {1: ("Report title",), 2: ("Conclusion",)}. Per-page text presence is enforced above.
+expected_strings_by_page = {}
+for page_number, expected_strings in expected_strings_by_page.items():
+    missing = [value for value in expected_strings if value not in page_texts[page_number]]
+    assert not missing, f"page {page_number} is missing {missing}"
+page_sizes = [tuple(page.mediabox) for page in r.pages]
 ```
 
-Confirm: page count matches the request; the key title/heading text extracts non-empty; page
-size is the declared size (`r.pages[0].mediabox`). Report all three. For pixel-sensitive work,
-add a PyMuPDF render of page 1 at 100 dpi and check it is non-blank (mean pixel value).
+Confirm: page count matches the request; every page except those explicitly listed in
+`intentionally_raster_only_pages` has extractable text; each requested key string is listed in
+`expected_strings_by_page` and extracts on the correct page; every value in `page_sizes` is the
+declared size. Report all four. For pixel-sensitive work, render every applicable page with
+PyMuPDF at 100 dpi and check that each render is non-blank (mean pixel value).

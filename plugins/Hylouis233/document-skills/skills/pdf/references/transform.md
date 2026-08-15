@@ -31,16 +31,35 @@ Watermark / stamp by merging a stamp page onto each page:
 
 ```python
 stamp = PdfReader("watermark.pdf").pages[0]
+stamp_text = (stamp.extract_text() or "").strip()
+reader = PdfReader("input.pdf")
+expected_sizes = [tuple(float(value) for value in page.mediabox) for page in reader.pages]
 writer = PdfWriter()
-for page in PdfReader("input.pdf").pages:
+for page in reader.pages:
     page.merge_page(stamp)          # stamp content on top; use merge_transformed_page to place
     writer.add_page(page)
+
+with open("watermarked.pdf", "wb") as f:
+    writer.write(f)
+
+check = PdfReader("watermarked.pdf")
+assert len(check.pages) == len(expected_sizes)
+assert [tuple(float(value) for value in page.mediabox) for page in check.pages] == expected_sizes
+if stamp_text:
+    assert all(stamp_text in (page.extract_text() or "") for page in check.pages)
 ```
+
+If the stamp is graphical, render every output page and visually confirm that it is present;
+text extraction cannot validate a graphical watermark.
 
 Encryption and forms:
 
-- `writer.encrypt("pass", algorithm="AES-256")` to protect; `PdfReader(..., password="pass")`
-  to open. Report that you set a password - the user must record it.
+- AES encryption requires pypdf's optional crypto backend. Install `pypdf[crypto]` with
+  `python -m pip install "pypdf[crypto]"`. Run
+  `python -c "import cryptography; print('AES backend ok')"` before calling
+  `writer.encrypt("pass", algorithm="AES-256")`.
+  Open the result with `PdfReader(..., password="pass")`. Report that you set a password - the
+  user must record it.
 - AcroForm fields: `reader.get_fields()` to enumerate; `writer.update_page_form_field_values(
   page, {"fieldname": "value"})` to fill. Flatten only on explicit request; it stops later
   editing.
