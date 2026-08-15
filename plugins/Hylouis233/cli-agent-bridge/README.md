@@ -35,11 +35,15 @@ diff stat, changed files, and output tail before continuing.
 
 ```text
 Use cli-agent-bridge to have claude and kimi implement the same small feature independently,
-then compare the two diffs.
+then compare the two diffs. Create two independent worktrees first.
 ```
 
-Expected result: two delegate_task runs (backend=claude and backend=kimi) against the same
-workspace, followed by a comparison of the two diffs reported to the user.
+Expected result: the orchestrator creates two git worktrees (`git worktree add ../ws-claude`,
+`git worktree add ../ws-kimi`), delegates the same task to backend=claude in the first and
+backend=kimi in the second, then compares the two diffs reported to the user. Independent
+comparison runs need separate worktrees: the first run leaves its checkout dirty, so a
+same-workspace second run would be rejected by the allowDirty=false guard (same-checkout runs
+are serialized into a queue, which suits follow-up work, not parallel comparisons).
 
 ## Requirements
 
@@ -54,7 +58,7 @@ workspace, followed by a comparison of the two diffs reported to the user.
 | Backend | CLI | Status | Headless form used |
 |---|---|---|---|
 | claude | Claude Code | verified end-to-end (2.1.226) | claude -p <task> --output-format text --permission-mode acceptEdits |
-| codex | OpenAI Codex CLI | documented non-interactive form | codex exec <task> |
+| codex | OpenAI Codex CLI | documented non-interactive form | codex exec -- <task> |
 | kimi | Kimi Code | headless invocation verified (0.30.0) | kimi -p <task> |
 
 The claude template passes `--permission-mode acceptEdits` so the headless worker can edit files

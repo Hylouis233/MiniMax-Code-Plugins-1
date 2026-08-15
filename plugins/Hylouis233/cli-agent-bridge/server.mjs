@@ -7,7 +7,7 @@
 // License: MIT. See NOTICE for upstream credits.
 
 import { spawn } from "node:child_process";
-import { readFile, stat } from "node:fs/promises";
+import { readFile, stat, realpath } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
@@ -37,8 +37,10 @@ const FALLBACK_BACKENDS = {
   codex: {
     label: "OpenAI Codex CLI",
     command: "codex",
-    buildArgs: ["exec", "<task>"],
-    resumeArgs: ["exec", "resume", "<session>", "<task>"],
+    // "--" delimits the prompt from CLI options so a task like "--help" cannot
+    // be interpreted as a codex flag.
+    buildArgs: ["exec", "--", "<task>"],
+    resumeArgs: ["exec", "resume", "<session>", "--", "<task>"],
     experimental: false,
   },
   kimi: {
@@ -189,6 +191,27 @@ function capture() {
   };
 }
 
+// Kill the worker's whole process tree, not just the top-level child. On
+// Windows, child.kill() ends only the .cmd/.ps1 shim while the real CLI keeps
+// running, so taskkill /T /F is required; on POSIX the worker is spawned
+// detached in its own process group and the group is signaled here.
+function treeKill(child, signal) {
+  if (!child) return;
+  if (!child.pid) {
+    try { child.kill(signal); } catch { /* already gone */ }
+    return;
+  }
+  try {
+    if (process.platform === "win32") {
+      spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
+    } else {
+      process.kill(-child.pid, signal); // negative pid = the whole group
+    }
+  } catch {
+    try { child.kill(signal); } catch { /* already gone */ }
+  }
+}
+
 async function runCommand(command, args, options = {}) {
   const spawnOnce = (argv, shellArgs) => new Promise((resolve) => {
     const child = shellArgs
@@ -196,12 +219,14 @@ async function runCommand(command, args, options = {}) {
           cwd: options.cwd,
           env: process.env,
           windowsHide: true,
+          detached: process.platform !== "win32", // own process group for treeKill
           stdio: ["ignore", "pipe", "pipe"],
         })
       : spawn(command, argv, {
           cwd: options.cwd,
           env: process.env,
           windowsHide: true,
+          detached: process.platform !== "win32", // own process group for treeKill
           stdio: ["ignore", "pipe", "pipe"],
         });
     if (typeof options.onChild === "function") options.onChild(child);
@@ -229,14 +254,14 @@ async function runCommand(command, args, options = {}) {
     };
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill("SIGTERM");
+      treeKill(child, "SIGTERM");
     }, timeoutMs);
     // If the child ignores SIGTERM or a descendant holds the pipes, close never
     // fires; force-settle after the grace period so the MCP call cannot hang.
     const forceTimer = setTimeout(() => {
       if (settled) return;
       killed = true;
-      try { child.kill("SIGKILL"); } catch { /* already gone */ }
+      treeKill(child, "SIGKILL");
       settle();
     }, timeoutMs + KILL_GRACE_MS);
 
@@ -346,10 +371,15 @@ async function gitSnapshot(workspacePath) {
   const failures = [];
   const out = {};
   results.forEach((result, i) => {
+    // An unborn HEAD (fresh `git init`, no commits yet) is a valid repository
+    // state, not an unreliable snapshot; record it as an empty head.
+    if (jobs[i][1] === "head") return;
     const failure = snapshotFailure(jobs[i][0], result);
     if (failure) { failures.push(failure); return; }
     out[jobs[i][1]] = result.stdout;
   });
+  const headResult = results[jobs.findIndex((j) => j[1] === "head")];
+  out.head = headResult && headResult.exitCode === 0 ? String(headResult.stdout).trim() : "";
   if (failures.length > 0) {
     // Fail closed: an unreliable snapshot must never authorize a delegation.
     throw new Error("git snapshot unreliable: " + failures.join("; "));
@@ -373,13 +403,18 @@ async function gitSnapshot(workspacePath) {
 }
 
 async function committedDelta(workspacePath, beforeHead, afterHead) {
-  if (!beforeHead || beforeHead === afterHead) return null;
+  if (!afterHead || beforeHead === afterHead) return null;
+  const range = beforeHead ? beforeHead + ".." + afterHead : null;
   const [log, stat] = await Promise.all([
-    runCommand("git", ["log", "--oneline", beforeHead + ".." + afterHead], { cwd: workspacePath, timeoutMs: GIT_TIMEOUT_MS }),
-    runCommand("git", ["diff", "--stat", beforeHead + ".." + afterHead], { cwd: workspacePath, timeoutMs: GIT_TIMEOUT_MS }),
+    range
+      ? runCommand("git", ["log", "--oneline", range], { cwd: workspacePath, timeoutMs: GIT_TIMEOUT_MS })
+      : runCommand("git", ["log", "--oneline", "--max-count=50"], { cwd: workspacePath, timeoutMs: GIT_TIMEOUT_MS }),
+    range
+      ? runCommand("git", ["diff", "--stat", range], { cwd: workspacePath, timeoutMs: GIT_TIMEOUT_MS })
+      : runCommand("git", ["show", "--stat", "--oneline", afterHead], { cwd: workspacePath, timeoutMs: GIT_TIMEOUT_MS }),
   ]);
   return {
-    range: beforeHead + ".." + afterHead,
+    range: range ?? "(repository had no commits before the worker ran)",
     log: String(log.stdout ?? "").trim(),
     diffStat: String(stat.stdout ?? "").trim(),
   };
@@ -424,6 +459,23 @@ async function withWorkspaceLock(key, fn) {
   }
 }
 
+// Lock key = canonical real path of the git worktree root. The same checkout
+// reached through a subdirectory, different casing, or a symlink must share
+// one mutex, otherwise two write workers could run on it concurrently.
+async function worktreeKey(workspacePath) {
+  const topLevel = await runCommand("git", ["rev-parse", "--show-toplevel"], {
+    cwd: workspacePath, timeoutMs: 15_000,
+  });
+  const root = topLevel.exitCode === 0 && topLevel.stdout.trim()
+    ? topLevel.stdout.trim().replace(/[\\/]+$/, "")
+    : workspacePath;
+  try {
+    return await realpath(root);
+  } catch {
+    return path.resolve(root);
+  }
+}
+
 async function delegateTask(rawArgs, cancel) {
   const backends = await loadBackends();
   if (!rawArgs || typeof rawArgs.backend !== "string" || !rawArgs.backend.trim()) {
@@ -440,7 +492,20 @@ async function delegateTask(rawArgs, cancel) {
   const workspacePath = await validateWorkspace(rawArgs.workspacePath);
   await requireGitRepo(workspacePath);
 
-  return await withWorkspaceLock("ws:" + workspacePath, async () => {
+  const lockKey = "wt:" + (await worktreeKey(workspacePath));
+  return await withWorkspaceLock(lockKey, async () => {
+    // A cancellation that arrived while this request was queued behind the
+    // lock must not start the worker at all; re-check before spawning.
+    if (cancel && cancel.cancelled) {
+      return {
+        ok: false,
+        error: "delegation cancelled by client while waiting for the workspace lock; the worker never started",
+        backend, workspacePath, exitCode: null, timedOut: false, killed: false, cancelled: true,
+        outputTail: "", stderrTail: "",
+        gitBefore: null, git: null, commits: null,
+        experimental: Boolean(spec.experimental),
+      };
+    }
     const allowDirty = rawArgs.allowDirty === true;
     const before = await gitSnapshot(workspacePath);
     if (!allowDirty && before.statusShort) {
@@ -552,10 +617,8 @@ async function handleMessage(message) {
     if (entry && entry.cancel) {
       entry.cancel.cancelled = true;
       if (entry.cancel.child) {
-        try { entry.cancel.child.kill("SIGTERM"); } catch { /* already gone */ }
-        setTimeout(() => {
-          try { entry.cancel.child.kill("SIGKILL"); } catch { /* already gone */ }
-        }, KILL_GRACE_MS).unref?.();
+        treeKill(entry.cancel.child, "SIGTERM");
+        setTimeout(() => treeKill(entry.cancel.child, "SIGKILL"), KILL_GRACE_MS).unref?.();
       }
     }
     return null;

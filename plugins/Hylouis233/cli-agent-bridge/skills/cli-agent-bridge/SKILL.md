@@ -27,7 +27,10 @@ inside the target git repository, and their results come back as a git diff for 
    files including staged and new files), the commits block when the worker committed, the
    output and stderr tails, and the exit code. A failed, timed-out, or cancelled run reports
    ok=false (and isError=true at the protocol level); never treat such a result as success.
-5. If the result is wrong, delegate a follow-up task with resumeSessionId where supported.
+5. If the result is wrong, delegate a follow-up task. delegate_task results do not carry the
+   backend's own session id, so use resumeSessionId only when the user already knows one (for
+   example from the backend CLI's session history); otherwise start a fresh delegation with the
+   needed context in the task text.
 
 ## Backend guidance
 
