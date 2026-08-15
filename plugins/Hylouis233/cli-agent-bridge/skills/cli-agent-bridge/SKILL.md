@@ -12,7 +12,8 @@ inside the target git repository, and their results come back as a git diff for 
 
 - The user names another CLI explicitly (for example: delegate this to codex).
 - A task is long and self-contained and should not fill the current context.
-- Independent subtasks can run in parallel across different CLIs.
+- Independent subtasks in separate workspaces can run in parallel across different CLIs;
+  same-workspace delegations queue behind each other.
 - The user wants a second opinion or a cross-check from another agent.
 
 ## Workflow
