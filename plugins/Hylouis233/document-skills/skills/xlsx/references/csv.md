@@ -14,9 +14,19 @@ with open("input.csv", newline="", encoding="utf-8-sig") as f:   # utf-8-sig str
 
 - Always pass `newline=""` to `open` on every platform - it is the documented requirement,
   not a style choice.
-- Sniff the dialect when provenance is unknown:
-  `csv.Sniffer().sniff(f.read(2048))` then `f.seek(0)`; semicolon-delimited exports are common
-  in European locales.
+- Sniff the dialect when provenance is unknown, and pass the detected dialect to the reader -
+  seeking back alone does not reconfigure it, so semicolon exports would still parse as comma:
+
+  ```python
+  with open("input.csv", newline="", encoding="utf-8-sig") as f:
+      sample = f.read(2048)
+      f.seek(0)
+      dialect = csv.Sniffer().sniff(sample)      # raises csv.Error on ambiguous input
+      reader = csv.DictReader(f, dialect=dialect)
+      for i, row in enumerate(reader):
+          if i >= 5: break
+          print(row)
+  ```
 - Never trust inferred dtypes in CSV: everything is a string. Convert explicitly with
   `try/except ValueError` per column and report counts of parse failures rather than dropping
   rows silently.

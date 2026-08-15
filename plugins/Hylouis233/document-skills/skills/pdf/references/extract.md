@@ -22,9 +22,12 @@ for page in doc:
                 print(page_number, round(span["bbox"][0]),
                       round(span["bbox"][1]), span["text"])
 
-    # Images
+    # Images. Pixmap keeps the image's own colorspace: CMYK/ICC pixmaps cannot be
+    # saved as PNG directly, so convert anything not Gray/RGB to RGB first.
     for i, info in enumerate(page.get_images(full=True), start=1):
         pix = fitz.Pixmap(doc, info[0])
+        if pix.colorspace and pix.colorspace not in (fitz.csGRAY, fitz.csRGB):
+            pix = fitz.Pixmap(fitz.csRGB, pix)
         pix.save(f"img-p{page_number}-{i}.png")
 
     # Rasterize (for visual checks or OCR preprocessing)

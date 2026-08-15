@@ -27,6 +27,7 @@ python -c "import openpyxl; print(openpyxl.__version__)"
 | Edit cells, add sheets, fix formatting | [references/edit.md](references/edit.md) |
 | Build a new workbook (data + formulas + chart) | [references/create.md](references/create.md) |
 | CSV/TSV in or out, messy data cleanup | [references/csv.md](references/csv.md) |
+| Conditional formatting, structured tables, pivot-style aggregation | [references/formatting.md](references/formatting.md) |
 
 ## Step 2 - Contracts that always apply
 

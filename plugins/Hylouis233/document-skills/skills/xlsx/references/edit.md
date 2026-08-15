@@ -40,6 +40,29 @@ for formula_ws in wb.worksheets:
 wb.save("input-edited.xlsx")
 ```
 
+- Before editing an unknown workbook, detect parts an openpyxl load/save round trip silently
+  drops (slicers, pivot caches, power-query connections are the common casualties). Save a
+  copy to memory, compare archive contents, and report the loss before overwriting the file:
+
+  ```python
+  import zipfile
+  from io import BytesIO
+
+  def round_trip_losses(path, **load_options):
+      with zipfile.ZipFile(path) as z:
+          before = set(z.namelist())
+      wb = openpyxl.load_workbook(path, **load_options)   # same options as the real edit
+      buf = BytesIO()
+      wb.save(buf)
+      with zipfile.ZipFile(buf) as z:
+          return sorted(before - set(z.namelist()))
+
+  losses = round_trip_losses("input.xlsx")
+  if losses:
+      print("WARNING: saving with openpyxl will drop:", losses)
+      # report to the user and get confirmation before the first save
+  ```
+
 ## Rules
 
 - `insert_rows`/`delete_rows` move cells but do **not** rewrite range references for you.

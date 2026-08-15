@@ -48,11 +48,15 @@ Per format:
 - **docx** — create with python-docx from a heading outline; edit existing files by direct
   `word/document.xml` surgery (python-docx cannot open-and-save arbitrary files losslessly);
   extract text with python-docx or `pandoc -t markdown`; postcheck with python-docx re-open and
-  `soffice --headless --convert-to` PDF smoke test when LibreOffice is present.
+  `soffice --headless --convert-to` PDF smoke test when LibreOffice is present. Depth
+  references: CJK typography (east-asian font slots, 字号 table, char-based indents, GB/T 9704
+  page geometry) and scene patterns (academic paper, resume, official document, contract).
 - **xlsx** — openpyxl for reading, editing, styling, and native charts; formulas as formulas,
   never as pasted results; `data_only=True` only for reading cached values; date/number formats
   applied explicitly; recalculation contract documented (openpyxl writes formulas, the viewer
-  calculates).
+  calculates). Depth references: conditional formatting rules, structured tables, and honest
+  pivot-style aggregation (openpyxl cannot create pivot tables; the reference gives the
+  formula-sheet, frozen-values, and user-template routes).
 - **pptx** — python-pptx to build decks (7 common slide patterns: title, agenda, bullet, two
   image+text, table, chart, quote/closing); edit only named, existing shapes, never blind
   rewriting of the whole XML; text measured against shape width with font-size reduction rules;
@@ -68,6 +72,12 @@ Every Skill ends with the same rule: do not hand back a file you have not re-ope
 are specific (re-open the archive, confirm the sheet count and formula presence, confirm the slide
 count, confirm page count and text extraction) and the Skills require reporting what was verified
 versus what was assumed.
+
+The [`tests/`](tests/) directory ships one runnable fixture script per format covering the
+snippets with the worst silent-failure modes (PDF AcroForm clone-and-fill, watermark write,
+CMYK pixmap conversion; PPTX run-preserving edits, table-cell run edits, grouped-shape walking;
+XLSX dialect sniffing, round-trip part-loss detection; DOCX numbering restart rendered through
+LibreOffice). Each script is self-contained and exits non-zero on failure.
 
 ## Requirements
 

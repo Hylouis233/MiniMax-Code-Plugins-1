@@ -63,8 +63,49 @@ doc.save("report.docx")
 - Build the heading outline **before** writing prose; a wrong outline is the most expensive
   late fix.
 - One table style per document. Cell-level font overrides are for exceptions only.
-- Bullet/numbered lists: `add_paragraph(text, style="List Bullet")` /
-  `"List Number"`. Restart numbering per list by using separate list style instances.
+- Bullet lists: `add_paragraph(text, style="List Bullet")`. Numbered lists: `style="List
+  Number"` - but reusing that style makes every list **continue** the same sequence, because
+  all paragraphs share one numbering definition. When a second list must restart at 1, clone
+  the numbering definition and point the new list's paragraphs at the clone:
+
+  ```python
+  import copy
+  from docx.oxml.ns import qn
+  from docx.oxml import OxmlElement
+  from docx.opc.constants import RELATIONSHIP_TYPE as RT
+
+  def new_restart_num_id(doc, base_num_id):
+      """Clone <w:num> base_num_id with a startOverride so the next list restarts at 1."""
+      numbering = doc.part.part_related_by(RT.NUMBERING).element
+      source = next(
+          n for n in numbering.findall(qn("w:num"))
+          if n.get(qn("w:numId")) == str(base_num_id)
+      )
+      clone = copy.deepcopy(source)
+      new_id = max(int(n.get(qn("w:numId"))) for n in numbering.findall(qn("w:num"))) + 1
+      clone.set(qn("w:numId"), str(new_id))
+      override = OxmlElement("w:lvlOverride")
+      override.set(qn("w:ilvl"), "0")
+      start = OxmlElement("w:startOverride")
+      start.set(qn("w:val"), "1")
+      override.append(start)
+      clone.append(override)
+      numbering.append(clone)
+      return new_id
+
+  def numbered_paragraph(doc, text, num_id):
+      p = doc.add_paragraph(text, style="List Number")
+      pPr = p._p.get_or_add_pPr()
+      numPr = OxmlElement("w:numPr")
+      ilvl = OxmlElement("w:ilvl"); ilvl.set(qn("w:val"), "0")
+      numId = OxmlElement("w:numId"); numId.set(qn("w:val"), str(num_id))
+      numPr.append(ilvl); numPr.append(numId)
+      pPr.append(numPr)
+      return p
+
+  # Find the numId behind "List Number" in numbering.xml (inspect it once, then hard-code),
+  # then give each independent list its own cloned definition.
+  ```
 - Images: `doc.add_picture(path, width=Cm(14))` - always set width so oversized images do not
   overflow the text column. Keep aspect ratio by setting only one dimension.
 - A real TOC is a **field**, it renders after the user opens the file and updates fields

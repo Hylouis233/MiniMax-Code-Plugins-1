@@ -31,6 +31,11 @@ python -c "import docx; print(docx.__version__ if hasattr(docx,'__version__') el
 | "Read / extract / summarize / convert" | Read | [references/read.md](references/read.md) |
 | "Check / fix / why is it broken" | Review | [references/review.md](references/review.md) |
 
+Two depth references slot in before create/edit: [references/cjk.md](references/cjk.md)
+whenever the document contains CJK text (east-asian fonts, 字号, char-based indents, 公文
+geometry), and [references/scenes.md](references/scenes.md) when the request matches a known
+scene - academic paper, resume, official document (公文), or contract.
+
 Two routes can chain (read -> edit, create -> review). Never skip classification; it decides
 between python-docx generation and raw XML surgery, which have opposite safety profiles.
 

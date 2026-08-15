@@ -51,8 +51,17 @@ prs.save("input-edited.pptx")
 3. For formatted text, change `run.text` only when the target is wholly inside one run. Assigning
    `paragraph.text` or `text_frame.text` rebuilds runs and can discard run formatting and links.
    If the target spans runs, stop and make an explicitly reviewed run/XML edit.
-4. Table cells: `table.cell(r, c).text = ...`; keep the change inside the cell's text frame so
-   its formatting survives.
+4. Table cells are edited at run level exactly like shape text: iterate
+   `table.cell(r, c).text_frame.paragraphs` and change `run.text`. Assigning `cell.text`
+   (or `.text` on the text frame) rebuilds the frame and discards per-run formatting and
+   hyperlinks:
+
+   ```python
+   cell = table.cell(2, 1)
+   hits = [run for p in cell.text_frame.paragraphs for run in p.runs if old in run.text]
+   assert len(hits) == 1, "target is duplicated or split across runs in this cell"
+   hits[0].text = hits[0].text.replace(old, new, 1)
+   ```
 5. Chart data: `chart.replace_data(CategoryChartData(...))` updates the embedded workbook and
    the plot together - do not hand-edit the XML series.
 6. Reordering slides means moving the underlying `sldIdLst` entries; do it only on request and

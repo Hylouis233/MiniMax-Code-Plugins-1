@@ -68,7 +68,11 @@ expected_strings_by_page = {}
 for page_number, expected_strings in expected_strings_by_page.items():
     missing = [value for value in expected_strings if value not in page_texts[page_number]]
     assert not missing, f"page {page_number} is missing {missing}"
-page_sizes = [tuple(page.mediabox) for page in r.pages]
+# mediabox is (left, bottom, right, top); reduce it to the width/height pair you declared
+page_sizes = [
+    (round(float(page.mediabox.width), 2), round(float(page.mediabox.height), 2))
+    for page in r.pages
+]
 ```
 
 Confirm: page count matches the request; every page except those explicitly listed in

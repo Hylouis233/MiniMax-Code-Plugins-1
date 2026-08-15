@@ -60,9 +60,37 @@ Encryption and forms:
   `writer.encrypt("pass", algorithm="AES-256")`.
   Open the result with `PdfReader(..., password="pass")`. Report that you set a password - the
   user must record it.
-- AcroForm fields: `reader.get_fields()` to enumerate; `writer.update_page_form_field_values(
-  page, {"fieldname": "value"})` to fill. Flatten only on explicit request; it stops later
-  editing.
+- AcroForm: fill fields on a cloned copy of the document, never on the readers' own pages:
+
+  ```python
+  from pypdf import PdfReader, PdfWriter
+
+  reader = PdfReader("form.pdf")
+  fields = reader.get_fields() or {}
+  assert fields, "this PDF has no AcroForm form fields"
+
+  writer = PdfWriter()
+  writer.append(reader)   # clones every page AND the catalog /AcroForm into the writer
+
+  # update fields on the writer's page copies; a field widget can sit on any page,
+  # so pass the writer page that actually carries the field you are filling
+  writer.update_page_form_field_values(
+      writer.pages[0],
+      {"applicant_name": "Ada Byron"},
+  )
+
+  with open("filled.pdf", "wb") as f:
+      writer.write(f)
+
+  check = PdfReader("filled.pdf")
+  value = str((check.get_fields() or {}).get("applicant_name", {}).get("/V", ""))
+  assert value.strip("/") == "Ada Byron"
+  ```
+
+  A freshly constructed `PdfWriter` is empty: `append` (or `clone_document_from_reader`) must
+  copy the pages and the `/AcroForm` dictionary before any `update_page_form_field_values`
+  call, or the write fails or silently produces a formless file. Flatten only on explicit
+  request; it stops later editing.
 
 ## Rules
 
