@@ -20,7 +20,12 @@ inside the target git repository, and their results come back as a git diff for 
 1. Run workspace_status with the workspace path and confirm the working tree is clean.
 2. Pick a backend from list_backends and confirm it is available on this machine.
 3. Run delegate_task with a self-contained task, the workspace path, and the backend name.
-4. Review the returned git status, diff stat, changed files, output tail, and exit code.
+   Delegations to the same workspace are serialized by the server, so parallel runs on one
+   checkout queue instead of interleaving edits.
+4. Review the returned result: the before and after git snapshots (status, diff stat, changed
+   files including staged and new files), the commits block when the worker committed, the
+   output and stderr tails, and the exit code. A failed, timed-out, or cancelled run reports
+   ok=false (and isError=true at the protocol level); never treat such a result as success.
 5. If the result is wrong, delegate a follow-up task with resumeSessionId where supported.
 
 ## Backend guidance
@@ -39,7 +44,12 @@ inside the target git repository, and their results come back as a git diff for 
   with --permission-mode acceptEdits); treat every returned diff as untrusted until reviewed.
 - Review every change the worker produced before reporting completion. New files the worker
   created are listed under changed files even though they do not appear in git diff --stat.
-- Timeouts: the default is 20 minutes; adjust timeoutMs for very large tasks.
+- Timeouts: the default is 20 minutes; adjust timeoutMs for very large tasks. A timed-out worker
+  is terminated (SIGTERM, then a forceful kill after a grace period), so a delegation call never
+  hangs past the cap.
+- Cancellation: cancelling an in-flight delegate_task call terminates the worker process and the
+  result reports cancelled=true; the workspace may still contain the edits the worker made before
+  cancellation, so still review the returned snapshot.
 
 ## Notes
 

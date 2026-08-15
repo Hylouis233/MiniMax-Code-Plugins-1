@@ -16,7 +16,9 @@ repository:
 - list_backends: report which coding CLIs are installed and available on this machine.
 - workspace_status: git status, diff stat, and changed files before delegating work.
 - delegate_task: run a self-contained task with a chosen backend CLI and return its exit
-  code, output tail, stderr tail, and the git diff the worker produced.
+  code, output tail, stderr tail, and the before/after git snapshots (staged, unstaged,
+  untracked, and committed deltas) the worker produced. Runs against the same workspace are
+  serialized; dirty trees are refused unless allowDirty=true; cancellation kills the worker.
 
 The Skill teaches MiniMax Code when and how to delegate, and to review the returned diff before
 reporting completion.
