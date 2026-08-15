@@ -35,7 +35,10 @@ inside the target git repository, and their results come back as a git diff for 
 
 - Never include credentials, tokens, private endpoints, or personal data in the task text.
 - Keep allowDirty=false (the default) unless the user explicitly accepts running on a dirty tree.
-- Review every change the worker produced before reporting completion.
+- Default templates let the worker edit workspace files autonomously (for example claude runs
+  with --permission-mode acceptEdits); treat every returned diff as untrusted until reviewed.
+- Review every change the worker produced before reporting completion. New files the worker
+  created are listed under changed files even though they do not appear in git diff --stat.
 - Timeouts: the default is 20 minutes; adjust timeoutMs for very large tasks.
 
 ## Notes

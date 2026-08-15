@@ -28,8 +28,8 @@ const FALLBACK_BACKENDS = {
   claude: {
     label: "Claude Code",
     command: "claude",
-    buildArgs: ["-p", "<task>", "--output-format", "text"],
-    resumeArgs: ["-p", "<task>", "--output-format", "text", "--resume", "<session>"],
+    buildArgs: ["-p", "<task>", "--output-format", "text", "--permission-mode", "acceptEdits"],
+    resumeArgs: ["-p", "<task>", "--output-format", "text", "--permission-mode", "acceptEdits", "--resume", "<session>"],
     experimental: false,
   },
   codex: {
@@ -52,13 +52,15 @@ const FALLBACK_BACKENDS = {
     buildArgs: ["-p", "<task>"],
     resumeArgs: null,
     experimental: true,
+    notes: "Desktop ZCode builds have no verified headless mode; set command to your CLI if your distribution provides one.",
   },
   dsh: {
     label: "DeepSeek Harness (dsh)",
     command: "dsh",
-    buildArgs: ["run", "<task>"],
+    buildArgs: ["--profile", "headless", "<task>"],
     resumeArgs: null,
     experimental: true,
+    notes: "Uses the documented headless profile; requires a headless profile under DSH_HOME/profiles.",
   },
 };
 
@@ -238,15 +240,21 @@ async function requireGitRepo(workspacePath) {
 }
 
 async function gitSnapshot(workspacePath) {
-  const [status, diffStat, diffNames] = await Promise.all([
+  const [status, diffStat, diffNames, untracked] = await Promise.all([
     runCommand("git", ["status", "--short"], { cwd: workspacePath, timeoutMs: 30_000 }),
     runCommand("git", ["diff", "--stat"], { cwd: workspacePath, timeoutMs: 30_000 }),
     runCommand("git", ["diff", "--name-only"], { cwd: workspacePath, timeoutMs: 30_000 }),
+    runCommand("git", ["ls-files", "--others", "--exclude-standard"], { cwd: workspacePath, timeoutMs: 30_000 }),
   ]);
+  const seen = new Set();
+  const changedFiles = [
+    ...diffNames.stdout.split(/\r?\n/).map((l) => l.trim()).filter(Boolean),
+    ...untracked.stdout.split(/\r?\n/).map((l) => l.trim()).filter(Boolean),
+  ].filter((f) => (seen.has(f) ? false : (seen.add(f), true)));
   return {
     statusShort: status.stdout.trim(),
     diffStat: diffStat.stdout.trim(),
-    changedFiles: diffNames.stdout.split(/\r?\n/).map((l) => l.trim()).filter(Boolean),
+    changedFiles,
   };
 }
 
@@ -265,6 +273,7 @@ async function listBackends() {
       version: check.exitCode === 0 ? tail(check.stdout, 200).trim() : null,
       error: check.exitCode === 0 ? "" : (check.errorMessage || "command not found or not executable"),
       resumeSupported: Array.isArray(spec.resumeArgs),
+      notes: typeof spec.notes === "string" ? spec.notes : "",
     });
   }
   return entries;
@@ -387,6 +396,7 @@ async function handleMessage(message) {
             lines.push("- " + e.name + " (" + e.label + "): " + (e.available ? "available" : "unavailable") + (e.experimental ? " [experimental]" : ""));
             if (e.version) lines.push("  version: " + e.version);
             if (e.error) lines.push("  error: " + e.error);
+            if (e.notes) lines.push("  note: " + e.notes);
           }
           return jsonRpcResult(message.id, {
             content: [{ type: "text", text: lines.join("\n") }],

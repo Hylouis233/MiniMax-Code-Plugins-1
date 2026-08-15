@@ -47,15 +47,27 @@ workspace, followed by a comparison of the two diffs reported to the user.
 
 | Backend | CLI | Status | Headless form used |
 |---|---|---|---|
-| claude | Claude Code | verified | claude -p <task> --output-format text |
-| codex | OpenAI Codex CLI | verified | codex exec <task> |
-| kimi | Kimi Code | verified | kimi -p <task> |
-| zcode | ZCode | experimental | zcode -p <task> (verify locally) |
-| dsh | DeepSeek Harness | experimental | dsh run <task> (verify locally) |
+| claude | Claude Code | verified end-to-end (2.1.226) | claude -p <task> --output-format text --permission-mode acceptEdits |
+| codex | OpenAI Codex CLI | documented non-interactive form | codex exec <task> |
+| kimi | Kimi Code | headless invocation verified (0.30.0) | kimi -p <task> |
 
-Experimental backends ship with a sensible template that must be verified against your local
-CLI version. Edit backends.json (or set the CLI_AGENT_BRIDGE_BACKENDS environment variable to a
-custom file) to adjust command, args, or binary paths.
+The claude template passes `--permission-mode acceptEdits` so the headless worker can edit files
+in the workspace without an interactive approval prompt; other permission levels can be selected
+by editing backends.json. The kimi prompt mode (`-p`) accepts no permission flags on current
+versions, so the worker runs with kimi's own non-interactive defaults.
+
+Experimental backends ship with a documented template and a note in list_backends:
+
+| Backend | CLI | Status | Headless form used |
+|---|---|---|---|
+| zcode | ZCode | experimental | zcode -p <task> (desktop builds have no verified headless mode) |
+| dsh | DeepSeek Harness | experimental | dsh --profile headless <task> (requires a headless profile) |
+
+ZCode desktop builds have no verified headless CLI; point the command field at your own CLI if
+your ZCode distribution provides one. The dsh template uses its documented headless profile
+(dsh --profile headless), which must exist under DSH_HOME/profiles. Edit backends.json (or set
+the CLI_AGENT_BRIDGE_BACKENDS environment variable to a custom file) to adjust command, args, or
+binary paths.
 
 ## Data and network
 
@@ -66,8 +78,9 @@ custom file) to adjust command, args, or binary paths.
   credentials, private endpoints, or personal data in a task.
 - The server captures only the command output and the resulting git diff; nothing is transmitted
   anywhere by the server itself.
-- Workers run with whatever permission or sandbox configuration that CLI has. Review the
-  returned diff before accepting the work.
+- Workers run with the permission level baked into their template (claude: acceptEdits, which
+  auto-approves workspace file edits but still gates other tool classes) or with that CLI's own
+  non-interactive defaults. Review the returned diff before accepting the work.
 
 ## Customizing backends
 
@@ -82,7 +95,8 @@ change the command field. resumeSessionId is honored only for backends whose res
   plays that role instead.
 - The bridge delegates tasks; it does not merge code, commit, or push. The user reviews every
   diff.
-- zcode and dsh backends are experimental because their headless modes vary by version.
+- zcode and dsh backends are experimental: ZCode desktop builds have no verified headless CLI,
+  and dsh needs a headless profile present under DSH_HOME/profiles.
 
 ## License
 
