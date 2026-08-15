@@ -169,16 +169,24 @@ function substituteArgs(template, task, session) {
 }
 
 async function runCommand(command, args, options = {}) {
-  return await new Promise((resolve) => {
-    const child = spawn(command, args, {
-      cwd: options.cwd,
-      env: process.env,
-      windowsHide: true,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+  const spawnOnce = (argv, shellArgs) => new Promise((resolve) => {
+    const child = shellArgs
+      ? spawn(shellArgs[0], shellArgs.slice(1), {
+          cwd: options.cwd,
+          env: process.env,
+          windowsHide: true,
+          stdio: ["ignore", "pipe", "pipe"],
+        })
+      : spawn(command, argv, {
+          cwd: options.cwd,
+          env: process.env,
+          windowsHide: true,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
     let stdout = "";
     let stderr = "";
     let settled = false;
+    let spawnError = null;
     let timedOut = false;
     const timeoutMs = options.timeoutMs ?? 30_000;
     const timer = setTimeout(() => {
@@ -192,18 +200,38 @@ async function runCommand(command, args, options = {}) {
     child.stderr.on("data", (chunk) => { stderr = capAppend(stderr, chunk); });
 
     child.on("error", (error) => {
+      spawnError = error;
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      resolve({ stdout, stderr, exitCode: null, timedOut, errorMessage: error.message });
+      resolve({ stdout, stderr, exitCode: null, timedOut, errorMessage: error.message, spawnError });
     });
     child.on("close", (code) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      resolve({ stdout, stderr, exitCode: code, timedOut, errorMessage: "" });
+      resolve({ stdout, stderr, exitCode: code, timedOut, errorMessage: "", spawnError });
     });
   });
+
+  const direct = await spawnOnce(args, null);
+  if (process.platform !== "win32" || !direct.spawnError) return direct;
+
+  // Windows shim fallback: .ps1/.cmd npm shims cannot be launched by CreateProcess,
+  // so retry through the bundled PowerShell runner, which forwards every argument
+  // verbatim (no cmd.exe re-interpretation).
+  const runner = path.join(path.dirname(fileURLToPath(import.meta.url)), "ps1-runner.ps1");
+  return await spawnOnce(null, [
+    "powershell.exe",
+    "-NoProfile",
+    "-NonInteractive",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-File",
+    runner,
+    command,
+    ...args,
+  ]);
 }
 
 function capAppend(current, chunk) {

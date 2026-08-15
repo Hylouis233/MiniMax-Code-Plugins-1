@@ -69,6 +69,12 @@ your ZCode distribution provides one. The dsh template uses its documented headl
 the CLI_AGENT_BRIDGE_BACKENDS environment variable to a custom file) to adjust command, args, or
 binary paths.
 
+On Windows, npm-style .ps1/.cmd shims cannot be launched directly, so the server retries them
+through the bundled ps1-runner.ps1 using the built-in Windows PowerShell 5.1. Arguments pass
+through verbatim with no cmd.exe re-interpretation. If a custom wrapper shim re-binds parameters
+(for example a proxy autostart shim) and mangles dashed flags, set the backend command to the
+underlying real executable in backends.json.
+
 ## Data and network
 
 - This Plugin makes no network calls of its own and stores no credentials, tokens, or logs.
@@ -97,6 +103,8 @@ change the command field. resumeSessionId is honored only for backends whose res
   diff.
 - zcode and dsh backends are experimental: ZCode desktop builds have no verified headless CLI,
   and dsh needs a headless profile present under DSH_HOME/profiles.
+- Custom wrapper shims that re-bind dashed flags can misreport a backend as unavailable; point
+  the backend command at the real executable to bypass the wrapper.
 
 ## License
 
