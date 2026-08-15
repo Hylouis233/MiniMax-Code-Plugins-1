@@ -1,0 +1,10 @@
+{
+  "$comment": "Backend command templates for cli-agent-bridge. <task> and <session> are placeholders. Edit command or buildArgs to point at another binary or add flags. Never store credentials here; each CLI uses your own local authentication.",
+  "backends": {
+    "claude": { "label": "Claude Code", "command": "claude", "buildArgs": ["-p", "<task>", "--output-format", "text"], "resumeArgs": ["-p", "<task>", "--output-format", "text", "--resume", "<session>"], "experimental": false },
+    "codex": { "label": "OpenAI Codex CLI", "command": "codex", "buildArgs": ["exec", "<task>"], "resumeArgs": ["exec", "resume", "<session>", "<task>"], "experimental": false },
+    "kimi": { "label": "Kimi Code", "command": "kimi", "buildArgs": ["-p", "<task>"], "resumeArgs": ["-S", "<session>", "-p", "<task>"], "experimental": false },
+    "zcode": { "label": "ZCode", "command": "zcode", "buildArgs": ["-p", "<task>"], "resumeArgs": null, "experimental": true },
+    "dsh": { "label": "DeepSeek Harness (dsh)", "command": "dsh", "buildArgs": ["run", "<task>"], "resumeArgs": null, "experimental": true }
+  }
+}
