@@ -367,7 +367,13 @@ async function gitSnapshot(workspacePath) {
     ["git ls-files --others --exclude-standard", "untracked", ["ls-files", "--others", "--exclude-standard"]],
     ["git rev-parse HEAD", "head", ["rev-parse", "HEAD"]],
   ];
-  const results = await Promise.all(jobs.map((j) => runCommand("git", j[2], { cwd: workspacePath, timeoutMs: GIT_TIMEOUT_MS })));
+  // Serial execution on purpose: git status/diff refresh the index, and
+  // concurrent git processes on one repository race for .git/index.lock,
+  // which intermittently fails commands with exit code 128.
+  const results = [];
+  for (const job of jobs) {
+    results.push(await runCommand("git", job[2], { cwd: workspacePath, timeoutMs: GIT_TIMEOUT_MS }));
+  }
   const failures = [];
   const out = {};
   results.forEach((result, i) => {
@@ -405,14 +411,13 @@ async function gitSnapshot(workspacePath) {
 async function committedDelta(workspacePath, beforeHead, afterHead) {
   if (!afterHead || beforeHead === afterHead) return null;
   const range = beforeHead ? beforeHead + ".." + afterHead : null;
-  const [log, stat] = await Promise.all([
-    range
-      ? runCommand("git", ["log", "--oneline", range], { cwd: workspacePath, timeoutMs: GIT_TIMEOUT_MS })
-      : runCommand("git", ["log", "--oneline", "--max-count=50"], { cwd: workspacePath, timeoutMs: GIT_TIMEOUT_MS }),
-    range
-      ? runCommand("git", ["diff", "--stat", range], { cwd: workspacePath, timeoutMs: GIT_TIMEOUT_MS })
-      : runCommand("git", ["show", "--stat", "--oneline", afterHead], { cwd: workspacePath, timeoutMs: GIT_TIMEOUT_MS }),
-  ]);
+  // Serial like gitSnapshot: no index.lock races between git commands.
+  const log = range
+    ? await runCommand("git", ["log", "--oneline", range], { cwd: workspacePath, timeoutMs: GIT_TIMEOUT_MS })
+    : await runCommand("git", ["log", "--oneline", "--max-count=50"], { cwd: workspacePath, timeoutMs: GIT_TIMEOUT_MS });
+  const stat = range
+    ? await runCommand("git", ["diff", "--stat", range], { cwd: workspacePath, timeoutMs: GIT_TIMEOUT_MS })
+    : await runCommand("git", ["show", "--stat", "--oneline", afterHead], { cwd: workspacePath, timeoutMs: GIT_TIMEOUT_MS });
   return {
     range: range ?? "(repository had no commits before the worker ran)",
     log: String(log.stdout ?? "").trim(),
