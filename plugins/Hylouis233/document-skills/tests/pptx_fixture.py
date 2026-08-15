@@ -138,6 +138,35 @@ check(
     not any(getattr(sh, "text_frame", None) is not None and sh.text_frame.text == "nested member" for sh in slide6.shapes),
 )
 
+# ---- edit.md locator: candidate collection must recurse into groups ------------
+old_w, new_w = "nested member", "renamed member"
+
+
+def iter_shapes_with_path(shapes, path=""):
+    for shape in shapes:
+        here = f"{path}/{shape.name}" if path else shape.name
+        if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
+            yield from iter_shapes_with_path(shape.shapes, here)
+        else:
+            yield here, shape
+
+
+candidates = [
+    (i, p, sh)
+    for i, s in enumerate(prs6.slides)
+    for p, sh in iter_shapes_with_path(s.shapes)
+    if sh.has_text_frame and old_w in sh.text_frame.text
+]
+check("locator reaches text inside the group", len(candidates) == 1, [(i, p) for i, p, _ in candidates])
+check("locator reports a stable nested path", "/" in candidates[0][1], candidates[0][1])
+_, _, target = candidates[0]
+target.text_frame.paragraphs[0].runs[0].text = new_w
+prs6.save("group-edited.pptx")
+prs_g = Presentation("group-edited.pptx")
+found = [sh for sh in iter_shapes(prs_g.slides[0].shapes)
+         if getattr(sh, "text_frame", None) is not None and sh.text_frame.text == new_w]
+check("group member edit persists after save", len(found) == 1)
+
 # ---- analyze.md snippet: theme font resolution ---------------------------------
 import re
 

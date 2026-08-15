@@ -55,6 +55,19 @@ doc.build(story)
 
 ## Rules
 
+- **Escape plain text before Paragraph**: `Paragraph` parses its string as XML-ish markup, so
+  user-provided prose containing `&` or `<` raises a parse error or renders wrong. Escape
+  everything that is data; use markup only for strings you authored as markup:
+
+  ```python
+  from xml.sax.saxutils import escape
+
+  def para(text, style):
+      return Paragraph(escape(text), style)      # & < > become entity-safe
+  ```
+
+  The same applies to `ListItem(Paragraph(...))` and to table cell strings when they flow
+  through `Paragraph`.
 - **Exactly-one-page constraint**: after `build`, run the postcheck. Over budget -> reduce
   `leading`, tighten `spaceBefore/After`, cut rows - in that order of preference. Under budget
   is usually fine; add a spacer or scale the title block.

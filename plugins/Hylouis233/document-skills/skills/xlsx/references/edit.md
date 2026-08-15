@@ -40,28 +40,44 @@ for formula_ws in wb.worksheets:
 wb.save("input-edited.xlsx")
 ```
 
-- Before editing an unknown workbook, detect parts an openpyxl load/save round trip silently
-  drops (slicers, pivot caches, power-query connections are the common casualties). Save a
-  copy to memory, compare archive contents, and report the loss before overwriting the file:
+- Before editing an unknown workbook, detect what an openpyxl load/save round trip silently
+  changes. Dropped parts (slicers, pivot caches, power-query connections) are only half the
+  risk: features stored *inside* a retained part, such as `x14` extension lists in
+  `xl/worksheets/sheet1.xml`, can be stripped while the archive member name stays. Compare
+  part contents too, not just names, and report both lists before overwriting the file:
 
   ```python
   import zipfile
   from io import BytesIO
 
-  def round_trip_losses(path, **load_options):
+  EXTENSION_MARKERS = (b"<extLst", b"x14:", b"mc:AlternateContent")
+
+  def round_trip_changes(path, **load_options):
       with zipfile.ZipFile(path) as z:
-          before = set(z.namelist())
-      wb = openpyxl.load_workbook(path, **load_options)   # same options as the real edit
+          before = {name: z.read(name) for name in z.namelist()}
+      wb = openpyxl.load_workbook(path, **load_options)  # same options as the real edit
       buf = BytesIO()
       wb.save(buf)
       with zipfile.ZipFile(buf) as z:
-          return sorted(before - set(z.namelist()))
+          after = {name: z.read(name) for name in z.namelist()}
+      dropped = sorted(set(before) - set(after))
+      stripped_extensions = sorted(
+          name for name in set(before) & set(after)
+          if any(marker in before[name] for marker in EXTENSION_MARKERS)
+          and not any(marker in after[name] for marker in EXTENSION_MARKERS)
+      )
+      return dropped, stripped_extensions
 
-  losses = round_trip_losses("input.xlsx")
-  if losses:
-      print("WARNING: saving with openpyxl will drop:", losses)
+  dropped, stripped = round_trip_changes("input.xlsx")
+  if dropped or stripped:
+      print("WARNING: saving with openpyxl will drop:", dropped)
+      print("WARNING: saving with openpyxl will strip extensions from:", stripped)
       # report to the user and get confirmation before the first save
   ```
+
+  (openpyxl re-serializes every sheet it touches, so byte-identity of sheets is not a
+  meaningful check; the extension-marker comparison above is what catches silent feature
+  loss.)
 
 ## Rules
 

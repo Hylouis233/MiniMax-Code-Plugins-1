@@ -9,7 +9,9 @@ LibreOffice" report almost always means the east-asian face was never set.
 ```python
 from docx.oxml.ns import qn
 
-def set_fonts(run, latin="Times New Roman", east_asian="宋体"):
+LATIN, EAST_ASIAN = "Times New Roman", "宋体"   # define both names once, up front
+
+def set_fonts(run, latin=LATIN, east_asian=EAST_ASIAN):
     run.font.name = latin                      # writes w:ascii + w:hAnsi
     rPr = run._element.get_or_add_rPr()
     rFonts = rPr.get_or_add_rFonts()
@@ -17,14 +19,12 @@ def set_fonts(run, latin="Times New Roman", east_asian="宋体"):
 
 # Style level: do the same on the style so body text inherits it
 style = doc.styles["Normal"]
-style.font.name = latin
-style.element.get_or_add_rPr().get_or_add_rFonts().set(qn("w:eastAsia"), east_asian)
+style.font.name = LATIN
+style.element.get_or_add_rPr().get_or_add_rFonts().set(qn("w:eastAsia"), EAST_ASIAN)
 ```
 
 Convention for mixed-script body text: CJK glyphs from the east-asian face, digits and Latin
-from a Latin face (Times New Roman or Arial). Both slots set = deterministic rendering.
-
-## Chinese font-size table (字号)
+from a Latin face (Times New Roman or Arial). Both slots set = deterministic rendering.## Chinese font-size table (字号)
 
 Word's Chinese UI names map to point sizes; scripts must use the points:
 
@@ -91,6 +91,20 @@ section.left_margin, section.right_margin = Cm(2.8), Cm(2.6)
 
 1. Re-open the output and assert the east-asian slot is set on body runs and styles
    (`.get(qn("w:eastAsia"))` is not None) - not just `run.font.name`.
-2. Render with soffice and confirm no tofu (missing-glyph boxes) by extracting text from the
-   rendered PDF and comparing against the source strings.
+2. Tofu (missing-glyph boxes) cannot be detected by text extraction: the rendered PDF's text
+   layer keeps the original codepoint while the glyph is a box, so "extracted text matches"
+   proves nothing about rendering. Check glyph coverage directly instead - with fontTools
+   (`pip install fonttools`) when the referenced faces can be located:
+
+   ```python
+   from fontTools.ttLib import TTFont
+
+   cmaps = [TTFont(font_path).getBestCmap() for font_path in referenced_font_files]
+   emitted = {ch for ch in source_text if ord(ch) >= 0x2E80}     # CJK and beyond
+   missing = {ch for ch in emitted if not any(ord(ch) in cmap for cmap in cmaps)}
+   assert not missing, f"codepoints with no glyph in any referenced font: {sorted(missing)}"
+   ```
+
+   When font files cannot be located, rasterize the rendered pages with PyMuPDF and inspect
+   the images visually, and say in the report that glyph rendering was not machine-verified.
 3. Confirm `firstLineChars` survived on body paragraphs if the indent was requested.

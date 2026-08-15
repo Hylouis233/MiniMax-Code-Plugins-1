@@ -61,16 +61,23 @@ one you took:
 
 1. **Formula sheet (live, recalculates)** - the default. A `SUMIFS`/`COUNTIFS`/`AVERAGEIFS`
    grid keyed on a unique-values column reproduces most pivot outputs and stays a formula
-   per contract rule 1:
+   per contract rule 1. Build every sheet reference from the real source sheet's name -
+   hard-coding `Data!` breaks on any workbook whose sheet is named differently:
 
    ```python
    ws2 = wb.create_sheet("ByRegion")
    ws2.append(["Region", "Units", "Revenue"])
+
+   def sheet_ref(sheet):
+       # quote the title only when it contains characters a formula would misread
+       return f"'{sheet.title}'!" if any(c in sheet.title for c in " !'") else f"{sheet.title}!"
+
+   src = sheet_ref(ws)                              # e.g. "Sales!" or "'Raw Data'!"
    regions = sorted({r[0] for r in ws.iter_rows(min_row=2, min_col=1, values_only=True) if r[0]})
    for i, region in enumerate(regions, start=2):
        ws2.cell(row=i, column=1, value=region)
-       ws2.cell(row=i, column=2, value=f'=SUMIF(Data!A:A,A{i},Data!C:C)')
-       ws2.cell(row=i, column=3, value=f'=SUMIF(Data!A:A,A{i},Data!D:D)')
+       ws2.cell(row=i, column=2, value=f"=SUMIF({src}A:A,A{i},{src}C:C)")
+       ws2.cell(row=i, column=3, value=f"=SUMIF({src}A:A,A{i},{src}D:D)")
    ```
 
    Unique values themselves are formulas only with array/dynamic functions - extracting them

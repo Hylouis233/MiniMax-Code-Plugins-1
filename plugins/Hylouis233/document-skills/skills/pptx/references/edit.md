@@ -4,6 +4,7 @@
 
 ```python
 from pptx import Presentation
+from pptx.enum.shapes import MSO_SHAPE_TYPE
 
 prs = Presentation("input.pptx")
 
@@ -11,17 +12,27 @@ old, new = "old wording", "new wording"
 slide_index = None                 # Set this and shape_name when repeated text is expected.
 shape_name = None
 
+def iter_shapes(shapes, path=""):
+    """Yield (path, shape) for every shape, recursing into groups so text inside
+    grouped artwork is reachable; the path keeps the uniqueness check readable."""
+    for shape in shapes:
+        here = f"{path}/{shape.name}" if path else shape.name
+        if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
+            yield from iter_shapes(shape.shapes, here)
+        else:
+            yield here, shape
+
 candidates = []
 for i, slide in enumerate(prs.slides):
-    for shape in slide.shapes:
-        if slide_index is not None and i != slide_index:
-            continue
+    if slide_index is not None and i != slide_index:
+        continue
+    for path, shape in iter_shapes(slide.shapes):
         if shape_name is not None and shape.name != shape_name:
             continue
         if shape.has_text_frame and old in shape.text_frame.text:
-            candidates.append((i, shape.name, shape))
+            candidates.append((i, path, shape))
 
-locations = [(i, name) for i, name, _ in candidates]
+locations = [(i, path) for i, path, _ in candidates]
 assert len(candidates) == 1, f"expected one matching shape, found {locations}"
 _, _, target_shape = candidates[0]
 

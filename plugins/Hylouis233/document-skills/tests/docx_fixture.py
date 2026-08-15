@@ -127,5 +127,44 @@ print("restarted.docx renders second list as:", restart)
 check("plain style reuse continues the sequence (negative control)", cont == ["4.", "5.", "6."], cont)
 check("cloned definition restarts the second list at 1", restart == ["1.", "2.", "3."], restart)
 
+# ---- scenes.md snippet: keep_table_together for the signature block -------------
+doc_c = Document()
+doc_c.add_heading("Contract", level=1)
+# fill most of page 1 so a tall signature table would otherwise straddle the page break
+for _ in range(24):
+    doc_c.add_paragraph("Filler paragraph to push the signature block toward the page break. " * 3)
+sig = doc_c.add_table(rows=4, cols=2)
+labels = [("甲方（盖章）", "乙方（盖章）"), ("签字", "签字"), ("日期", "日期"), ("备注", "备注")]
+for r, pair in enumerate(labels):
+    sig.cell(r, 0).text, sig.cell(r, 1).text = pair
+
+
+def keep_table_together(table):
+    for row in table.rows:
+        trPr = row._tr.get_or_add_trPr()
+        if trPr.find(qn("w:cantSplit")) is None:
+            trPr.append(OxmlElement("w:cantSplit"))   # a row never splits mid-row
+    for row in table.rows[:-1]:
+        for cell in row.cells:
+            for par in cell.paragraphs:
+                par.paragraph_format.keep_with_next = True  # row sticks to the next row
+
+
+keep_table_together(sig)
+doc_c.save("signature.docx")
+reopened = Document("signature.docx")
+check("every signature row carries cantSplit",
+      all(row._tr.find(qn("w:trPr")) is not None and row._tr.find(qn("w:trPr")).find(qn("w:cantSplit")) is not None
+          for row in reopened.tables[0].rows))
+subprocess.run(
+    ["soffice", "--headless", "--convert-to", "pdf", "--outdir", ".", "signature.docx"],
+    check=True, capture_output=True, timeout=180,
+)
+pages_with_labels = [
+    page.number for page in fitz.open("signature.pdf")
+    if "甲方（盖章）" in page.get_text() and "备注" in page.get_text()
+]
+check("rendered signature table stays on one page", len(pages_with_labels) == 1, pages_with_labels)
+
 print("\n" + ("ALL DOCX FIXTURES PASSED" if not failures else f"{len(failures)} FAILURES: {failures}"))
 sys.exit(0 if not failures else 1)

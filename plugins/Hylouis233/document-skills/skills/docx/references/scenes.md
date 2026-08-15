@@ -59,8 +59,25 @@ numbered 条款 -> 签署 block.
 - Cross-references as literal text ("见第 5.2 条"); after edits, grep every 第 X 条 reference
   and verify the target still exists at that number.
 - Signature block: a borderless 2-column table (甲方/乙方 rows for 签字、盖章、日期) at the
-  end; set `keep_with_next = True` on the paragraphs right before it so the block never
-  splits across pages, and re-check in the rendered PDF.
+  end. `keep_with_next` on preceding paragraphs alone does not stop table rows from splitting
+  across pages - apply the row-level guard to the table itself:
+
+  ```python
+  from docx.oxml import OxmlElement
+  from docx.oxml.ns import qn
+
+  def keep_table_together(table):
+      for row in table.rows:
+          trPr = row._tr.get_or_add_trPr()
+          if trPr.find(qn("w:cantSplit")) is None:
+              trPr.append(OxmlElement("w:cantSplit"))   # a row never splits mid-row
+      for row in table.rows[:-1]:
+          for cell in row.cells:
+              for par in cell.paragraphs:
+                  par.paragraph_format.keep_with_next = True  # row sticks to the next row
+  ```
+
+  Then verify in the rendered PDF that the whole block landed on one page.
 - Verification beyond the standard postcheck: every defined term defined once; every
   cross-reference resolves; signature block on one page in the rendered PDF.
 

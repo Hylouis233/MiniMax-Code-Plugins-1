@@ -103,5 +103,42 @@ check("CMYK pixmap converts to a saved PNG", os.path.getsize("cmyk-converted.png
 rgb = fitz.Pixmap("cmyk-converted.png")
 check("converted pixmap is RGB", "RGB" in str(rgb.colorspace), rgb.colorspace)
 
+# ---- create.md rule: escape plain text before Paragraph ------------------------
+from reportlab.lib.pagesizes import A4 as A4_SIZE
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import Paragraph, SimpleDocTemplate
+from xml.sax.saxutils import escape
+
+MESSY = "R&D spend <budget> & \"pipeline\" > forecast"
+try:
+    SimpleDocTemplate("escaped.pdf", pagesize=A4_SIZE).build(
+        [Paragraph(escape(MESSY), getSampleStyleSheet()["BodyText"])]
+    )
+    build_error = ""
+except Exception as exc:  # unescaped markup typically raises a paraparser error
+    build_error = str(exc)
+check("escaped messy text builds without paraparser error", build_error == "", build_error)
+esc_text = " ".join(page.get_text() for page in fitz.open("escaped.pdf"))
+check("escaped text extracts with original characters",
+      "R&D spend <budget>" in esc_text and "\"pipeline\"" in esc_text, esc_text[:120])
+
+unescaped_failed = False
+try:
+    SimpleDocTemplate("raw.pdf", pagesize=A4_SIZE).build(
+        [Paragraph(MESSY, getSampleStyleSheet()["BodyText"])]
+    )
+except Exception:
+    unescaped_failed = True
+if unescaped_failed:
+    check("unescaped markup is proven dangerous (negative control)", True)
+else:
+    # lenient inputs build but render mangled: markup is swallowed, entities reinterpreted
+    raw_text = " ".join(page.get_text() for page in fitz.open("raw.pdf"))
+    check(
+        "unescaped markup is proven dangerous (negative control)",
+        "<budget>" not in raw_text or "R&D;" in raw_text,
+        raw_text[:120],
+    )
+
 print("\n" + ("ALL PDF FIXTURES PASSED" if not failures else f"{len(failures)} FAILURES: {failures}"))
 sys.exit(0 if not failures else 1)
