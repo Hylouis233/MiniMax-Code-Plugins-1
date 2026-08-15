@@ -1,11 +1,11 @@
 ---
 name: minimax-code-trajectory
-description: Inspect privacy-aware timelines for local MiniMax Code sessions. Use when the user asks to review a task trajectory, diagnose a prior local session, summarize tool or token activity, inspect compaction/failure events, or compare recent session metadata without opening raw ledger files.
+description: Inspect or visualize privacy-aware timelines for local MiniMax Code sessions. Use when the user asks to show, draw, open, review, or diagnose a task trajectory, summarize tool or token activity, inspect compaction or failure events, or compare recent session metadata without opening raw ledger files.
 license: Apache-2.0
-compatibility: Requires MiniMax Code Agent Plugins 1.0 MCP support, Node.js 22+, and local-runtime v2 session artifacts.
+compatibility: Requires MiniMax Code Agent Plugins 1.0 MCP support, Node.js 22+, and local-runtime v2 session artifacts. Automatic visualization opening requires the MCode built-in Browser.
 metadata:
   author: hetaoBackend
-  version: "0.1.0"
+  version: "0.2.0"
 ---
 
 # MiniMax Code Trajectory
@@ -15,12 +15,19 @@ filesystem manually when the tools can answer the request.
 
 ## Workflow
 
-1. If the user did not provide a session ID, call `list_minimax_sessions` with the smallest useful
-   limit. Use the first result unless the user asks to choose another session.
-2. Call `get_minimax_trajectory` with `detailLevel: "summary"` and a bounded `maxRecords` value.
-3. Report the event sequence, session state, failures, message/tool counts, compactions, token usage,
-   and parser warnings that answer the user's question.
-4. Distinguish observed ledger facts from inference. A missing event does not prove an action never
+1. If the user asks to show, draw, open, or visualize a trajectory, call
+   `show_minimax_trajectory` with `detailLevel: "summary"` and a bounded `maxRecords` value. Omit
+   `sessionId` for the latest readable session unless the user selected another session.
+2. Read the exact `visualization.fileUrl` from the tool result. If the MCode built-in Browser is
+   available, call Browser with action `navigate` and pass that exact file URL. Do not use shell
+   commands, an external browser, or a guessed path. After Browser succeeds, tell the user the
+   interactive trajectory is open; do not dump the trajectory JSON into the conversation.
+3. If Browser is unavailable, return the `visualization.fileUrl` as the fallback and explain that
+   the generated self-contained HTML can be opened in MCode Desktop. Do not claim it was opened.
+4. If the user asks for analysis without a visual page, call `get_minimax_trajectory` instead and
+   report the event sequence, session state, failures, message/tool counts, compactions, token
+   usage, and parser warnings that answer the question.
+5. Distinguish observed ledger facts from inference. A missing event does not prove an action never
    happened outside the retained ledger.
 
 ## Privacy boundary

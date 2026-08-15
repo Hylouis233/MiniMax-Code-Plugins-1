@@ -9,6 +9,7 @@ import {
   listMiniMaxSessions,
   resolveDataDir,
 } from './lib/trajectory.mjs';
+import { writeTrajectoryHtml } from './lib/html.mjs';
 
 export const TOOLS = [
   {
@@ -59,6 +60,34 @@ export const TOOLS = [
       additionalProperties: false,
     },
   },
+  {
+    name: 'show_minimax_trajectory',
+    description:
+      'Generate a self-contained HTML visualization for one local MiniMax Code trajectory and return a file URL that can be opened with the built-in Browser.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: {
+          type: 'string',
+          minLength: 1,
+          description: 'Exact session ID. Omit to use the most recently updated readable session.',
+        },
+        maxRecords: {
+          type: 'integer',
+          minimum: 50,
+          maximum: 1000,
+          default: 200,
+        },
+        detailLevel: {
+          type: 'string',
+          enum: ['summary', 'full'],
+          default: 'summary',
+          description: 'Use summary by default. Use full only after the user explicitly requests content previews.',
+        },
+      },
+      additionalProperties: false,
+    },
+  },
 ];
 
 export async function handleRpc(message, options = {}) {
@@ -70,7 +99,7 @@ export async function handleRpc(message, options = {}) {
       result: {
         protocolVersion: message.params?.protocolVersion ?? '2025-06-18',
         capabilities: { tools: {} },
-        serverInfo: { name: 'minimax-code-trajectory', version: '0.1.0' },
+        serverInfo: { name: 'minimax-code-trajectory', version: '0.2.0' },
       },
     };
   }
@@ -88,6 +117,7 @@ async function handleToolCall(params, options) {
   const dataDir = options.dataDir ?? resolveDataDir(options.env, options.homeDir);
   try {
     let value;
+    let responseText;
     if (name === 'list_minimax_sessions') {
       value = await listMiniMaxSessions({ dataDir, limit: args.limit });
     } else if (name === 'get_minimax_trajectory') {
@@ -97,12 +127,34 @@ async function handleToolCall(params, options) {
         maxRecords: args.maxRecords,
         detailLevel: args.detailLevel,
       });
+    } else if (name === 'show_minimax_trajectory') {
+      const trajectory = await getMiniMaxTrajectory({
+        dataDir,
+        sessionId: args.sessionId,
+        maxRecords: args.maxRecords,
+        detailLevel: args.detailLevel,
+      });
+      const pluginData = options.pluginData ?? (options.env ?? process.env).PLUGIN_DATA;
+      if (typeof pluginData !== 'string' || !pluginData.trim()) {
+        throw new Error('plugin_data_unavailable');
+      }
+      const visualization = await writeTrajectoryHtml({ trajectory, outputDir: pluginData });
+      value = {
+        schemaVersion: 1,
+        sessionId: trajectory.session.sessionId,
+        detailLevel: trajectory.privacy.detailLevel,
+        warningCount: trajectory.warnings.length,
+        visualization,
+      };
+      responseText =
+        `Trajectory HTML created. Open this file URL with the MCode built-in Browser: ` +
+        visualization.fileUrl;
     } else {
       return toolError(`Unknown tool: ${String(name)}`);
     }
     return {
       result: {
-        content: [{ type: 'text', text: JSON.stringify(value, null, 2) }],
+        content: [{ type: 'text', text: responseText ?? JSON.stringify(value, null, 2) }],
         structuredContent: value,
       },
     };

@@ -214,7 +214,7 @@ test('handles MCP initialize, tool listing, calls, and unknown tools', async () 
     const listed = await handleRpc({ method: 'tools/list' });
     assert.deepEqual(
       listed.result.tools.map((tool) => tool.name),
-      ['list_minimax_sessions', 'get_minimax_trajectory'],
+      ['list_minimax_sessions', 'get_minimax_trajectory', 'show_minimax_trajectory'],
     );
     const called = await handleRpc(
       { method: 'tools/call', params: { name: 'list_minimax_sessions', arguments: { limit: 1 } } },
@@ -225,6 +225,129 @@ test('handles MCP initialize, tool listing, calls, and unknown tools', async () 
     assert.equal(missing.result.isError, true);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('show tool writes a self-contained trajectory HTML file and returns its file URL', async () => {
+  const dataDir = await makeDataDir();
+  const pluginData = await mkdtemp(path.join(os.tmpdir(), 'minimax-code-trajectory-output-'));
+  const sessionId = 'visual-session';
+  try {
+    await writeSession(dataDir, sessionId, 1_800_000_000_000, sampleEvents(sessionId, dataDir));
+    const response = await handleRpc(
+      {
+        method: 'tools/call',
+        params: {
+          name: 'show_minimax_trajectory',
+          arguments: { sessionId, detailLevel: 'summary', maxRecords: 50 },
+        },
+      },
+      { dataDir, pluginData },
+    );
+
+    assert.equal(response.result.isError, undefined);
+    assert.match(response.result.content[0].text, /Open this file URL with the MCode built-in Browser/u);
+    assert.doesNotMatch(response.result.content[0].text, /message\.display_upserted/u);
+    assert.equal(response.result.structuredContent.events, undefined);
+    const visualization = response.result.structuredContent.visualization;
+    assert.match(visualization.fileUrl, /^file:\/\//u);
+    const html = await readFile(fileURLToPath(visualization.fileUrl), 'utf8');
+    assert.match(html, /<!doctype html>/iu);
+    assert.match(html, /Agent flight recorder/iu);
+    assert.match(html, /visual-session/u);
+    assert.match(html, /message\.display_upserted/u);
+    assert.match(html, /Content-Security-Policy/u);
+    assert.match(html, /aria-label="Filter trajectory events"/u);
+    assert.match(html, /data-filter="message\.display_upserted"/u);
+    assert.match(html, /data-kind="message\.display_upserted"/u);
+    assert.match(html, /id="event-inspector"/u);
+    assert.match(html, /prefers-reduced-motion/u);
+    assert.doesNotMatch(html, /https?:\/\//u);
+    assert.doesNotMatch(html, /supersecret|tool result secret|chain of thought/u);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(pluginData, { recursive: true, force: true });
+  }
+});
+
+test('skill opens the generated file URL with the built-in Browser', async () => {
+  const skill = await readFile(
+    fileURLToPath(new URL('../skills/minimax-code-trajectory/SKILL.md', import.meta.url)),
+    'utf8',
+  );
+  assert.match(skill, /show_minimax_trajectory/u);
+  assert.match(skill, /visualization\.fileUrl/u);
+  assert.match(skill, /Browser[\s\S]{0,240}navigate/u);
+  assert.match(skill, /Browser is unavailable/u);
+});
+
+test('show tool refuses a symlinked Plugin data directory', async (context) => {
+  const dataDir = await makeDataDir();
+  const outside = await mkdtemp(path.join(os.tmpdir(), 'minimax-trajectory-html-outside-'));
+  const linkParent = await mkdtemp(path.join(os.tmpdir(), 'minimax-trajectory-html-link-'));
+  const pluginData = path.join(linkParent, 'plugin-data');
+  try {
+    await writeSession(dataDir, 'safe-output-session', 1_800_000_000_000, [
+      ledgerEvent('safe-output-session', 1, 'session.deleted'),
+    ]);
+    try {
+      await symlink(outside, pluginData, 'dir');
+    } catch (error) {
+      if (error?.code === 'EPERM') {
+        context.skip('directory symlinks are unavailable on this platform');
+        return;
+      }
+      throw error;
+    }
+    const response = await handleRpc(
+      {
+        method: 'tools/call',
+        params: { name: 'show_minimax_trajectory', arguments: { sessionId: 'safe-output-session' } },
+      },
+      { dataDir, pluginData },
+    );
+    assert.equal(response.result.isError, true);
+    assert.match(response.result.content[0].text, /html_output_directory_unsafe/u);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(linkParent, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
+  }
+});
+
+test('full-detail HTML cannot turn trajectory previews into executable markup', async () => {
+  const dataDir = await makeDataDir();
+  const pluginData = await mkdtemp(path.join(os.tmpdir(), 'minimax-trajectory-html-xss-'));
+  const sessionId = 'markup-session';
+  try {
+    await writeSession(dataDir, sessionId, 1_800_000_000_000, [
+      ledgerEvent(sessionId, 1, 'session.created', {
+        record: sessionRecord(
+          sessionId,
+          '</script><script id="injected">globalThis.compromised=true</script>',
+          '/workspace',
+        ),
+      }),
+    ]);
+    const response = await handleRpc(
+      {
+        method: 'tools/call',
+        params: {
+          name: 'show_minimax_trajectory',
+          arguments: { sessionId, detailLevel: 'full' },
+        },
+      },
+      { dataDir, pluginData },
+    );
+    const html = await readFile(
+      fileURLToPath(response.result.structuredContent.visualization.fileUrl),
+      'utf8',
+    );
+    assert.doesNotMatch(html, /<script id="injected">/u);
+    assert.match(html, /\\u003c\/script\\u003e/u);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(pluginData, { recursive: true, force: true });
   }
 });
 
@@ -265,7 +388,7 @@ test('serves MCP requests over the configured stdio process boundary', async (co
     const responses = stdout.trim().split('\n').map((line) => JSON.parse(line));
     assert.deepEqual(responses.map((response) => response.id), [1, 2, 3]);
     assert.equal(responses[0].result.serverInfo.name, 'minimax-code-trajectory');
-    assert.equal(responses[1].result.tools.length, 2);
+    assert.equal(responses[1].result.tools.length, 3);
     assert.equal(
       responses[2].result.structuredContent.sessions[0].sessionId,
       'stdio-session',
