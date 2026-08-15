@@ -18,6 +18,8 @@ const DEFAULT_TIMEOUT_MS = 1_200_000;
 const MIN_TIMEOUT_MS = 5_000;
 const MAX_TIMEOUT_MS = 3_600_000;
 const VERSION_CHECK_TIMEOUT_MS = 15_000;
+const GIT_TIMEOUT_MS = 30_000;
+const KILL_GRACE_MS = 10_000;
 const MAX_CAPTURE_CHARS = 5_000_000;
 const RAW_TAIL_CHARS = 60_000;
 
@@ -96,7 +98,7 @@ const TOOLS = [
     name: "delegate_task",
     title: "Delegate Task To A Coding CLI",
     description:
-      "Run a coding task with a locally installed coding CLI (backend: claude, codex, kimi, zcode, or dsh) inside the given workspace, headless. Returns the CLI exit code, readable output tail, stderr tail, and the git diff stat and changed files produced by the run. Refuses to run when the working tree is dirty unless allowDirty=true.",
+      "Run a coding task with a locally installed coding CLI (backend: claude, codex, kimi, zcode, or dsh) inside the given workspace, headless. Returns the CLI exit code, readable output tail, stderr tail, and the git snapshot (staged, unstaged, untracked, and committed deltas) produced by the run. Refuses to run when the working tree is dirty unless allowDirty=true. Delegations to the same workspace are serialized.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -131,12 +133,12 @@ const TOOLS = [
           minimum: MIN_TIMEOUT_MS,
           maximum: MAX_TIMEOUT_MS,
           default: DEFAULT_TIMEOUT_MS,
-          description: "Execution timeout in milliseconds. Defaults to 1200000 (20 minutes).",
+          description: "Execution timeout in milliseconds. Defaults to 1200000 (20 minutes). After the timeout the worker receives SIGTERM, then a forceful kill after a 10 second grace period.",
         },
       },
       required: ["backend", "task", "workspacePath"],
     },
-    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
   },
 ];
 
@@ -168,6 +170,25 @@ function substituteArgs(template, task, session) {
   });
 }
 
+// Bounded capture: chunks are kept in a ring buffer with a running length, so a
+// runaway CLI never triggers repeated multi-megabyte string copies.
+function capture() {
+  let chunks = [];
+  let length = 0;
+  return {
+    push(chunk) {
+      if (typeof chunk !== "string" || chunk.length === 0) return;
+      chunks.push(chunk);
+      length += chunk.length;
+      while (length > MAX_CAPTURE_CHARS && chunks.length > 0) {
+        const dropped = chunks.shift();
+        length -= dropped.length;
+      }
+    },
+    text() { return chunks.join(""); },
+  };
+}
+
 async function runCommand(command, args, options = {}) {
   const spawnOnce = (argv, shellArgs) => new Promise((resolve) => {
     const child = shellArgs
@@ -183,34 +204,77 @@ async function runCommand(command, args, options = {}) {
           windowsHide: true,
           stdio: ["ignore", "pipe", "pipe"],
         });
-    let stdout = "";
-    let stderr = "";
+    if (typeof options.onChild === "function") options.onChild(child);
+    const stdoutBuf = capture();
+    const stderrBuf = capture();
     let settled = false;
     let spawnError = null;
     let timedOut = false;
+    let killed = false;
     const timeoutMs = options.timeoutMs ?? 30_000;
+    const settle = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearTimeout(forceTimer);
+      resolve({
+        stdout: stdoutBuf.text(),
+        stderr: stderrBuf.text(),
+        exitCode: null,
+        timedOut,
+        killed,
+        errorMessage: "",
+        spawnError,
+      });
+    };
     const timer = setTimeout(() => {
       timedOut = true;
       child.kill("SIGTERM");
     }, timeoutMs);
+    // If the child ignores SIGTERM or a descendant holds the pipes, close never
+    // fires; force-settle after the grace period so the MCP call cannot hang.
+    const forceTimer = setTimeout(() => {
+      if (settled) return;
+      killed = true;
+      try { child.kill("SIGKILL"); } catch { /* already gone */ }
+      settle();
+    }, timeoutMs + KILL_GRACE_MS);
 
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => { stdout = capAppend(stdout, chunk); });
-    child.stderr.on("data", (chunk) => { stderr = capAppend(stderr, chunk); });
+    child.stdout.on("data", (chunk) => { stdoutBuf.push(chunk); });
+    child.stderr.on("data", (chunk) => { stderrBuf.push(chunk); });
 
     child.on("error", (error) => {
       spawnError = error;
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      resolve({ stdout, stderr, exitCode: null, timedOut, errorMessage: error.message, spawnError });
+      clearTimeout(forceTimer);
+      resolve({
+        stdout: stdoutBuf.text(),
+        stderr: stderrBuf.text(),
+        exitCode: null,
+        timedOut,
+        killed,
+        errorMessage: error.message,
+        spawnError,
+      });
     });
     child.on("close", (code) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      resolve({ stdout, stderr, exitCode: code, timedOut, errorMessage: "", spawnError });
+      clearTimeout(forceTimer);
+      resolve({
+        stdout: stdoutBuf.text(),
+        stderr: stderrBuf.text(),
+        exitCode: code,
+        timedOut,
+        killed,
+        errorMessage: "",
+        spawnError,
+      });
     });
   });
 
@@ -232,11 +296,6 @@ async function runCommand(command, args, options = {}) {
     command,
     ...args,
   ]);
-}
-
-function capAppend(current, chunk) {
-  const combined = current + chunk;
-  return combined.length > MAX_CAPTURE_CHARS ? combined.slice(-MAX_CAPTURE_CHARS) : combined;
 }
 
 function tail(text, count) {
@@ -267,22 +326,62 @@ async function requireGitRepo(workspacePath) {
   }
 }
 
+function snapshotFailure(label, result) {
+  if (result.timedOut) return label + " timed out";
+  if (result.exitCode !== 0) return label + " failed with exit code " + String(result.exitCode);
+  return "";
+}
+
 async function gitSnapshot(workspacePath) {
-  const [status, diffStat, diffNames, untracked] = await Promise.all([
-    runCommand("git", ["status", "--short"], { cwd: workspacePath, timeoutMs: 30_000 }),
-    runCommand("git", ["diff", "--stat"], { cwd: workspacePath, timeoutMs: 30_000 }),
-    runCommand("git", ["diff", "--name-only"], { cwd: workspacePath, timeoutMs: 30_000 }),
-    runCommand("git", ["ls-files", "--others", "--exclude-standard"], { cwd: workspacePath, timeoutMs: 30_000 }),
-  ]);
+  const jobs = [
+    ["git status --short", "status", ["status", "--short"]],
+    ["git diff --stat", "diffStat", ["diff", "--stat"]],
+    ["git diff --name-only", "diffNames", ["diff", "--name-only"]],
+    ["git diff --cached --stat", "cachedDiffStat", ["diff", "--cached", "--stat"]],
+    ["git diff --cached --name-only", "cachedDiffNames", ["diff", "--cached", "--name-only"]],
+    ["git ls-files --others --exclude-standard", "untracked", ["ls-files", "--others", "--exclude-standard"]],
+    ["git rev-parse HEAD", "head", ["rev-parse", "HEAD"]],
+  ];
+  const results = await Promise.all(jobs.map((j) => runCommand("git", j[2], { cwd: workspacePath, timeoutMs: GIT_TIMEOUT_MS })));
+  const failures = [];
+  const out = {};
+  results.forEach((result, i) => {
+    const failure = snapshotFailure(jobs[i][0], result);
+    if (failure) { failures.push(failure); return; }
+    out[jobs[i][1]] = result.stdout;
+  });
+  if (failures.length > 0) {
+    // Fail closed: an unreliable snapshot must never authorize a delegation.
+    throw new Error("git snapshot unreliable: " + failures.join("; "));
+  }
   const seen = new Set();
   const changedFiles = [
-    ...diffNames.stdout.split(/\r?\n/).map((l) => l.trim()).filter(Boolean),
-    ...untracked.stdout.split(/\r?\n/).map((l) => l.trim()).filter(Boolean),
+    ...String(out.diffNames ?? "").split(/\r?\n/).map((l) => l.trim()).filter(Boolean),
+    ...String(out.cachedDiffNames ?? "").split(/\r?\n/).map((l) => l.trim()).filter(Boolean),
+    ...String(out.untracked ?? "").split(/\r?\n/).map((l) => l.trim()).filter(Boolean),
   ].filter((f) => (seen.has(f) ? false : (seen.add(f), true)));
+  const diffStat = [String(out.diffStat ?? "").trim(), String(out.cachedDiffStat ?? "").trim()]
+    .filter(Boolean)
+    .map((s, i) => (i === 0 ? s : s.split(/\r?\n/).map((l) => "staged: " + l).join("\n")))
+    .join("\n");
   return {
-    statusShort: status.stdout.trim(),
-    diffStat: diffStat.stdout.trim(),
+    statusShort: String(out.status ?? "").trim(),
+    diffStat,
     changedFiles,
+    head: String(out.head ?? "").trim(),
+  };
+}
+
+async function committedDelta(workspacePath, beforeHead, afterHead) {
+  if (!beforeHead || beforeHead === afterHead) return null;
+  const [log, stat] = await Promise.all([
+    runCommand("git", ["log", "--oneline", beforeHead + ".." + afterHead], { cwd: workspacePath, timeoutMs: GIT_TIMEOUT_MS }),
+    runCommand("git", ["diff", "--stat", beforeHead + ".." + afterHead], { cwd: workspacePath, timeoutMs: GIT_TIMEOUT_MS }),
+  ]);
+  return {
+    range: beforeHead + ".." + afterHead,
+    log: String(log.stdout ?? "").trim(),
+    diffStat: String(stat.stdout ?? "").trim(),
   };
 }
 
@@ -307,7 +406,25 @@ async function listBackends() {
   return entries;
 }
 
-async function delegateTask(rawArgs) {
+// Per-workspace mutex: concurrent delegations to the same checkout are
+// serialized so workers cannot interleave edits or snapshot each other.
+const workspaceLocks = new Map();
+async function withWorkspaceLock(key, fn) {
+  const prev = workspaceLocks.get(key) ?? Promise.resolve();
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const next = prev.catch(() => {}).then(() => gate);
+  workspaceLocks.set(key, next);
+  await prev.catch(() => {});
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (workspaceLocks.get(key) === next) workspaceLocks.delete(key);
+  }
+}
+
+async function delegateTask(rawArgs, cancel) {
   const backends = await loadBackends();
   if (!rawArgs || typeof rawArgs.backend !== "string" || !rawArgs.backend.trim()) {
     throw new Error("backend must be a non-empty string");
@@ -323,66 +440,94 @@ async function delegateTask(rawArgs) {
   const workspacePath = await validateWorkspace(rawArgs.workspacePath);
   await requireGitRepo(workspacePath);
 
-  const allowDirty = rawArgs.allowDirty === true;
-  const before = await gitSnapshot(workspacePath);
-  if (!allowDirty && before.statusShort) {
+  return await withWorkspaceLock("ws:" + workspacePath, async () => {
+    const allowDirty = rawArgs.allowDirty === true;
+    const before = await gitSnapshot(workspacePath);
+    if (!allowDirty && before.statusShort) {
+      return {
+        ok: false,
+        error: "working tree is dirty; review current changes first or set allowDirty=true deliberately",
+        backend, workspacePath, exitCode: null, timedOut: false, killed: false, cancelled: false,
+        outputTail: "", stderrTail: "",
+        gitBefore: before, git: before, commits: null,
+        experimental: Boolean(spec.experimental),
+      };
+    }
+
+    let template;
+    if (typeof rawArgs.resumeSessionId === "string" && rawArgs.resumeSessionId.trim() && Array.isArray(spec.resumeArgs)) {
+      template = spec.resumeArgs;
+    } else if (Array.isArray(spec.buildArgs)) {
+      template = spec.buildArgs;
+    } else {
+      return {
+        ok: false,
+        error: "backend \"" + backend + "\" has no command template configured",
+        backend, workspacePath, exitCode: null, timedOut: false, killed: false, cancelled: false,
+        outputTail: "", stderrTail: "",
+        gitBefore: before, git: before, commits: null,
+        experimental: Boolean(spec.experimental),
+      };
+    }
+
+    const timeoutMs = Number.isInteger(rawArgs.timeoutMs)
+      ? Math.min(MAX_TIMEOUT_MS, Math.max(MIN_TIMEOUT_MS, rawArgs.timeoutMs))
+      : DEFAULT_TIMEOUT_MS;
+    const args = substituteArgs(template, rawArgs.task.trim(), rawArgs.resumeSessionId ?? "");
+
+    const result = await runCommand(spec.command, args, {
+      cwd: workspacePath,
+      timeoutMs,
+      onChild: (child) => { if (cancel) cancel.child = child; },
+    });
+    const after = await gitSnapshot(workspacePath);
+    const commits = await committedDelta(workspacePath, before.head, after.head);
+    let error = "";
+    if (cancel && cancel.cancelled) {
+      error = "delegation cancelled by client";
+    } else if (result.timedOut) {
+      error = "backend \"" + backend + "\" timed out after " + timeoutMs + " ms" + (result.killed ? " and was force-killed" : "");
+    } else if (result.exitCode !== 0) {
+      error = "backend \"" + backend + "\" exited with code " + String(result.exitCode);
+    }
+
     return {
-      ok: false,
-      error: "working tree is dirty; review current changes first or set allowDirty=true deliberately",
-      backend, workspacePath, exitCode: null, timedOut: false, outputTail: "", stderrTail: "",
-      git: before, experimental: Boolean(spec.experimental),
+      ok: !error,
+      error,
+      backend,
+      workspacePath,
+      exitCode: result.exitCode,
+      timedOut: result.timedOut,
+      killed: result.killed,
+      cancelled: Boolean(cancel && cancel.cancelled),
+      outputTail: tail(result.stdout, RAW_TAIL_CHARS),
+      stderrTail: tail(result.stderr, RAW_TAIL_CHARS),
+      gitBefore: before,
+      git: after,
+      commits,
+      experimental: Boolean(spec.experimental),
     };
-  }
-
-  let template;
-  if (typeof rawArgs.resumeSessionId === "string" && rawArgs.resumeSessionId.trim() && Array.isArray(spec.resumeArgs)) {
-    template = spec.resumeArgs;
-  } else if (Array.isArray(spec.buildArgs)) {
-    template = spec.buildArgs;
-  } else {
-    return {
-      ok: false,
-      error: "backend \"" + backend + "\" has no command template configured",
-      backend, workspacePath, exitCode: null, timedOut: false, outputTail: "", stderrTail: "",
-      git: before, experimental: Boolean(spec.experimental),
-    };
-  }
-
-  const timeoutMs = Number.isInteger(rawArgs.timeoutMs)
-    ? Math.min(MAX_TIMEOUT_MS, Math.max(MIN_TIMEOUT_MS, rawArgs.timeoutMs))
-    : DEFAULT_TIMEOUT_MS;
-  const args = substituteArgs(template, rawArgs.task.trim(), rawArgs.resumeSessionId ?? "");
-
-  const result = await runCommand(spec.command, args, { cwd: workspacePath, timeoutMs });
-  const after = await gitSnapshot(workspacePath);
-  let error = "";
-  if (result.timedOut) error = "backend \"" + backend + "\" timed out after " + timeoutMs + " ms";
-  else if (result.exitCode !== 0) error = "backend \"" + backend + "\" exited with code " + String(result.exitCode);
-
-  return {
-    ok: !error,
-    error,
-    backend,
-    workspacePath,
-    exitCode: result.exitCode,
-    timedOut: result.timedOut,
-    outputTail: tail(result.stdout, RAW_TAIL_CHARS),
-    stderrTail: tail(result.stderr, RAW_TAIL_CHARS),
-    git: after,
-    experimental: Boolean(spec.experimental),
-  };
+  });
 }
 
 function textResult(header, obj) {
   const lines = ["# " + header, ""];
   for (const [key, value] of Object.entries(obj)) {
-    if (key === "outputTail" || key === "stderrTail" || key === "git") continue;
+    if (["outputTail", "stderrTail", "git", "gitBefore", "commits"].includes(key)) continue;
     lines.push("- " + key + ": " + String(value ?? ""));
   }
-  if (obj.git) {
-    lines.push("", "## git status --short", "", "~~~text", obj.git.statusShort || "(clean)", "~~~");
-    lines.push("", "## git diff --stat", "", "~~~text", obj.git.diffStat || "(empty)", "~~~");
-    lines.push("", "## changed files", "", "~~~text", (obj.git.changedFiles ?? []).join("\n") || "(none)", "~~~");
+  const gitBlock = (label, git) => {
+    if (!git) return;
+    lines.push("", "## " + label + " git status --short", "", "~~~text", git.statusShort || "(clean)", "~~~");
+    lines.push("", "## " + label + " git diff stat", "", "~~~text", git.diffStat || "(empty)", "~~~");
+    lines.push("", "## " + label + " changed files", "", "~~~text", (git.changedFiles ?? []).join("\n") || "(none)", "~~~");
+    lines.push("", "## " + label + " HEAD", "", "~~~text", git.head || "(unknown)", "~~~");
+  };
+  gitBlock("before", obj.gitBefore);
+  gitBlock("after", obj.git);
+  if (obj.commits) {
+    lines.push("", "## commits made by the worker", "", "~~~text", obj.commits.log || "(none)", "~~~");
+    lines.push("", "## commit diff stat", "", "~~~text", obj.commits.diffStat || "(empty)", "~~~");
   }
   if (obj.outputTail) lines.push("", "## output tail", "", "~~~text", obj.outputTail, "~~~");
   if (obj.stderrTail) lines.push("", "## stderr tail", "", "~~~text", obj.stderrTail, "~~~");
@@ -393,21 +538,42 @@ function textResult(header, obj) {
 function jsonRpcResult(id, result) { return { jsonrpc: "2.0", id, result }; }
 function jsonRpcError(id, code, message) { return { jsonrpc: "2.0", id, error: { code, message } }; }
 
+// In-flight delegate_task requests, keyed by JSON-RPC request id, so a
+// notifications/cancelled can terminate the worker process.
+const activeRequests = new Map();
+
 async function handleMessage(message) {
   if (!message || typeof message !== "object" || message.jsonrpc !== "2.0") {
     return jsonRpcError(null, -32600, "Invalid JSON-RPC request");
   }
-  if (message.id === undefined) return null; // notification
+  if (message.method === "notifications/cancelled") {
+    const requestId = message.params?.requestId ?? message.params?.id;
+    const entry = activeRequests.get(String(requestId));
+    if (entry && entry.cancel) {
+      entry.cancel.cancelled = true;
+      if (entry.cancel.child) {
+        try { entry.cancel.child.kill("SIGTERM"); } catch { /* already gone */ }
+        setTimeout(() => {
+          try { entry.cancel.child.kill("SIGKILL"); } catch { /* already gone */ }
+        }, KILL_GRACE_MS).unref?.();
+      }
+    }
+    return null;
+  }
+  if (message.id === undefined) return null; // other notification
 
   try {
     switch (message.method) {
       case "initialize":
         return jsonRpcResult(message.id, {
-          protocolVersion: message.params?.protocolVersion ?? PROTOCOL_VERSION,
+          // Negotiate honestly: this server implements exactly one protocol
+          // version, so it always reports that version rather than echoing an
+          // unsupported client request.
+          protocolVersion: PROTOCOL_VERSION,
           capabilities: { tools: { listChanged: false } },
           serverInfo: { name: SERVER_NAME, title: "CLI Agent Bridge", version: SERVER_VERSION },
           instructions:
-            "Delegate coding tasks to locally installed coding CLIs. Prefer workspace_status first, then delegate_task, then review the returned git diff. Never put credentials in task text.",
+            "Delegate coding tasks to locally installed coding CLIs. Prefer workspace_status first, then delegate_task, then review the returned git snapshot. Never put credentials in task text.",
         });
       case "ping":
         return jsonRpcResult(message.id, {});
@@ -441,11 +607,18 @@ async function handleMessage(message) {
           });
         }
         if (params.name === "delegate_task") {
-          const out = await delegateTask(args);
-          return jsonRpcResult(message.id, {
-            content: [{ type: "text", text: textResult("Delegated Task Result", out) }],
-            structuredContent: out,
-          });
+          const cancel = { child: null, cancelled: false };
+          activeRequests.set(String(message.id), { cancel });
+          try {
+            const out = await delegateTask(args, cancel);
+            return jsonRpcResult(message.id, {
+              content: [{ type: "text", text: textResult("Delegated Task Result", out) }],
+              structuredContent: out,
+              isError: !out.ok,
+            });
+          } finally {
+            activeRequests.delete(String(message.id));
+          }
         }
         return jsonRpcError(message.id, -32602, "Unknown tool: " + params.name);
       }

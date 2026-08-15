@@ -43,6 +43,10 @@ workspace, followed by a comparison of the two diffs reported to the user.
 
 - Node.js 20 or newer to run the MCP server (the server has no npm dependencies).
 - git available on PATH; the target workspace must be a git repository.
+- Supported operating systems: Windows, macOS, and Linux. The server is plain Node.js; on Windows,
+  shim-based CLIs additionally go through the bundled PowerShell 5.1 runner. End-to-end verified on
+  Windows (Claude Code 2.1.226, Kimi Code 0.30.0) and validated on Linux in a Node 22 container;
+  macOS uses the same POSIX path and is not yet machine-verified.
 - Each backend CLI must be installed, on PATH, and signed in with your own account before use:
 
 | Backend | CLI | Status | Headless form used |
