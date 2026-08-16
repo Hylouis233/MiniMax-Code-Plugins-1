@@ -6,9 +6,11 @@
 #   python xlsx_fixture.py  (deps: openpyxl)
 #   python docx_fixture.py  (deps: python-docx, pymupdf, soffice on PATH)
 import sys
+import zipfile
 
+from lxml import etree
 from pptx import Presentation
-from pptx.chart.data import ChartData
+from pptx.chart.data import BubbleChartData, ChartData, XyChartData
 from pptx.dml.color import RGBColor
 from pptx.enum.chart import XL_CHART_TYPE
 from pptx.enum.shapes import MSO_SHAPE_TYPE
@@ -139,6 +141,13 @@ def iter_shapes(shapes):
             yield shape
 
 
+def cached_numeric_values(series, element_name):
+    return [
+        node.text for node in
+        series._element.xpath(f"./c:{element_name}//c:pt/c:v")
+    ]
+
+
 def extract_slide_content(slide):
     shapes = list(iter_shapes(slide.shapes))
     text = [sh.text_frame.text for sh in shapes if sh.has_text_frame and sh.text_frame.text]
@@ -157,15 +166,29 @@ def extract_slide_content(slide):
         )
         plots = []
         for plot in chart.plots:
-            categories = [
-                [str(level) for level in label]
-                for label in plot.categories.flattened_labels
-            ]
-            series = [
-                {"name": item.name, "values": list(item.values)}
-                for item in plot.series
-            ]
-            plots.append({"categories": categories, "series": series})
+            plot_kind = type(plot).__name__
+            if plot_kind in {"XyPlot", "BubblePlot"}:
+                series = []
+                for item in plot.series:
+                    values = {
+                        "name": item.name,
+                        "x_values": cached_numeric_values(item, "xVal"),
+                        "y_values": cached_numeric_values(item, "yVal"),
+                    }
+                    if plot_kind == "BubblePlot":
+                        values["bubble_sizes"] = cached_numeric_values(item, "bubbleSize")
+                    series.append(values)
+                plots.append({"kind": plot_kind, "series": series})
+            else:
+                categories = [
+                    [str(level) for level in label]
+                    for label in plot.categories.flattened_labels
+                ]
+                series = [
+                    {"name": item.name, "values": list(item.values)}
+                    for item in plot.series
+                ]
+                plots.append({"kind": plot_kind, "categories": categories, "series": series})
         charts.append({"title": chart_title, "plots": plots})
     notes = slide.notes_slide.notes_text_frame.text if slide.has_notes_slide else ""
     return {"text": text, "tables": tables, "charts": charts, "notes": notes}
@@ -183,6 +206,49 @@ check(
     content["charts"],
 )
 check("content inventory emits notes text", "regional split" in content["notes"], content["notes"])
+
+# XY scatter and bubble plots do not have category/value-series semantics.
+xy_prs = Presentation()
+xy_slide = xy_prs.slides.add_slide(xy_prs.slide_layouts[6])
+xy_data = XyChartData()
+xy_series = xy_data.add_series("XY series")
+xy_series.add_data_point(1, 2)
+xy_series.add_data_point(3, 4)
+xy_slide.shapes.add_chart(
+    XL_CHART_TYPE.XY_SCATTER,
+    Inches(0.5), Inches(0.5), Inches(4), Inches(2.5), xy_data,
+)
+bubble_data = BubbleChartData()
+bubble_series = bubble_data.add_series("Bubble series")
+bubble_series.add_data_point(5, 6, 7)
+xy_slide.shapes.add_chart(
+    XL_CHART_TYPE.BUBBLE,
+    Inches(0.5), Inches(3.5), Inches(4), Inches(2.5), bubble_data,
+)
+xy_prs.save("xy-bubble.pptx")
+xy_content = extract_slide_content(Presentation("xy-bubble.pptx").slides[0])
+xy_plots = [plot for chart in xy_content["charts"] for plot in chart["plots"]]
+check(
+    "scatter inventory emits x and y caches without category access",
+    any(
+        plot["kind"] == "XyPlot"
+        and plot["series"][0]["x_values"] == ["1", "3"]
+        and plot["series"][0]["y_values"] == ["2", "4"]
+        for plot in xy_plots
+    ),
+    xy_plots,
+)
+check(
+    "bubble inventory emits x, y, and bubble-size caches",
+    any(
+        plot["kind"] == "BubblePlot"
+        and plot["series"][0]["x_values"] == ["5"]
+        and plot["series"][0]["y_values"] == ["6"]
+        and plot["series"][0]["bubble_sizes"] == ["7"]
+        for plot in xy_plots
+    ),
+    xy_plots,
+)
 
 
 sp_element = slide6.shapes[-1]._element  # the textbox; layout 5 still carries a Title placeholder
@@ -425,6 +491,66 @@ check(
     ("Paragraph Face", "paragraph defaults") in detected_faces,
     detected_faces,
 )
+
+# ---- analyze.md bounded ZIP/XML health check ----------------------------------
+MAX_XML_PART = 20 * 1024 * 1024
+MAX_ENTRY = 100 * 1024 * 1024
+MAX_TOTAL_UNCOMPRESSED = 500 * 1024 * 1024
+MAX_COMPRESSION_RATIO = 200
+safe_xml_parser = etree.XMLParser(
+    load_dtd=False,
+    resolve_entities=False,
+    no_network=True,
+    huge_tree=False,
+    recover=False,
+)
+
+
+def validate_pptx_package(path):
+    with zipfile.ZipFile(path) as archive:
+        infos = archive.infolist()
+        names = {info.filename for info in infos}
+        assert len(names) == len(infos)
+        assert "[Content_Types].xml" in names and "ppt/presentation.xml" in names
+        assert sum(info.file_size for info in infos) <= MAX_TOTAL_UNCOMPRESSED
+        actual_total = 0
+        for info in infos:
+            assert info.file_size <= MAX_ENTRY
+            assert info.file_size / max(info.compress_size, 1) <= MAX_COMPRESSION_RATIO
+            is_xml = info.filename.endswith((".xml", ".rels"))
+            if is_xml:
+                assert info.file_size <= MAX_XML_PART
+            chunks = []
+            actual_size = 0
+            with archive.open(info) as stream:
+                while chunk := stream.read(64 * 1024):
+                    actual_size += len(chunk)
+                    actual_total += len(chunk)
+                    assert actual_size <= MAX_ENTRY
+                    assert actual_total <= MAX_TOTAL_UNCOMPRESSED
+                    if is_xml:
+                        chunks.append(chunk)
+            assert actual_size == info.file_size
+            if is_xml:
+                etree.fromstring(b"".join(chunks), parser=safe_xml_parser)
+
+
+try:
+    validate_pptx_package("input.pptx")
+    healthy_package_passed = True
+except Exception:
+    healthy_package_passed = False
+check("bounded package health check accepts an ordinary PPTX", healthy_package_passed)
+
+with zipfile.ZipFile("compressed-bomb.pptx", "w", zipfile.ZIP_DEFLATED) as archive:
+    archive.writestr("[Content_Types].xml", "<Types/>")
+    archive.writestr("ppt/presentation.xml", "<presentation>" + (" " * 2_000_000) + "</presentation>")
+try:
+    validate_pptx_package("compressed-bomb.pptx")
+    archive_bomb_rejected = False
+except AssertionError:
+    archive_bomb_rejected = True
+check("PPTX compression bomb is rejected before XML expansion", archive_bomb_rejected)
 
 print("\n" + ("ALL PPTX FIXTURES PASSED" if not failures else f"{len(failures)} FAILURES: {failures}"))
 sys.exit(0 if not failures else 1)

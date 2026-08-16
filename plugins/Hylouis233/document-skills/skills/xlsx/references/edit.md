@@ -11,7 +11,14 @@ ws = wb["Data"]
 def non_cell_references(workbook):
     """Inventory ranges/formulas that insert_rows/delete_rows will not rewrite."""
     refs = []
-    for item in workbook.defined_names.values():
+    defined_names = workbook.defined_names
+    # openpyxl 3.1 exposes a dict-like mapping; 3.0 uses DefinedNameList.
+    defined_name_items = (
+        defined_names.values()
+        if hasattr(defined_names, "values")
+        else defined_names.definedName
+    )
+    for item in defined_name_items:
         refs.append(("defined name", item.name, item.attr_text))
     for sheet in workbook.worksheets:
         owner = sheet.title

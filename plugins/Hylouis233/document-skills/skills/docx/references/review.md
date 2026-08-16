@@ -4,7 +4,7 @@
 
 | Symptom | Likely cause | Fix route
 |---|---|---|
-File will not open at all | broken ZIP (truncated, wrong repack) | inspect with `zipfile.ZipFile(path).testzip()`; if entries are damaged, recover from the user's original or prior version |
+File will not open at all | broken ZIP (truncated, wrong repack) | run the bounded health check below; if entries are damaged, recover from the user's original or prior version |
 Opens with "unreadable content" repair prompt | content-types / rels mismatch, invalid XML | Tier 2 surgery: validate XML parses, check `[Content_Types].xml` covers every part extension |
 Text present but styles lost | document rebuilt from scratch instead of edited | redo as edit on the original package |
 Images missing | media parts not repacked or rels broken | verify `word/media/*` exist and `document.xml.rels` references them |

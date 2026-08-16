@@ -135,6 +135,44 @@ check("pooled cmap is proven unsafe (negative control)", pooled_passes)
 check("per-run cmap check identifies the actual missing glyph",
       per_run_missing == [("Latin Face", "漢")], per_run_missing)
 
+# Header/footer runs do not expose run.part.document; resolve Normal from doc once.
+header_doc = Document()
+normal_style = header_doc.styles["Normal"]
+normal_rfonts = normal_style._element.get_or_add_rPr().get_or_add_rFonts()
+normal_rfonts.set(qn("w:eastAsia"), "Header CJK Face")
+header_run = header_doc.sections[0].header.paragraphs[0].add_run("漢")
+
+
+def fixture_face_from_rpr(rpr, slot):
+    if rpr is None:
+        return None
+    rfonts = rpr.find(qn("w:rFonts"))
+    return None if rfonts is None else rfonts.get(qn("w:" + slot))
+
+
+def fixture_style_faces(style, slot):
+    while style is not None:
+        face = fixture_face_from_rpr(style.element.find(qn("w:rPr")), slot)
+        if face:
+            yield face
+        style = style.base_style
+
+
+def fixture_effective_face(run, slot):
+    direct = fixture_face_from_rpr(run._r.find(qn("w:rPr")), slot)
+    if direct:
+        return direct
+    for style in (run.style, run._parent.style, normal_style):
+        if face := next(fixture_style_faces(style, slot), None):
+            return face
+    raise LookupError(slot)
+
+
+check("header part has no document back-reference (negative control)",
+      not hasattr(header_run.part, "document"))
+check("header glyph validation resolves document Normal style",
+      fixture_effective_face(header_run, "eastAsia") == "Header CJK Face")
+
 # ---- edit.md guarded cross-run replacement ------------------------------------
 SAFE_RUN_CHILDREN = {
     qn("w:rPr"), qn("w:t"), qn("w:tab"), qn("w:br"), qn("w:cr"),

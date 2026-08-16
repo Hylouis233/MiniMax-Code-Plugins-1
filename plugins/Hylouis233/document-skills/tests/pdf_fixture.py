@@ -5,6 +5,7 @@
 #   python pptx_fixture.py  (deps: python-pptx)
 #   python xlsx_fixture.py  (deps: openpyxl)
 #   python docx_fixture.py  (deps: python-docx, pymupdf, soffice on PATH)
+import os
 import sys
 
 import fitz
@@ -61,6 +62,42 @@ check("PyMuPDF authenticates before page extraction", encrypted_extract.authenti
 check("authenticated PyMuPDF extraction reaches page text",
       "Application form" in encrypted_extract[0].get_text("text", sort=True))
 
+
+def open_pdf(path):
+    reader = pypdf.PdfReader(path)
+    if reader.is_encrypted:
+        password = os.environ.get("PDF_PASSWORD", "")
+        if reader.decrypt(password) == 0:
+            raise RuntimeError(f"Encrypted PDF {path}: set a valid PDF_PASSWORD")
+    return reader
+
+
+os.environ["PDF_PASSWORD"] = "fixture-password"
+transform_encrypted = open_pdf("encrypted.pdf")
+check("transform helper authenticates encrypted input before page access",
+      len(transform_encrypted.pages) == 2)
+
+# A page containing only an AcroForm widget is interactive content, not blank.
+widget_canvas = canvas.Canvas("widget-only.pdf", pagesize=A4)
+widget_canvas.acroForm.textfield(
+    name="widget_only", x=72, y=740, width=260, height=20, borderWidth=1,
+)
+widget_canvas.showPage()
+widget_canvas.save()
+widget_doc = fitz.open("widget-only.pdf")
+widget_page = widget_doc[0]
+widgets = list(widget_page.widgets() or ())
+annotations = list(widget_page.annots() or ())
+links = widget_page.get_links()
+blank = (
+    not widget_page.get_text().strip()
+    and not widget_page.get_images()
+    and not widget_page.get_drawings()
+    and not widgets and not annotations and not links
+)
+check("widget-only form page exposes a widget", len(widgets) == 1, len(widgets))
+check("widget-aware blank-page predicate keeps form page", not blank)
+
 # ---- transform.md AcroForm snippet: clone into writer, fill on writer pages ----
 from pypdf import PdfReader, PdfWriter
 
@@ -81,6 +118,25 @@ check_r = PdfReader("filled.pdf")
 check("filled file keeps both pages", len(check_r.pages) == 2, len(check_r.pages))
 value = str((check_r.get_fields() or {}).get("applicant_name", {}).get("/V", ""))
 check("field value round-trips", value.strip("/") == "Ada Byron", repr(value))
+
+# ---- transform.md merge imports outline navigation ----------------------------
+appendix_writer = PdfWriter()
+appendix_writer.add_blank_page(width=200, height=300)
+appendix_writer.add_outline_item("Appendix bookmark", 0)
+with open("appendix-outline.pdf", "wb") as f:
+    appendix_writer.write(f)
+
+merge_writer = PdfWriter()
+merge_writer.append(open_pdf("form.pdf"), pages=(1, 2), import_outline=True)
+merge_writer.append(open_pdf("appendix-outline.pdf"), import_outline=True)
+with open("merged-outline.pdf", "wb") as f:
+    merge_writer.write(f)
+merged_outline = PdfReader("merged-outline.pdf").outline
+check(
+    "append imports the appended PDF outline",
+    any(getattr(item, "title", "") == "Appendix bookmark" for item in merged_outline),
+    merged_outline,
+)
 
 # ---- transform.md watermark snippet -------------------------------------------
 from pypdf import PdfReader as R2
@@ -117,8 +173,6 @@ check("stamp text present on every page", all(stamp_text in (p.extract_text() or
 pix = fitz.Pixmap(fitz.csCMYK, fitz.IRect(0, 0, 24, 24))  # CMYK pixmap like a CMYK PDF image
 converted = fitz.Pixmap(fitz.csRGB, pix) if pix.colorspace not in (fitz.csGRAY, fitz.csRGB) else pix
 converted.save("cmyk-converted.png")
-import os
-
 check("CMYK pixmap converts to a saved PNG", os.path.getsize("cmyk-converted.png") > 0)
 rgb = fitz.Pixmap("cmyk-converted.png")
 check("converted pixmap is RGB", "RGB" in str(rgb.colorspace), rgb.colorspace)

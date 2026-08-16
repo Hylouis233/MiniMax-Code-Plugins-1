@@ -3,19 +3,27 @@
 One tool for page-level structure changes:
 
 ```python
+import os
 from pypdf import PdfReader, PdfWriter
 
-reader = PdfReader("input.pdf")
+def open_pdf(path):
+    reader = PdfReader(path)
+    if reader.is_encrypted:
+        password = os.environ.get("PDF_PASSWORD", "")
+        if reader.decrypt(password) == 0:
+            raise RuntimeError(f"Encrypted PDF {path}: set a valid PDF_PASSWORD")
+    return reader
+
+reader = open_pdf("input.pdf")
 writer = PdfWriter()
 
-# Split: keep only pages 2-4 (0-based)
-for i in range(1, 4):
-    writer.add_page(reader.pages[i])
+# Split: keep only pages 2-4 (0-based), remapping any retained outline entries.
+writer.append(reader, pages=(1, 4), import_outline=True)
 
-# Merge another file at the end
-other = PdfReader("appendix.pdf")
-for page in other.pages:
-    writer.add_page(page)
+# Merge another file at the end. append() imports bookmarks/named destinations;
+# copying other.pages one by one would silently discard that navigation structure.
+other = open_pdf("appendix.pdf")
+writer.append(other, import_outline=True)
 
 # Rotate a page 90 degrees
 writer.pages[0].rotate(90)
@@ -30,9 +38,9 @@ with open("output.pdf", "wb") as f:
 Watermark / stamp by merging a stamp page onto each page:
 
 ```python
-stamp = PdfReader("watermark.pdf").pages[0]
+stamp = open_pdf("watermark.pdf").pages[0]
 stamp_text = (stamp.extract_text() or "").strip()
-reader = PdfReader("input.pdf")
+reader = open_pdf("input.pdf")
 expected_sizes = [tuple(float(value) for value in page.mediabox) for page in reader.pages]
 expected_fields = reader.get_fields() or {}
 writer = PdfWriter()
@@ -68,7 +76,7 @@ Encryption and forms:
   ```python
   from pypdf import PdfReader, PdfWriter
 
-  reader = PdfReader("form.pdf")
+  reader = open_pdf("form.pdf")
   fields = reader.get_fields() or {}
   assert fields, "this PDF has no AcroForm form fields"
 

@@ -103,6 +103,7 @@ section.left_margin, section.right_margin = Cm(2.8), Cm(2.6)
    from docx.text.paragraph import Paragraph
 
    doc = Document("output.docx")
+   normal_style = doc.styles["Normal"]
 
    def xml_runs(element, parent):
        # Covers direct paragraphs, tables, nested tables, and block content controls.
@@ -131,7 +132,9 @@ section.left_margin, section.right_margin = Cm(2.8), Cm(2.6)
        direct = face_from_rpr(run._r.find(qn("w:rPr")), slot)
        if direct:
            return direct
-       for style in (run.style, run._parent.style, run.part.document.styles["Normal"]):
+       # Header/footer runs belong to a HeaderPart/FooterPart, which has no .document.
+       # Resolve the owning document's Normal style once rather than via run.part.
+       for style in (run.style, run._parent.style, normal_style):
            if face := next(style_faces(style, slot), None):
                return face
        raise LookupError(f"no resolved {slot} face for run {run.text!r}; resolve theme defaults")

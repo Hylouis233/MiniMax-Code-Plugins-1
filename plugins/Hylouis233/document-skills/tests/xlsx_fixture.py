@@ -226,7 +226,13 @@ from openpyxl.worksheet.table import Table
 
 def non_cell_references(workbook):
     refs = []
-    for item in workbook.defined_names.values():
+    defined_names = workbook.defined_names
+    defined_name_items = (
+        defined_names.values()
+        if hasattr(defined_names, "values")
+        else defined_names.definedName
+    )
+    for item in defined_name_items:
         refs.append(("defined name", item.name, item.attr_text))
     for sheet in workbook.worksheets:
         owner = sheet.title
@@ -258,6 +264,23 @@ def non_cell_references(workbook):
                 if element.tag.rsplit("}", 1)[-1] == "f" and element.text:
                     refs.append(("chart series", f"{owner} chart {index}", element.text))
     return refs
+
+
+class LegacyDefinedNames:
+    """Minimal openpyxl 3.0-style DefinedNameList surface."""
+    definedName = [DefinedName("LegacyRange", attr_text="'Legacy'!$A$1")]
+
+
+class LegacyWorkbook:
+    defined_names = LegacyDefinedNames()
+    worksheets = []
+
+
+check(
+    "structural audit supports openpyxl 3.0 DefinedNameList",
+    non_cell_references(LegacyWorkbook())
+    == [("defined name", "LegacyRange", "'Legacy'!$A$1")],
+)
 
 
 audit_wb = openpyxl.Workbook()

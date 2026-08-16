@@ -14,6 +14,13 @@ def iter_shapes(shapes):
         else:
             yield shape
 
+def cached_numeric_values(series, element_name):
+    """Read the cached numeric points python-pptx does not expose for XY/bubble axes."""
+    return [
+        node.text for node in
+        series._element.xpath(f"./c:{element_name}//c:pt/c:v")
+    ]
+
 prs = Presentation("input.pptx")
 print("slide size:", prs.slide_width, prs.slide_height)
 for i, slide in enumerate(prs.slides):
@@ -37,15 +44,29 @@ for i, slide in enumerate(prs.slides):
         )
         plots = []
         for plot in chart.plots:
-            categories = [
-                [str(level) for level in label]
-                for label in plot.categories.flattened_labels
-            ]
-            series = [
-                {"name": item.name, "values": list(item.values)}
-                for item in plot.series
-            ]
-            plots.append({"categories": categories, "series": series})
+            plot_kind = type(plot).__name__
+            if plot_kind in {"XyPlot", "BubblePlot"}:
+                series = []
+                for item in plot.series:
+                    values = {
+                        "name": item.name,
+                        "x_values": cached_numeric_values(item, "xVal"),
+                        "y_values": cached_numeric_values(item, "yVal"),
+                    }
+                    if plot_kind == "BubblePlot":
+                        values["bubble_sizes"] = cached_numeric_values(item, "bubbleSize")
+                    series.append(values)
+                plots.append({"kind": plot_kind, "series": series})
+            else:
+                categories = [
+                    [str(level) for level in label]
+                    for label in plot.categories.flattened_labels
+                ]
+                series = [
+                    {"name": item.name, "values": list(item.values)}
+                    for item in plot.series
+                ]
+                plots.append({"kind": plot_kind, "categories": categories, "series": series})
         charts.append({"title": chart_title, "plots": plots})
     pictures = [sh.name for sh in shapes if sh.shape_type == MSO_SHAPE_TYPE.PICTURE]
 
@@ -70,8 +91,65 @@ layouts where the title placeholder is missing.)
 | Text is clipped or overflows its box | render every slide and inspect right/left and bottom/vertical fit; shape bounds do not measure laid-out text | reflow, resize the box, or reduce text/font size, then render again |
 | Everything shifted | slide size changed between sources | normalize slide size or re-layout on the target size |
 | Fonts look wrong elsewhere | non-embedded fonts (pptx rarely embeds) | report every effective font via the resolution chain below, not just explicit `run.font.name` values |
-| File will not open | broken ZIP / part mismatch | same programmatic health check as DOCX: `zipfile.testzip()`, parse every `.xml` part |
+| File will not open | broken ZIP / part mismatch | run the bounded package health check below before parsing every XML part |
 | Pictures blank | media parts missing or rels broken | verify `ppt/media/*` present and slide rels reference them |
+
+## Bounded package health check
+
+Inspect declared sizes and compression ratios before decompressing anything. `ZipFile.testzip()`
+must not be the first check because it expands every member, including an archive bomb.
+
+```python
+import zipfile
+from lxml import etree
+
+path = "input.pptx"
+MAX_XML_PART = 20 * 1024 * 1024
+MAX_ENTRY = 100 * 1024 * 1024
+MAX_TOTAL_UNCOMPRESSED = 500 * 1024 * 1024
+MAX_COMPRESSION_RATIO = 200
+safe_xml_parser = etree.XMLParser(
+    load_dtd=False,
+    resolve_entities=False,
+    no_network=True,
+    huge_tree=False,
+    recover=False,
+)
+
+with zipfile.ZipFile(path) as archive:
+    infos = archive.infolist()
+    names = {info.filename for info in infos}
+    assert len(names) == len(infos), "duplicate archive member names are unsafe"
+    assert "[Content_Types].xml" in names and "ppt/presentation.xml" in names
+    assert sum(info.file_size for info in infos) <= MAX_TOTAL_UNCOMPRESSED
+
+    actual_total = 0
+    for info in infos:
+        assert info.file_size <= MAX_ENTRY, f"oversized part: {info.filename}"
+        ratio = info.file_size / max(info.compress_size, 1)
+        assert ratio <= MAX_COMPRESSION_RATIO, f"suspicious compression ratio: {info.filename}"
+        is_xml = info.filename.endswith((".xml", ".rels"))
+        if is_xml:
+            assert info.file_size <= MAX_XML_PART, f"oversized XML part: {info.filename}"
+
+        chunks = []
+        actual_size = 0
+        # Streaming to EOF verifies decompression and CRC only after metadata limits pass.
+        with archive.open(info) as stream:
+            while chunk := stream.read(64 * 1024):
+                actual_size += len(chunk)
+                actual_total += len(chunk)
+                assert actual_size <= MAX_ENTRY, f"part exceeded read limit: {info.filename}"
+                assert actual_total <= MAX_TOTAL_UNCOMPRESSED, "archive exceeded total read limit"
+                if is_xml:
+                    chunks.append(chunk)
+        assert actual_size == info.file_size, f"size mismatch: {info.filename}"
+        if is_xml:
+            etree.fromstring(b"".join(chunks), parser=safe_xml_parser)
+```
+
+These are conservative triage defaults, not PPTX format limits. Raise a limit only for an
+explicitly trusted large deck, and retain the per-member and streaming checks.
 
 ## Font triage with inheritance
 
