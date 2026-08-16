@@ -144,8 +144,9 @@ node --test plugins/Hylouis233/cli-agent-bridge/tests/server.test.mjs
 ```
 
 They cover the full MCP flow plus in-process and cross-process canonical worktree locking, queued
-delegation/status cancellation, cancel/timeout process-tree termination, unborn HEAD snapshots,
-and Codex prompt delimiters on Windows and POSIX.
+delegation/status cancellation, cancel/timeout process-tree termination, zombie-only Linux groups,
+unusual Git pathnames, JSON-RPC id typing, unborn HEAD snapshots, and Codex prompt delimiters on
+Windows and POSIX.
 
 ## License
 

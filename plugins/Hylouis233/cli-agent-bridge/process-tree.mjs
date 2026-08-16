@@ -74,54 +74,72 @@ async function windowsProcessTreePids(rootPid, knownPids = new Set()) {
   return [...descendants];
 }
 
-async function linuxProcessGroupHasLiveMembers(processGroupId) {
+// Linux keeps zombie processes in /proc until their parent (sometimes a
+// non-reaping container PID 1) collects them. This classifier is deliberately
+// tri-state: true means a live member was found, false means every matching
+// member is a zombie, and null means the result is uncertain. Callers may only
+// use the false result after a group-wide SIGKILL; while a group is still
+// running, enumerating /proc races with members that can fork.
+export async function linuxProcessGroupHasLiveMembers(
+  processGroupId,
+  procRoot = "/proc",
+  fsOps = { readdir, readFile },
+) {
   let entries;
   try {
-    entries = await readdir("/proc", { withFileTypes: true });
+    entries = await fsOps.readdir(procRoot, { withFileTypes: true });
   } catch {
     return null;
   }
-  let incomplete = false;
+  let sawMember = false;
   for (const entry of entries) {
     if (!entry.isDirectory() || !/^\d+$/u.test(entry.name)) continue;
-    let raw;
+    let statLine;
     try {
-      raw = await readFile("/proc/" + entry.name + "/stat", "utf8");
+      statLine = await fsOps.readFile(`${procRoot}/${entry.name}/stat`, "utf8");
     } catch (error) {
-      if (error.code === "ENOENT") continue; // process exited during the scan
-      incomplete = true;
-      continue;
+      if (error.code === "ENOENT") continue;
+      return null;
     }
-    // /proc/PID/stat starts with `pid (comm) state ppid pgrp ...`; comm can
-    // contain spaces and parentheses, so split only after its final `)`.
-    const close = raw.lastIndexOf(")");
-    if (close < 0) { incomplete = true; continue; }
-    const fields = raw.slice(close + 1).trim().split(/\s+/u);
+    // comm is parenthesized and may itself contain ')' characters. Fields
+    // after the final ')' begin with: state, ppid, pgrp, ...
+    const close = statLine.lastIndexOf(")");
+    if (close === -1) return null;
+    const fields = statLine.slice(close + 1).trim().split(/\s+/u);
     const state = fields[0];
-    const pgrp = Number(fields[2]);
-    if (pgrp === processGroupId && state !== "Z" && state !== "X" && state !== "x") {
-      return true;
-    }
+    const group = Number(fields[2]);
+    if (!state || !Number.isInteger(group)) return null;
+    if (group !== processGroupId) continue;
+    sawMember = true;
+    if (state !== "Z" && state !== "X" && state !== "x") return true;
   }
-  // When procfs is partially hidden, fall back to kill(0) and fail safe.
-  return incomplete ? null : false;
+  return sawMember ? false : null;
 }
 
-export async function isProcessTreeAlive(child, treeState) {
+export async function isProcessTreeAlive(child, treeState, {
+  ignoreZombieOnly = false,
+  platform = process.platform,
+  procRoot = "/proc",
+  fsOps = { readdir, readFile },
+  probeProcessGroup = (processGroupId) => process.kill(-processGroupId, 0),
+} = {}) {
   if (!Number.isInteger(child.pid)) return false;
-  if (process.platform === "win32") {
+  if (platform === "win32") {
     return (await windowsProcessTreePids(child.pid, treeState.knownPids)).length > 0;
   }
-  if (process.platform === "linux") {
-    const live = await linuxProcessGroupHasLiveMembers(child.pid);
-    if (live !== null) return live;
-  }
   try {
-    process.kill(-child.pid, 0);
-    return true;
+    probeProcessGroup(child.pid);
   } catch (error) {
-    return error.code === "EPERM";
+    // Only ESRCH is a reliable negative result. Permission and unexpected
+    // probe errors fail safe so callers quarantine rather than reuse a live
+    // workspace.
+    return error.code !== "ESRCH";
   }
+  if (ignoreZombieOnly && platform === "linux") {
+    const classification = await linuxProcessGroupHasLiveMembers(child.pid, procRoot, fsOps);
+    return classification !== false;
+  }
+  return true;
 }
 
 export async function signalProcessTree(child, signal, treeState) {
@@ -145,9 +163,9 @@ export async function signalProcessTree(child, signal, treeState) {
   }
 }
 
-export async function waitForProcessTreeExit(child, timeoutMs, treeState) {
+export async function waitForProcessTreeExit(child, timeoutMs, treeState, options = {}) {
   const deadline = Date.now() + timeoutMs;
-  while (await isProcessTreeAlive(child, treeState)) {
+  while (await isProcessTreeAlive(child, treeState, options)) {
     if (Date.now() >= deadline) return false;
     await new Promise((resolve) => setTimeout(resolve, 50));
   }

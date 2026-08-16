@@ -268,7 +268,7 @@ async function runCommand(command, args, options = {}) {
           if (manageProcessTree) await signalProcessTree(child, "SIGKILL", treeState);
           else try { child.kill("SIGKILL"); } catch { /* already gone */ }
           treeTerminated = manageProcessTree
-            ? await waitForProcessTreeExit(child, killGraceMs, treeState)
+            ? await waitForProcessTreeExit(child, killGraceMs, treeState, { ignoreZombieOnly: true })
             : await waitForChildExit(child, killGraceMs);
           if (!treeTerminated) {
             terminationError = "process tree still appears alive after forceful termination";
