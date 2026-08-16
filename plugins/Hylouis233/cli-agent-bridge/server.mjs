@@ -1332,7 +1332,7 @@ export async function closestExistingBase(worktreeRoot, target, baselineCommits,
   return null;
 }
 
-async function committedDelta(worktreeRoot, before, after, options = {}) {
+export async function committedDelta(worktreeRoot, before, after, options = {}) {
   const refNames = new Set([...Object.keys(before.refs ?? {}), ...Object.keys(after.refs ?? {})]);
   const refsChanged = [...refNames].sort().flatMap((ref) => {
     const beforeOid = before.refs?.[ref] ?? "";

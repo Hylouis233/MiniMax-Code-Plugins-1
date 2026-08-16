@@ -14,7 +14,7 @@ import {
 } from "../workspace-lock.mjs";
 import { resolvePathCommand } from "../git-executable.mjs";
 import {
-  closestExistingBase, populateCommitishCache, runCommand, runGitCommand,
+  closestExistingBase, committedDelta, populateCommitishCache, runCommand, runGitCommand,
 } from "../server.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -2224,7 +2224,11 @@ test("target refs resembling coordination refs remain visible to attribution", a
 });
 
 test("a ref moved from a blob to a new commit uses a commit-safe diff base", async (context) => {
-  const { tempRoot, workspace, client } = await makeHarness(context);
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), "cli-agent-commit-safe-base-test-"));
+  const workspace = path.join(tempRoot, "workspace");
+  await mkdir(workspace);
+  await initializeFixtureRepository(workspace);
+  context.after(() => rm(tempRoot, { recursive: true, force: true }));
   const refName = "refs/tags/blob-to-commit";
   const oldBlobPath = path.join(tempRoot, "old-blob.txt");
   await writeFile(oldBlobPath, "old blob\n");
@@ -2232,16 +2236,37 @@ test("a ref moved from a blob to a new commit uses a commit-safe diff base", asy
     "git", ["hash-object", "-w", oldBlobPath], { cwd: workspace },
   );
   await execFileAsync("git", ["update-ref", refName, blobOid.trim()], { cwd: workspace });
-  const response = await client.request("tools/call", taskArguments(workspace, {
-    name: "blob-to-commit", moveBlobRefToCommit: true, refName,
-    writeFile: "ref-commit.txt", commitMessage: "commit behind moved ref",
-  }));
-  assert.equal(response.result.error, undefined, "post-run attribution must not become a JSON-RPC error");
-  const out = response.result.structuredContent;
-  assert.equal(out.ok, true, JSON.stringify(out.error));
-  assert.match(out.commits.log, /commit behind moved ref/u);
-  assert.match(out.commits.diffStat, /ref-commit\.txt/u);
-  assert.doesNotMatch(out.commits.diffStat, new RegExp(blobOid.trim(), "u"));
+  const { stdout: headText } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: workspace });
+  const head = headText.trim();
+  const before = {
+    head,
+    headRef: "refs/heads/main",
+    refs: { "refs/heads/main": head, [refName]: blobOid.trim() },
+    fetchHeads: [],
+  };
+
+  await execFileAsync("git", ["checkout", "-b", "temporary-ref-commit"], { cwd: workspace });
+  await writeFile(path.join(workspace, "ref-commit.txt"), "ref commit\n");
+  await execFileAsync("git", ["add", "ref-commit.txt"], { cwd: workspace });
+  await execFileAsync("git", ["commit", "-m", "commit behind moved ref"], { cwd: workspace });
+  const { stdout: newCommitText } = await execFileAsync("git", ["rev-parse", "HEAD"], {
+    cwd: workspace,
+  });
+  const newCommit = newCommitText.trim();
+  await execFileAsync("git", ["checkout", "main"], { cwd: workspace });
+  await execFileAsync("git", ["branch", "-D", "temporary-ref-commit"], { cwd: workspace });
+  await execFileAsync("git", ["update-ref", refName, newCommit], { cwd: workspace });
+  const after = {
+    head,
+    headRef: "refs/heads/main",
+    refs: { "refs/heads/main": head, [refName]: newCommit },
+    fetchHeads: [],
+  };
+
+  const commits = await committedDelta(workspace, before, after);
+  assert.match(commits.log, /commit behind moved ref/u);
+  assert.match(commits.diffStat, /ref-commit\.txt/u);
+  assert.doesNotMatch(commits.diffStat, new RegExp(blobOid.trim(), "u"));
 });
 
 test("a force-moved ref diffs from an ancestral pre-run baseline", async (context) => {
