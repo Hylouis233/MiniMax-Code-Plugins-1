@@ -168,7 +168,7 @@ def extract_slide_content(slide):
         chart = sh.chart
         chart_title = (
             chart.chart_title.text_frame.text
-            if chart.has_title and chart.chart_title.has_text_frame else ""
+            if chart.has_title else ""
         )
         plots = []
         for plot in chart.plots:
@@ -610,17 +610,7 @@ check("compact extraction is provably lossy (negative control)",
 from pptx.oxml import parse_xml as pptx_parse_xml2
 from pptx.oxml.ns import qn
 
-def explicit_run_faces(run, text, script_tags_fn):
-    rPr = run._r.find(qn("a:rPr"))
-    if rPr is None:
-        return []
-    declared = {}
-    for slot, tag in (("latin", "a:latin"), ("eastAsia", "a:ea"), ("complexScript", "a:cs")):
-        node = rPr.find(qn(tag))
-        if node is not None and node.get("typeface"):
-            declared[slot] = node.get("typeface")
-    if not declared:
-        return []
+def required_font_slots(text, script_tags_fn):
     tags = script_tags_fn(text)
     slots = []
     if any(ch.isascii() and ch.isalnum() for ch in text):
@@ -629,9 +619,35 @@ def explicit_run_faces(run, text, script_tags_fn):
         slots.append("eastAsia")
     if any(tag in ("Arab", "Hebr", "Deva") for tag in tags):
         slots.append("complexScript")
-    if not slots:
-        slots.append("latin")
-    return list(dict.fromkeys(declared[slot] for slot in slots if slot in declared))
+    return slots or ["latin"]
+
+def explicit_run_faces(run):
+    rPr = run._r.find(qn("a:rPr"))
+    if rPr is None:
+        return {}
+    declared = {}
+    for slot, tag in (("latin", "a:latin"), ("eastAsia", "a:ea"), ("complexScript", "a:cs")):
+        node = rPr.find(qn(tag))
+        if node is not None and node.get("typeface"):
+            declared[slot] = node.get("typeface")
+    return declared
+
+def resolve_faces(run, text, role_fonts, script_tags_fn):
+    direct = explicit_run_faces(run)
+    tags = script_tags_fn(text)
+    result = {}
+    for slot in required_font_slots(text, script_tags_fn):
+        if slot in direct:
+            result[slot] = [direct[slot]]
+            continue
+        relevant = {
+            "eastAsia": {"Hans", "Hant", "Jpan", "Hang"},
+            "complexScript": {"Arab", "Hebr", "Deva"},
+        }.get(slot, set())
+        candidates = [role_fonts[slot]]
+        candidates.extend(role_fonts["scripts"].get(tag, "") for tag in tags if tag in relevant)
+        result[slot] = [face for face in dict.fromkeys(candidates) if face]
+    return result
 
 run_xml = (
     '<a:r xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
@@ -642,9 +658,31 @@ dual_run = pptx_parse_xml2(run_xml)
 class FakeRun:
     _r = dual_run
 check("a CJK run with latin+ea declared resolves to the eastAsia face",
-      explicit_run_faces(FakeRun(), "\u6d4b\u8bd5", script_tags) == ["SimSun"])
+      resolve_faces(FakeRun(), "\u6d4b\u8bd5", {
+          "latin": "Theme Latin", "eastAsia": "Theme East", "complexScript": "Theme CS",
+          "scripts": {},
+      }, script_tags) == {"eastAsia": ["SimSun"]})
 check("a mixed Latin+CJK run reports both applicable declared faces",
-      explicit_run_faces(FakeRun(), "Q3 \u6d4b\u8bd5", script_tags) == ["Arial", "SimSun"])
+      resolve_faces(FakeRun(), "Q3 \u6d4b\u8bd5", {
+          "latin": "Theme Latin", "eastAsia": "Theme East", "complexScript": "Theme CS",
+          "scripts": {},
+      }, script_tags) == {"latin": ["Arial"], "eastAsia": ["SimSun"]})
+
+latin_only_xml = (
+    '<a:r xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+    '<a:rPr><a:latin typeface="Arial"/></a:rPr><a:t>Q3 \u6d4b\u8bd5</a:t></a:r>'
+)
+latin_only_run = pptx_parse_xml2(latin_only_xml)
+class LatinOnlyRun:
+    _r = latin_only_run
+partial_resolution = resolve_faces(LatinOnlyRun(), "Q3 \u6d4b\u8bd5", {
+    "latin": "Theme Latin", "eastAsia": "Theme East", "complexScript": "Theme CS",
+    "scripts": {"Hans": "Theme Hans"},
+}, script_tags)
+check("a direct Latin face does not suppress inherited CJK candidates",
+      partial_resolution["latin"] == ["Arial"]
+      and partial_resolution["eastAsia"] == ["Theme East", "Theme Hans"],
+      partial_resolution)
 check("run.font.name alone would report only the Latin face (negative control)",
       dual_run.find(qn("a:rPr")).find(qn("a:latin")).get("typeface") == "Arial")
 

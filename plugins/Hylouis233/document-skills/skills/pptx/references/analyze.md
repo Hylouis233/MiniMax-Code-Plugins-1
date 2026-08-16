@@ -53,7 +53,7 @@ for i, slide in enumerate(prs.slides):
         chart = sh.chart
         chart_title = (
             chart.chart_title.text_frame.text
-            if chart.has_title and chart.chart_title.has_text_frame else ""
+            if chart.has_title else ""
         )
         plots = []
         for plot in chart.plots:
@@ -251,31 +251,7 @@ def script_tags(text):
             tags.append("Deva")
     return list(dict.fromkeys(tags))
 
-def theme_candidates(role_fonts, text):
-    faces = [role_fonts["latin"]]
-    tags = script_tags(text)
-    if any(tag in ("Hans", "Hant", "Jpan", "Hang") for tag in tags):
-        faces.append(role_fonts["eastAsia"])
-    if any(tag in ("Arab", "Hebr", "Deva") for tag in tags):
-        faces.append(role_fonts["complexScript"])
-    faces.extend(role_fonts["scripts"].get(tag, "") for tag in tags)
-    return [face for face in dict.fromkeys(faces) if face]
-
-# 2. Per run: explicit value, else paragraph defaults, else report as inherited.
-# run.font.name exposes only the LATIN typeface; a run that also declares a:ea
-# or a:cs must be resolved per the scripts present in its own text first.
-def explicit_run_faces(run, text):
-    """Distinct direct a:latin/a:ea/a:cs faces applicable to scripts in this run."""
-    rPr = run._r.find(qn("a:rPr"))
-    if rPr is None:
-        return []
-    declared = {}
-    for slot, tag in (("latin", "a:latin"), ("eastAsia", "a:ea"), ("complexScript", "a:cs")):
-        node = rPr.find(qn(tag))
-        if node is not None and node.get("typeface"):
-            declared[slot] = node.get("typeface")
-    if not declared:
-        return []
+def required_font_slots(text):
     tags = script_tags(text)
     slots = []
     if any(ch.isascii() and ch.isalnum() for ch in text):
@@ -284,9 +260,57 @@ def explicit_run_faces(run, text):
         slots.append("eastAsia")
     if any(tag in ("Arab", "Hebr", "Deva") for tag in tags):
         slots.append("complexScript")
-    if not slots:
-        slots.append("latin")
-    return list(dict.fromkeys(declared[slot] for slot in slots if slot in declared))
+    return slots or ["latin"]
+
+def theme_candidates_by_slot(role_fonts, text):
+    tags = script_tags(text)
+    east_tags = {"Hans", "Hant", "Jpan", "Hang"}
+    complex_tags = {"Arab", "Hebr", "Deva"}
+    candidates = {}
+    for slot in required_font_slots(text):
+        slot_tags = [
+            tag for tag in tags
+            if (slot == "eastAsia" and tag in east_tags)
+            or (slot == "complexScript" and tag in complex_tags)
+            or (slot == "latin" and tag not in east_tags | complex_tags)
+        ]
+        faces = [role_fonts[slot]]
+        faces.extend(role_fonts["scripts"].get(tag, "") for tag in slot_tags)
+        candidates[slot] = [face for face in dict.fromkeys(faces) if face]
+    return candidates
+
+# 2. Per run: explicit value, else paragraph defaults, else report as inherited.
+# run.font.name exposes only the LATIN typeface; a run that also declares a:ea
+# or a:cs must be resolved per the scripts present in its own text first.
+def explicit_run_faces(run):
+    """Direct a:latin/a:ea/a:cs faces keyed by slot; missing slots stay missing."""
+    rPr = run._r.find(qn("a:rPr"))
+    if rPr is None:
+        return {}
+    declared = {}
+    for slot, tag in (("latin", "a:latin"), ("eastAsia", "a:ea"), ("complexScript", "a:cs")):
+        node = rPr.find(qn(tag))
+        if node is not None and node.get("typeface"):
+            declared[slot] = node.get("typeface")
+    return declared
+
+def resolve_run_faces(run, paragraph, role_fonts):
+    """Resolve every required script slot without letting one direct slot hide another."""
+    direct = explicit_run_faces(run)
+    inherited = theme_candidates_by_slot(role_fonts, run.text)
+    resolved = []
+    for slot in required_font_slots(run.text):
+        if slot in direct:
+            faces, source = [direct[slot]], "run direct"
+        elif slot == "latin" and run.font.name:
+            faces, source = [run.font.name], "run latin"
+        elif slot == "latin" and paragraph.font.name:
+            faces, source = [paragraph.font.name], "paragraph defaults (latin)"
+        else:
+            faces = inherited.get(slot, []) or ["(unresolved inherited face)"]
+            source = "theme candidates (verify placeholder chain/locale)"
+        resolved.append({"slot": slot, "faces": faces, "source": source})
+    return resolved
 
 def iter_text_frames(shapes):
     """Shape text frames plus every table cell's text frame (a graphic frame
@@ -307,24 +331,12 @@ for i, slide in enumerate(prs.slides):
         holder = getattr(frame, "_parent", None)  # the shape for ordinary frames
         for paragraph in frame.paragraphs:
             for run in paragraph.runs:
-                explicit = explicit_run_faces(run, run.text)
-                if explicit:
-                    face, source = explicit, "run script faces (a:latin/a:ea/a:cs)"
-                elif run.font.name:
-                    face, source = run.font.name, "run latin"
-                elif paragraph.font.name:
-                    # paragraph.font is the LATIN slot of a:pPr/a:defRPr only;
-                    # script-specific paragraph defaults are not modeled by
-                    # python-pptx and need raw XML for full coverage.
-                    face, source = paragraph.font.name, "paragraph defaults (latin)"
-                else:
-                    role = "major" if (
-                        title_shape is not None and
-                        getattr(holder, "_element", None) is title_shape._element
-                    ) else "minor"
-                    face = theme_candidates(theme_fonts[role], run.text)
-                    source = f"inherited {role} theme candidates (verify placeholder chain/locale)"
-                print(i, repr(run.text[:20]), "font:", ascii(face), "source:", source)
+                role = "major" if (
+                    title_shape is not None and
+                    getattr(holder, "_element", None) is title_shape._element
+                ) else "minor"
+                resolved = resolve_run_faces(run, paragraph, theme_fonts[role])
+                print(i, repr(run.text[:20]), f"{role} font slots:", ascii(resolved))
 ```
 
 python-pptx does not evaluate the full placeholder -> layout -> master inheritance chain; when

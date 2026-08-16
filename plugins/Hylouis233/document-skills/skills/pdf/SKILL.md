@@ -118,10 +118,18 @@ if overflow_doc.needs_pass:
     overflow_doc.authenticate(password)
 overflow_pages = []
 for page in overflow_doc:
-    clip = fitz.Rect(-2000, -2000, page.rect.width + 2000, page.rect.height + 2000)
+    # get_text() block coordinates are unrotated even when /Rotate is 90/270;
+    # page.rect uses rotated dimensions. Compare against an unrotated crop-box
+    # extent so valid high-y portrait text is not flagged on a rotated page.
+    page_box = fitz.Rect(0, 0, page.cropbox.width, page.cropbox.height)
+    clip = fitz.Rect(
+        page_box.x0 - 2000, page_box.y0 - 2000,
+        page_box.x1 + 2000, page_box.y1 + 2000,
+    )
     text_blocks = [b for b in page.get_text("blocks", clip=clip) if b[6] == 0]
     beyond_box = any(
-        b[0] < -0.5 or b[1] < -0.5 or b[2] > page.rect.width + 0.5 or b[3] > page.rect.height + 0.5
+        b[0] < page_box.x0 - 0.5 or b[1] < page_box.y0 - 0.5
+        or b[2] > page_box.x1 + 0.5 or b[3] > page_box.y1 + 0.5
         for b in text_blocks
     )
     if beyond_box:

@@ -365,15 +365,26 @@ def overflow_pages(path):
     pages = []
     for page in doc:
         # Plain block extraction drops fully off-page text; enlarge the clip.
-        clip = fitz.Rect(-2000, -2000, page.rect.width + 2000, page.rect.height + 2000)
+        page_box = fitz.Rect(0, 0, page.cropbox.width, page.cropbox.height)
+        clip = fitz.Rect(
+            page_box.x0 - 2000, page_box.y0 - 2000,
+            page_box.x1 + 2000, page_box.y1 + 2000,
+        )
         blocks = [b for b in page.get_text("blocks", clip=clip) if b[6] == 0]
-        if any(b[0] < -0.5 or b[1] < -0.5 or b[2] > page.rect.width + 0.5 or b[3] > page.rect.height + 0.5
+        if any(b[0] < page_box.x0 - 0.5 or b[1] < page_box.y0 - 0.5
+               or b[2] > page_box.x1 + 0.5 or b[3] > page_box.y1 + 0.5
                for b in blocks):
             pages.append(page.number + 1)
     doc.close()
     return pages
 
 check("in-bounds PDF reports no overflow pages", overflow_pages("overflow.pdf") == [])
+rotated_doc = fitz.open("overflow.pdf")
+rotated_doc[0].set_rotation(90)
+rotated_doc.save("overflow-rotated.pdf")
+rotated_doc.close()
+check("rotated in-bounds text uses the unrotated crop-box coordinate space",
+      overflow_pages("overflow-rotated.pdf") == [])
 check("off-page text is detected by the overflow check (negative control)",
       overflow_pages("overflow-bad.pdf") == [1])
 check("off-page text still extracts, so extraction alone cannot catch it",

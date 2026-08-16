@@ -3,7 +3,9 @@
 ```python
 import openpyxl
 from datetime import date
+from openpyxl.formula import Tokenizer
 from openpyxl.styles import Font
+from openpyxl.utils.cell import range_boundaries
 
 wb = openpyxl.load_workbook("input.xlsx")   # NOT data_only: that would drop all formulas
 ws = wb["Data"]
@@ -61,10 +63,35 @@ def cell_formula_references(workbook):
                     value = cell.value
                     refs.append((
                         "cell formula",
-                        f"{sheet.title}!{cell.coordinate}",
+                        sheet.title,
+                        cell.coordinate,
                         getattr(value, "text", None) or str(value),
                     ))
     return refs
+
+def formula_may_intersect_rows(owner_sheet, formula, shifted_sheet, start_row):
+    """Fail closed unless every range token is provably above/outside the shifted rows."""
+    if not isinstance(formula, str) or not formula.startswith("="):
+        return True
+    for token in Tokenizer(formula).items:
+        if token.type != "OPERAND" or token.subtype != "RANGE":
+            continue
+        reference = token.value
+        target_sheet = owner_sheet
+        if "!" in reference:
+            qualifier, reference = reference.rsplit("!", 1)
+            if "[" in qualifier or ":" in qualifier:  # external or 3-D reference
+                return True
+            target_sheet = qualifier.strip("'").replace("''", "'")
+        if target_sheet != shifted_sheet:
+            continue
+        try:
+            _, min_row, _, max_row = range_boundaries(reference.replace("$", ""))
+        except ValueError:  # named/dynamic reference: require a manual rewrite plan
+            return True
+        if min_row is None or max_row is None or max_row >= start_row:
+            return True
+    return False
 
 # Address cells directly; check the header to confirm column meaning first
 ws["D2"] = "=C2*1.08"                      # real formula
@@ -73,12 +100,17 @@ ws["E2"].number_format = "yyyy-mm-dd"
 ws["F2"] = 1234.5
 ws["F2"].number_format = "#,##0.00"
 
-# Insert/delete does not adjust formulas or non-cell dependencies. Snapshot both inventories
-# before moving anything; fail closed until every reference that can intersect row 5 or below
-# has an explicit old -> new rewrite plan.
-references_before = cell_formula_references(wb) + non_cell_references(wb)
-if references_before:
-    for reference in references_before:
+# Insert/delete does not adjust formulas or non-cell dependencies. Snapshot both inventories,
+# but block only formula ranges that may intersect the shifted rows (plus the conservative
+# non-cell inventory) so an audited formula such as D2 = C2*1.08 can proceed.
+cell_formulas_before = cell_formula_references(wb)
+intersecting_formulas = [
+    reference for reference in cell_formulas_before
+    if formula_may_intersect_rows(reference[1], reference[3], ws.title, 5)
+]
+unaudited_references = intersecting_formulas + non_cell_references(wb)
+if unaudited_references:
+    for reference in unaudited_references:
         print("structural-edit dependency:", reference)
     raise RuntimeError(
         "insert_rows is unsafe until cell formulas and non-cell references are audited"
@@ -99,6 +131,7 @@ for row in summary["A1:B1"]:
 
 # After applying the planned rewrites, rerun both inventories and compare them with the
 # pre-edit snapshot before saving. A post-edit listing alone cannot reveal a stale formula.
+print("cell formulas before:", cell_formulas_before)
 print("cell formulas after planned rewrites:", cell_formula_references(wb))
 print("non-cell references after planned rewrites:", non_cell_references(wb))
 

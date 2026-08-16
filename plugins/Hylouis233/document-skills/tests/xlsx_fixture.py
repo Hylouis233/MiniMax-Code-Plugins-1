@@ -218,7 +218,9 @@ check(
 
 # ---- edit.md structural audit includes non-cell dependencies ------------------
 from openpyxl.chart import BarChart, Reference
+from openpyxl.formula import Tokenizer
 from openpyxl.formatting.rule import CellIsRule, FormulaRule
+from openpyxl.utils.cell import range_boundaries
 from openpyxl.workbook.defined_name import DefinedName
 from openpyxl.worksheet.datavalidation import DataValidation
 from openpyxl.worksheet.table import Table
@@ -275,10 +277,35 @@ def cell_formula_references(workbook):
                     value = cell.value
                     refs.append((
                         "cell formula",
-                        f"{sheet.title}!{cell.coordinate}",
+                        sheet.title,
+                        cell.coordinate,
                         getattr(value, "text", None) or str(value),
                     ))
     return refs
+
+
+def formula_may_intersect_rows(owner_sheet, formula, shifted_sheet, start_row):
+    if not isinstance(formula, str) or not formula.startswith("="):
+        return True
+    for token in Tokenizer(formula).items:
+        if token.type != "OPERAND" or token.subtype != "RANGE":
+            continue
+        reference = token.value
+        target_sheet = owner_sheet
+        if "!" in reference:
+            qualifier, reference = reference.rsplit("!", 1)
+            if "[" in qualifier or ":" in qualifier:
+                return True
+            target_sheet = qualifier.strip("'").replace("''", "'")
+        if target_sheet != shifted_sheet:
+            continue
+        try:
+            _, min_row, _, max_row = range_boundaries(reference.replace("$", ""))
+        except ValueError:
+            return True
+        if min_row is None or max_row is None or max_row >= start_row:
+            return True
+    return False
 
 
 class LegacyDefinedNames:
@@ -331,9 +358,13 @@ check(
 )
 check(
     "structural audit snapshots ordinary cell formulas before row insertion",
-    formula_references == [("cell formula", "Audit!C1", "=SUM(A2:A3)")],
+    formula_references == [("cell formula", "Audit", "C1", "=SUM(A2:A3)")],
     formula_references,
 )
+check("intersecting formula ranges are blocked before row insertion",
+      formula_may_intersect_rows("Audit", "=SUM(A2:A3)", "Audit", 3))
+check("audited formula ranges above the insertion can proceed",
+      not formula_may_intersect_rows("Data", "=C2*1.08", "Data", 5))
 
 stale_wb = openpyxl.Workbook()
 stale_ws = stale_wb.active
@@ -343,11 +374,27 @@ stale_formula_before = cell_formula_references(stale_wb)
 stale_ws.insert_rows(5)
 check(
     "insert_rows leaves intersecting formulas stale (negative control)",
-    stale_formula_before == [("cell formula", "Sheet!B1", "=SUM(A5:A6)")]
+    stale_formula_before == [("cell formula", "Sheet", "B1", "=SUM(A5:A6)")]
     and stale_ws["B1"].value == "=SUM(A5:A6)"
     and (stale_ws["A6"].value, stale_ws["A7"].value) == (10, 20),
     (stale_formula_before, stale_ws["B1"].value),
 )
+
+safe_wb = openpyxl.Workbook()
+safe_ws = safe_wb.active
+safe_ws.title = "Data"
+safe_ws["C2"], safe_ws["D2"] = 100, "=C2*1.08"
+safe_before = cell_formula_references(safe_wb)
+safe_dependencies = [
+    reference for reference in safe_before
+    if formula_may_intersect_rows(reference[1], reference[3], "Data", 5)
+]
+if not safe_dependencies:
+    safe_ws.insert_rows(5)
+    safe_wb.save("audited-structural-edit.xlsx")
+safe_reopened = openpyxl.load_workbook("audited-structural-edit.xlsx", data_only=False)
+check("audited non-intersecting formula path reaches save",
+      safe_reopened["Data"]["D2"].value == "=C2*1.08")
 
 # and the edit itself still works after the warning path
 wb2 = openpyxl.load_workbook("plain.xlsx")
