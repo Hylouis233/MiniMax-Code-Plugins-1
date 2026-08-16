@@ -12,6 +12,8 @@ import {
   localHostIdentity,
   tryAcquireGitWorkspaceLock,
   workspaceLockRef,
+  WorkspaceLockCancelledError,
+  WorkspaceLockDeadlineError,
 } from "../workspace-lock.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -266,4 +268,82 @@ test("long lock waits unsubscribe cancellation listeners after every retry", asy
   assert.equal(listeners.size, 0);
   assert.ok(maximumListeners <= 1, "listeners accumulated across retries: " + String(maximumListeners));
   await holder.lease.release();
+});
+
+test("worker state updates honour the delegation cancellation and deadline", async (context) => {
+  const repo = await makeRepo(context);
+  const key = "git-worktree:" + repo;
+  const acquire = () => tryAcquireGitWorkspaceLock({
+    cwd: repo, key, processProbe: () => "alive", heartbeatMs: 60_000,
+  });
+
+  // One interruption ends a lease's update lifecycle, so each case uses its own.
+  const cancelledLease = await acquire();
+  assert.equal(cancelledLease.acquired, true);
+  const cancelled = { cancelled: true, promise: Promise.resolve(), subscribe: () => () => {} };
+  await assert.rejects(cancelledLease.lease.markWorkerStarting({ cancel: cancelled }), WorkspaceLockCancelledError);
+  await cancelledLease.lease.release();
+  await assert.rejects(execFileAsync("git", ["rev-parse", "--verify", workspaceLockRef(key)], { cwd: repo }), /Command failed/u);
+
+  const expiredLease = await acquire();
+  assert.equal(expiredLease.acquired, true);
+  const expired = { cancelled: false, promise: new Promise(() => {}), subscribe: () => () => {} };
+  await assert.rejects(
+    expiredLease.lease.markWorkerStarting({ cancel: expired, deadline: Date.now() - 1 }),
+    WorkspaceLockDeadlineError,
+  );
+  await expiredLease.lease.release();
+  await assert.rejects(execFileAsync("git", ["rev-parse", "--verify", workspaceLockRef(key)], { cwd: repo }), /Command failed/u);
+});
+
+test("quarantined leases are reclaimable after the operator clears the marker", async (context) => {
+  const repo = await makeRepo(context);
+  const key = "git-worktree:" + repo;
+  const ref = workspaceLockRef(key);
+  const now = Date.now();
+  await installOwner(repo, ref, {
+    version: 1,
+    token: "quarantined-owner",
+    hostIdentity: localHostIdentity(),
+    ownerPid: process.pid,
+    workerState: "quarantined",
+    workerPid: 4242,
+    acquiredAt: now,
+    heartbeatAt: now,
+  });
+
+  const stillHeld = await tryAcquireGitWorkspaceLock({
+    cwd: repo, key, now, staleMs: 60_000, processProbe: () => "alive",
+    operatorCleared: () => false,
+  });
+  assert.deepEqual(stillHeld, { acquired: false, reason: "held" });
+
+  const reclaimed = await tryAcquireGitWorkspaceLock({
+    cwd: repo, key, now, staleMs: 60_000, processProbe: () => "alive",
+    operatorCleared: () => true,
+  });
+  assert.equal(reclaimed.acquired, true, "a removed quarantine marker authorizes takeover");
+  await reclaimed.lease.release();
+});
+
+test("a quarantined lease left by a crashed owner is reclaimable after the stale window", async (context) => {
+  const repo = await makeRepo(context);
+  const key = "git-worktree:" + repo;
+  const now = Date.now();
+  await installOwner(repo, workspaceLockRef(key), {
+    version: 1,
+    token: "crashed-quarantine",
+    hostIdentity: localHostIdentity(),
+    ownerPid: 12345,
+    workerState: "quarantined",
+    workerPid: 5353,
+    acquiredAt: now - 120_000,
+    heartbeatAt: now - 120_000,
+  });
+  const result = await tryAcquireGitWorkspaceLock({
+    cwd: repo, key, now, staleMs: 30_000, processProbe: () => "dead",
+    operatorCleared: () => false,
+  });
+  assert.equal(result.acquired, true, "crash fallback: stale heartbeat plus dead owner");
+  await result.lease.release();
 });

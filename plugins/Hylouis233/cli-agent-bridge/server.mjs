@@ -330,11 +330,17 @@ async function runCommand(command, args, options = {}) {
     if (typeof options.onChild === "function" && Number.isInteger(child.pid)) {
       options.onChild({ child, terminate });
     }
-    if (manageProcessTree && process.platform !== "win32") {
+    if (manageProcessTree) {
+      // Capture the root's start identity immediately so termination can later
+      // detect a reused PID. Windows performs this one-shot inspection only;
+      // POSIX keeps polling to track descendants that escape the process group.
+      // The 250 ms interval trades discovery latency against scanning every
+      // process under /proc (or forking `ps`) for the whole delegation.
       void refreshTree();
-      const refreshIntervalMs = process.platform === "linux" ? 25 : 250;
-      treeRefreshTimer = setInterval(() => { void refreshTree(); }, refreshIntervalMs);
-      treeRefreshTimer.unref?.();
+      if (process.platform !== "win32") {
+        treeRefreshTimer = setInterval(() => { void refreshTree(); }, 250);
+        treeRefreshTimer.unref?.();
+      }
     }
     if (child.stdin) child.stdin.end(options.stdinText);
 
@@ -370,9 +376,23 @@ async function runCommand(command, args, options = {}) {
       if (settled) return;
       exitCode = code;
       if (terminationPromise) return;
-      if (manageProcessTree && await isProcessTreeAlive(child, treeState)) {
-        await terminate("orphaned");
-        return;
+      if (manageProcessTree) {
+        let stillAlive = false;
+        try {
+          stillAlive = await isProcessTreeAlive(child, treeState);
+        } catch (error) {
+          // An inspection failure (for example WMI unavailable on Windows) must
+          // settle through the fail-closed path, not surface as an unhandled
+          // rejection that could take down the whole server.
+          treeTerminated = false;
+          terminationError = "process-tree inspection failed: " + error.message;
+          settle();
+          return;
+        }
+        if (stillAlive) {
+          await terminate("orphaned");
+          return;
+        }
       }
       settle();
     });
@@ -489,7 +509,13 @@ async function runGitCommand(args, {
   return result;
 }
 
+// A lease owner counts as concurrently active while its heartbeat is fresh
+// and its worker has not finished; linked worktrees share one ref store, so
+// another worktree's delegation is visible here and can interleave commits.
+const CONCURRENT_LEASE_STALE_MS = 30_000;
+
 async function gitSnapshot(worktreeRoot, options = {}) {
+  const ownLockRef = typeof options.ownLockRef === "string" ? options.ownLockRef : null;
   const jobs = [
     ["git status --short", "status", ["status", "--short"]],
     ["git diff --stat", "diffStat", ["diff", "--stat"]],
@@ -533,13 +559,45 @@ async function gitSnapshot(worktreeRoot, options = {}) {
     .map((s, i) => (i === 0 ? s : s.split(/\r?\n/).map((l) => "staged: " + l).join("\n")))
     .join("\n");
   const refs = {};
+  const lockRefs = [];
   for (const line of String(out.refs ?? "").split(/\r?\n/u)) {
     if (!line) continue;
     const separator = line.indexOf("\t");
     if (separator <= 0) continue;
     const ref = line.slice(0, separator);
-    if (ref.startsWith(WORKSPACE_LOCK_REF_PREFIX)) continue;
+    if (ref.startsWith(WORKSPACE_LOCK_REF_PREFIX)) {
+      if (ref !== ownLockRef) lockRefs.push(line.slice(separator + 1));
+      continue;
+    }
     refs[ref] = line.slice(separator + 1);
+  }
+  // Linked worktrees serialize per worktree but share repository refs, so a
+  // commit from a parallel delegation can land between our two snapshots.
+  // Detection combines two signals: leases that are active right now, and the
+  // persistent run-history records completed delegations leave behind, whose
+  // [acquiredAt, endedAt] window is checked against this snapshot's window.
+  const windowStart = Number.isFinite(options.concurrencyWindowStart)
+    ? options.concurrencyWindowStart
+    : Number.POSITIVE_INFINITY;
+  let concurrentDelegations = 0;
+  for (const oid of lockRefs) {
+    const blob = await runGitCommand(["cat-file", "blob", oid], { cwd: worktreeRoot, ...options });
+    if (blob.exitCode !== 0) continue; // unreadable owner blob: ignore for disclosure
+    try {
+      const record = JSON.parse(blob.stdout);
+      if (Number.isFinite(record?.endedAt)) {
+        const acquiredAt = Number.isFinite(record.acquiredAt) ? record.acquiredAt : record.endedAt;
+        if (acquiredAt <= Date.now() && record.endedAt >= windowStart) {
+          concurrentDelegations += 1;
+        }
+        continue;
+      }
+      const active = record &&
+        (record.workerState === "starting" || record.workerState === "running") &&
+        Number.isFinite(record.heartbeatAt) &&
+        Date.now() - record.heartbeatAt < CONCURRENT_LEASE_STALE_MS;
+      if (active) concurrentDelegations += 1;
+    } catch { /* malformed owner blob: ignore for disclosure */ }
   }
   return {
     statusShort: String(out.status ?? "").trim(),
@@ -547,7 +605,33 @@ async function gitSnapshot(worktreeRoot, options = {}) {
     changedFiles,
     head: String(out.head ?? "").trim(),
     refs,
+    concurrentDelegations,
   };
+}
+
+// Peel an object id to a commit id. Returns null for blob/tree objects (legal
+// ref targets) and for tags that do not dereference to a commit.
+async function peelCommitish(worktreeRoot, oid, cache = new Map(), options = {}) {
+  if (!oid || !/^[0-9a-f]{40,64}$/u.test(oid)) return null;
+  if (cache.has(oid)) return cache.get(oid);
+  const typeResult = await runGitCommand(["cat-file", "-t", oid], {
+    cwd: worktreeRoot, ...options,
+  });
+  let commit = null;
+  if (typeResult.exitCode === 0) {
+    const type = typeResult.stdout.trim();
+    if (type === "commit") {
+      commit = oid;
+    } else if (type === "tag") {
+      const peeled = await runGitCommand(
+        ["rev-parse", "--verify", "--quiet", oid + "^{commit}"],
+        { cwd: worktreeRoot, ...options },
+      );
+      if (peeled.exitCode === 0 && peeled.stdout.trim()) commit = peeled.stdout.trim();
+    }
+  }
+  cache.set(oid, commit);
+  return commit;
 }
 
 async function committedDelta(worktreeRoot, before, after, options = {}) {
@@ -575,43 +659,86 @@ async function committedDelta(worktreeRoot, before, after, options = {}) {
     return emptyTreeId;
   }
 
-  const ranges = new Map();
-  async function addRange(label, beforeOid, afterOid) {
-    if (!afterOid || beforeOid === afterOid) return;
-    const base = beforeOid || before.head || await emptyTree();
-    const range = base + ".." + afterOid;
-    const labels = ranges.get(range) ?? [];
-    labels.push(label);
-    ranges.set(range, labels);
+  const cache = new Map();
+  // Baseline: every commit that already existed before the worker ran. New
+  // commits are attributed to the worker only when they are reachable from the
+  // after-state but from none of these, so merely checking out an existing
+  // divergent branch is never reported as "commits made by the worker".
+  const baselineCommits = [];
+  async function addBaseline(oid) {
+    const commit = await peelCommitish(worktreeRoot, oid, cache, options);
+    if (commit && !baselineCommits.includes(commit)) baselineCommits.push(commit);
   }
-  await addRange("HEAD", before.head, after.head);
+  await addBaseline(before.head);
+  for (const oid of new Set([
+    ...Object.values(before.refs ?? {}),
+    ...refsChanged.map((change) => change.before),
+  ])) {
+    await addBaseline(oid);
+  }
+
+  const targets = [{ label: "HEAD", beforeOid: before.head, afterOid: after.head }];
   for (const change of refsChanged) {
-    await addRange(change.ref, change.before, change.after);
+    targets.push({ label: change.ref, beforeOid: change.before, afterOid: change.after });
   }
 
   const logs = [];
   const stats = [];
-  for (const [range, labels] of ranges) {
-    const log = await runGitCommand(["log", "--oneline", range], {
-      cwd: worktreeRoot, ...options,
-    });
+  let newCommitCount = 0;
+  for (const { label, beforeOid, afterOid } of targets) {
+    if (!afterOid || beforeOid === afterOid) continue;
+    const target = await peelCommitish(worktreeRoot, afterOid, cache, options);
+    if (!target) {
+      // Legal non-commit ref (for example a tag pointing at a blob): report the
+      // movement, never build a commit range from it.
+      logs.push(label + " -> " + afterOid + " (non-commit object; no commit log)");
+      stats.push(label + ": (non-commit ref target)");
+      continue;
+    }
+    // Everything reachable from the pre-delegation state is excluded, so only
+    // commits the worker actually created remain attributed to it.
+    const exclusions = baselineCommits;
+    const revList = await runGitCommand(
+      exclusions.length > 0
+        ? ["log", "--oneline", target, "--stdin"]
+        : ["log", "--oneline", target],
+      {
+        cwd: worktreeRoot,
+        ...options,
+        stdinText: exclusions.length > 0
+          ? exclusions.map((commit) => "^" + commit).join("\n") + "\n"
+          : undefined,
+      },
+    );
+    const revListFailure = snapshotFailure("git log " + target, revList);
+    if (revListFailure) throw new Error("committed delta unreliable: " + revListFailure);
+    const newCommits = String(revList.stdout ?? "").trim();
+    if (!newCommits) {
+      const note = label === "HEAD" && beforeOid
+        ? "HEAD moved from " + beforeOid.slice(0, 12) + " to " + afterOid.slice(0, 12) +
+          " without creating commits (branch checkout or reset); the target history predates the delegation"
+        : label + " now points to pre-existing history; no new commits";
+      logs.push(label + ": " + note);
+      stats.push(label + ": (no new commits)");
+      continue;
+    }
+    newCommitCount += newCommits.split("\n").length;
+    const base = beforeOid || before.head || await emptyTree();
+    const range = base + ".." + target;
     const diff = await runGitCommand(["diff", "--stat", range], {
       cwd: worktreeRoot, ...options,
     });
-    const failures = [
-      snapshotFailure("git log " + range, log),
-      snapshotFailure("git diff --stat " + range, diff),
-    ].filter(Boolean);
-    if (failures.length > 0) throw new Error("committed delta unreliable: " + failures.join("; "));
-    const heading = labels.join(", ") + " [" + range + "]";
-    logs.push(heading + "\n" + (String(log.stdout ?? "").trim() || "(no new commits)"));
-    stats.push(heading + "\n" + (String(diff.stdout ?? "").trim() || "(empty)"));
+    const diffFailure = snapshotFailure("git diff --stat " + range, diff);
+    if (diffFailure) throw new Error("committed delta unreliable: " + diffFailure);
+    logs.push(label + " [" + range + "]\n" + newCommits);
+    stats.push(label + " [" + range + "]\n" + (String(diff.stdout ?? "").trim() || "(empty)"));
   }
   return {
-    range: [...ranges.keys()].join("\n"),
+    range: logs.length > 0 ? "attribution: new commits only (pre-existing history excluded)" : "",
     refsChanged,
-    log: logs.join("\n\n"),
-    diffStat: stats.join("\n\n"),
+    newCommitCount,
+    log: logs.join("\n\n") || "(no ref or HEAD movements)",
+    diffStat: stats.join("\n\n") || "(empty)",
   };
 }
 
@@ -651,6 +778,16 @@ async function readWorkspaceQuarantine(key) {
   } catch (error) {
     if (error.code === "ENOENT") return null;
     throw error;
+  }
+}
+
+// Quarantined leases become reclaimable through this check: the operator
+// deliberately removed the shared marker after inspecting leftover processes.
+async function quarantineFileAbsent(key) {
+  try {
+    return (await readWorkspaceQuarantine(key)) === null;
+  } catch {
+    return false;
   }
 }
 
@@ -734,6 +871,7 @@ async function withWorkspaceLock(key, worktreeRoot, fn, {
   onDeadline = null,
   isUnavailable = null,
   onUnavailable = null,
+  operatorCleared = null,
 } = {}) {
   const prev = workspaceLocks.get(key) ?? Promise.resolve();
   const prevDone = prev.catch(() => {});
@@ -770,7 +908,7 @@ async function withWorkspaceLock(key, worktreeRoot, fn, {
       return typeof onUnavailable === "function" ? onUnavailable() : undefined;
     }
     try {
-      lease = await acquireGitWorkspaceLock({ cwd: worktreeRoot, key, cancel, deadline });
+      lease = await acquireGitWorkspaceLock({ cwd: worktreeRoot, key, cancel, deadline, operatorCleared });
     } catch (error) {
       if (error instanceof WorkspaceLockCancelledError) {
         return typeof onCancelled === "function" ? onCancelled() : undefined;
@@ -980,9 +1118,12 @@ async function delegateTask(rawArgs, cancel) {
       return cancelledDelegation({ backend, workspacePath, worktreeRoot, spec });
     }
     const allowDirty = rawArgs.allowDirty === true;
+    // Attribution window for concurrency disclosure: everything between the
+    // before-snapshot and the after-snapshot.
+    const attributionWindowStart = Date.now();
     let before;
     try {
-      before = await gitSnapshot(worktreeRoot, { cancel, deadline });
+      before = await gitSnapshot(worktreeRoot, { cancel, deadline, ownLockRef: workspaceLease.ref });
     } catch (error) {
       if (error instanceof OperationCancelledError) {
         return cancelledDelegation({ backend, workspacePath, worktreeRoot, spec });
@@ -1039,7 +1180,26 @@ async function delegateTask(rawArgs, cancel) {
       return cancelledDelegation({ backend, workspacePath, worktreeRoot, spec, before });
     }
 
-    await workspaceLease.markWorkerStarting();
+    // The lease state update shares the request's cancellation/deadline so a
+    // hung reference-transaction hook cannot pin the request here.
+    try {
+      await workspaceLease.markWorkerStarting({ cancel, deadline });
+    } catch (error) {
+      if (error instanceof WorkspaceLockCancelledError) {
+        return cancelledDelegation({ backend, workspacePath, worktreeRoot, spec, before });
+      }
+      if (error instanceof WorkspaceLockDeadlineError) {
+        return {
+          ok: false,
+          error: "delegation timed out after preflight; the worker never started",
+          backend, workspacePath, worktreeRoot, exitCode: null, timedOut: true, killed: false, cancelled: false,
+          treeTerminated: true, outputTail: "", stderrTail: "",
+          gitBefore: before, git: before, commits: null,
+          experimental: Boolean(spec.experimental),
+        };
+      }
+      throw error;
+    }
     const remaining = deadline - Date.now();
     if (remaining <= 0) {
       return {
@@ -1085,7 +1245,16 @@ async function delegateTask(rawArgs, cancel) {
         workerController = controller;
         if (cancel) cancel.controller = controller;
         if (ownershipLostError) void recordOwnershipLoss(ownershipLostError);
-        workerLockUpdate = workspaceLease.markWorkerRunning(controller.child.pid).catch(recordOwnershipLoss);
+        workerLockUpdate = workspaceLease.markWorkerRunning(controller.child.pid, { cancel, deadline })
+          .catch((error) => {
+            // Interruption of the state update is expected during cancellation
+            // or timeout: the worker lifecycle itself is managed by terminate().
+            if (error instanceof WorkspaceLockCancelledError ||
+                error instanceof WorkspaceLockDeadlineError) {
+              return;
+            }
+            return recordOwnershipLoss(error);
+          });
       },
     });
     // Keep the controller live while runCommand is still inspecting or
@@ -1100,10 +1269,17 @@ async function delegateTask(rawArgs, cancel) {
     if (!result.treeTerminated) {
       quarantinedWorkspaces.add(lockKey);
       workspaceLease.retain();
+      // Move the retained lease into the recoverable "quarantined" state. A
+      // running-state lease can never be reclaimed, which would leave the
+      // workspace locked forever even after the operator removes the marker.
+      try {
+        await workspaceLease.markWorkerQuarantined();
+      } catch { /* lease lost or interrupted: the marker file below still gates recovery */ }
       quarantinePath = await markWorkspaceQuarantined(lockKey, {
         backend,
         workspacePath,
         worktreeRoot,
+        lockRef: workspaceLease.ref,
         terminationError: result.terminationError,
       });
       // The shared marker is now authoritative and removable by an operator;
@@ -1111,9 +1287,12 @@ async function delegateTask(rawArgs, cancel) {
       quarantinedWorkspaces.delete(lockKey);
     } else if (!ownershipLostError) {
       try {
-        await workspaceLease.markWorkerIdle();
+        await workspaceLease.markWorkerIdle({ cancel, deadline });
       } catch (error) {
-        await recordOwnershipLoss(error);
+        if (!(error instanceof WorkspaceLockCancelledError) &&
+            !(error instanceof WorkspaceLockDeadlineError)) {
+          await recordOwnershipLoss(error);
+        }
       }
     }
     if (ownershipLostError) {
@@ -1128,7 +1307,12 @@ async function delegateTask(rawArgs, cancel) {
     let postRunDeadlineExceeded = false;
     if (result.treeTerminated) {
       try {
-        after = await gitSnapshot(worktreeRoot, { cancel, deadline });
+        after = await gitSnapshot(worktreeRoot, {
+          cancel,
+          deadline,
+          ownLockRef: workspaceLease.ref,
+          concurrencyWindowStart: attributionWindowStart,
+        });
         commits = await committedDelta(worktreeRoot, before, after, { cancel, deadline });
       } catch (error) {
         if (error instanceof OperationCancelledError) {
@@ -1143,6 +1327,13 @@ async function delegateTask(rawArgs, cancel) {
         }
       }
     }
+    // Linked worktrees of one repository serialize per worktree only. If any
+    // other delegation held an active lease in the same repository during our
+    // before/after snapshots, ref movements may include its commits: disclose
+    // the overlap instead of presenting attribution as exact.
+    const repositoryConcurrency = Boolean(
+      (before.concurrentDelegations ?? 0) > 0 || (after?.concurrentDelegations ?? 0) > 0,
+    );
     let error = "";
     if (!result.treeTerminated) {
       error = "backend process tree could not be confirmed terminated; the shared workspace quarantine remains until an operator checks for leftovers and removes quarantinePath";
@@ -1170,6 +1361,7 @@ async function delegateTask(rawArgs, cancel) {
       treeTerminated: result.treeTerminated,
       terminationError: result.terminationError,
       quarantinePath,
+      repositoryConcurrency,
       outputTail: tail(result.stdout, RAW_TAIL_CHARS),
       stderrTail: tail(result.stderr, RAW_TAIL_CHARS),
       outputTruncated: Boolean(result.stdoutTruncated),
@@ -1184,6 +1376,7 @@ async function delegateTask(rawArgs, cancel) {
     deadline,
     onCancelled: () => cancelledDelegation({ backend, workspacePath, worktreeRoot, spec }),
     onDeadline: () => lockDeadlineDelegation({ backend, workspacePath, worktreeRoot, spec }),
+    operatorCleared: () => quarantineFileAbsent(lockKey),
     isUnavailable: async () => {
       observedQuarantine = await readWorkspaceQuarantine(lockKey);
       return quarantinedWorkspaces.has(lockKey) || Boolean(observedQuarantine);
@@ -1206,8 +1399,7 @@ function textResult(header, obj) {
     lines.push("", "## " + label + " git diff stat", "", "~~~text", git.diffStat || "(empty)", "~~~");
     lines.push("", "## " + label + " changed files", "", "~~~text", (git.changedFiles ?? []).join("\n") || "(none)", "~~~");
     lines.push("", "## " + label + " HEAD", "", "~~~text", git.head || "(unborn)", "~~~");
-  };
-  gitBlock("before", obj.gitBefore);
+  };  gitBlock("before", obj.gitBefore);
   gitBlock("after", obj.git);
   if (obj.commits) {
     if (obj.commits.refsChanged?.length) {
@@ -1216,8 +1408,19 @@ function textResult(header, obj) {
           item.ref + " " + (item.before || "(absent)") + " -> " + (item.after || "(deleted)"),
         ).join("\n"), "~~~");
     }
-    lines.push("", "## commits made by the worker", "", "~~~text", obj.commits.log || "(none)", "~~~");
+    const commitsHeading = obj.repositoryConcurrency
+      ? "## commits attributed to the worker (other delegations were active in this repository; attribution may overlap)"
+      : "## commits made by the worker";
+    lines.push("", commitsHeading, "", "~~~text", obj.commits.log || "(none)", "~~~");
     lines.push("", "## commit diff stat", "", "~~~text", obj.commits.diffStat || "(empty)", "~~~");
+  }
+  if (obj.repositoryConcurrency) {
+    lines.push(
+      "",
+      "## attribution note",
+      "",
+      "other delegations were active in this repository during the run; commits and ref changes may overlap those workers",
+    );
   }
   if (obj.outputTail) lines.push("", "## output tail", "", "~~~text", obj.outputTail, "~~~");
   if (obj.stderrTail) lines.push("", "## stderr tail", "", "~~~text", obj.stderrTail, "~~~");
@@ -1375,6 +1578,7 @@ async function handleMessage(message) {
             }, {
               cancel,
               onCancelled: () => cancelledWorkspaceStatus(message.id, { workspacePath, worktreeRoot }),
+              operatorCleared: () => quarantineFileAbsent(lockKey),
               isUnavailable: async () => {
                 observedQuarantine = await readWorkspaceQuarantine(lockKey);
                 return quarantinedWorkspaces.has(lockKey) || Boolean(observedQuarantine);

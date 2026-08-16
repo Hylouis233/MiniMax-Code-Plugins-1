@@ -26,6 +26,21 @@ if (spec.branchRoundTrip) {
   execFileSync("git", ["commit", "-m", spec.commitMessage ?? "worker branch commit"]);
   execFileSync("git", ["checkout", original]);
   event("end");
+} else if (spec.checkoutExisting) {
+  // Merely check out a pre-existing divergent branch; no commits are created.
+  event("start");
+  execFileSync("git", ["checkout", spec.branchName]);
+  event("end");
+} else if (spec.blobTag) {
+  // Create a legal ref that points at a blob, not a commit.
+  event("start");
+  const oid = execFileSync(
+    "git",
+    ["hash-object", "-w", "--stdin"],
+    { input: "blob payload\n", encoding: "utf8" },
+  ).trim();
+  execFileSync("git", ["update-ref", spec.refName ?? "refs/tags/blobtag", oid]);
+  event("end");
 } else if (spec.mode === "descendant") {
   event("descendant-start");
   await delay(spec.delayMs ?? 1_000);

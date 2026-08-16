@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import os from "node:os";
 
 export const WORKSPACE_LOCK_REF_PREFIX = "refs/cli-agent-bridge/workspace-locks/";
+const WORKSPACE_HISTORY_REF_SUFFIX = ".history";
 const DEFAULT_STALE_MS = 30_000;
 const DEFAULT_HEARTBEAT_MS = 5_000;
 const DEFAULT_POLL_MS = 100;
@@ -26,6 +27,33 @@ export function localHostIdentity() {
 
 export function workspaceLockRef(key) {
   return WORKSPACE_LOCK_REF_PREFIX + createHash("sha256").update(key).digest("hex");
+}
+
+// A completed delegation leaves a persistent run-window record under this ref
+// so later snapshots in the same repository can prove their attribution window
+// overlapped another worker, even after that worker's lease ref was deleted.
+export function workspaceHistoryRef(key) {
+  return workspaceLockRef(key) + WORKSPACE_HISTORY_REF_SUFFIX;
+}
+
+async function writeRunHistory(cwd, lockRef, owner) {
+  try {
+    const record = {
+      version: 1,
+      acquiredAt: Number.isFinite(owner.acquiredAt) ? owner.acquiredAt : null,
+      endedAt: Date.now(),
+      hostIdentity: owner.hostIdentity,
+    };
+    const oidResult = await runGit(cwd, ["hash-object", "-w", "--stdin"], {
+      stdinText: JSON.stringify(record) + "\n",
+    });
+    const oid = oidResult.stdout.trim();
+    if (oidResult.exitCode !== 0 || !/^[0-9a-f]{40,64}$/u.test(oid)) return;
+    await runGit(cwd, ["update-ref", "--no-deref", lockRef + WORKSPACE_HISTORY_REF_SUFFIX, oid]);
+  } catch {
+    // Best effort: a missing history record only weakens concurrency
+    // disclosure, never correctness of locking.
+  }
 }
 
 export function probeProcess(pid) {
@@ -200,9 +228,23 @@ async function canReclaim(owner, {
   staleMs,
   hostIdentity,
   processProbe,
+  operatorCleared = null,
 }) {
   if (!owner || owner.version !== 1 || owner.hostIdentity !== hostIdentity) return false;
-  if (!Number.isFinite(owner.heartbeatAt) || now - owner.heartbeatAt < staleMs) return false;
+  if (!Number.isFinite(owner.heartbeatAt)) return false;
+  // A quarantined lease means termination already failed and the operator was
+  // told to inspect leftovers. It becomes reclaimable once the quarantine
+  // marker is deliberately removed (or, failing that, the owner died and the
+  // heartbeat went stale after a crash).
+  if (owner.workerState === "quarantined") {
+    if (operatorCleared) {
+      try {
+        if (await operatorCleared()) return true;
+      } catch { /* treat a failed check as not cleared */ }
+    }
+    return now - owner.heartbeatAt >= staleMs && await processProbe(owner.ownerPid) === "dead";
+  }
+  if (now - owner.heartbeatAt < staleMs) return false;
   if (await processProbe(owner.ownerPid) !== "dead") return false;
   if (owner.workerState === "idle" && owner.workerPid === null) return true;
   // Starting/running records always fail closed. The live bridge tracks
@@ -226,6 +268,7 @@ function makeOwner({ hostIdentity, ownerPid, now }) {
 
 function createLease({ cwd, ref, oid, owner, heartbeatMs }) {
   const localRefKey = cwd + "\0" + ref;
+  const ownerToken = owner.token;
   let currentOid = oid;
   let currentOwner = owner;
   let updateChain = Promise.resolve();
@@ -234,6 +277,7 @@ function createLease({ cwd, ref, oid, owner, heartbeatMs }) {
   let releasePromise = null;
   let retained = false;
   let lostError = null;
+  let interruptedError = null;
   let resolveLost;
   const lost = new Promise((resolve) => { resolveLost = resolve; });
   let heartbeatPending = false;
@@ -243,27 +287,40 @@ function createLease({ cwd, ref, oid, owner, heartbeatMs }) {
     lostError = error;
     resolveLost(error);
   };
+  const isInterruption = (error) =>
+    error instanceof WorkspaceLockCancelledError || error instanceof WorkspaceLockDeadlineError;
 
-  const queueUpdate = (change) => {
+  // State transitions accept the delegation's cancellation/deadline so a hung
+  // reference-transaction hook cannot pin a request past its advertised limit.
+  // An interruption leaves the ref's actual value unknown (git may have
+  // committed the CAS before being killed), so the lease stops updating and
+  // release() resyncs by owner token before deleting.
+  const queueUpdate = (change, interrupt = {}) => {
+    if (interruptedError) return Promise.reject(interruptedError);
     updateChain = updateChain.then(async () => {
-      if (stopped || lostError) return;
+      if (stopped || lostError || interruptedError) return;
       const nextOwner = { ...currentOwner, ...change, heartbeatAt: Date.now() };
-      const nextOid = await writeOwnerBlob(cwd, nextOwner);
-      if (!await compareAndSwap(cwd, ref, nextOid, currentOid)) {
+      const nextOid = await writeOwnerBlob(cwd, nextOwner, interrupt);
+      if (!await compareAndSwap(cwd, ref, nextOid, currentOid, interrupt)) {
         throw new Error("workspace lock ownership changed during heartbeat");
       }
       currentOwner = nextOwner;
       currentOid = nextOid;
     }).catch((error) => {
+      if (isInterruption(error)) {
+        interruptedError ??= error;
+        return;
+      }
       rememberLoss(error);
     });
     return updateChain.then(() => {
+      if (interruptedError) throw interruptedError;
       if (lostError) throw lostError;
     });
   };
 
   const timer = setInterval(() => {
-    if (stopped || heartbeatPending || lostError) return;
+    if (stopped || heartbeatPending || lostError || interruptedError) return;
     heartbeatPending = true;
     void queueUpdate({}).catch(() => {}).finally(() => { heartbeatPending = false; });
   }, heartbeatMs);
@@ -275,16 +332,20 @@ function createLease({ cwd, ref, oid, owner, heartbeatMs }) {
     async assertOwned() {
       await updateChain;
       if (lostError) throw lostError;
+      if (interruptedError) throw interruptedError;
     },
-    async markWorkerStarting() {
-      await queueUpdate({ workerState: "starting", workerPid: null });
+    async markWorkerStarting(interrupt = {}) {
+      await queueUpdate({ workerState: "starting", workerPid: null }, interrupt);
     },
-    async markWorkerRunning(pid) {
+    async markWorkerRunning(pid, interrupt = {}) {
       if (!Number.isInteger(pid) || pid <= 0) throw new Error("worker pid is unavailable");
-      await queueUpdate({ workerState: "running", workerPid: pid });
+      await queueUpdate({ workerState: "running", workerPid: pid }, interrupt);
     },
-    async markWorkerIdle() {
-      await queueUpdate({ workerState: "idle", workerPid: null });
+    async markWorkerIdle(interrupt = {}) {
+      await queueUpdate({ workerState: "idle", workerPid: null }, interrupt);
+    },
+    async markWorkerQuarantined() {
+      await queueUpdate({ workerState: "quarantined" });
     },
     retain() {
       retained = true;
@@ -298,11 +359,20 @@ function createLease({ cwd, ref, oid, owner, heartbeatMs }) {
       stopped = true;
       clearInterval(timer);
       releasePromise = (async () => {
-        await updateChain;
+        await updateChain.catch(() => {});
         if (retained) {
           if (lostError) throw lostError;
           released = true;
           return;
+        }
+        // An interrupted state update may have committed its CAS after the git
+        // process was killed, leaving currentOid stale. Resync by owner token
+        // so cleanup still deletes this process's own lease record.
+        if (interruptedError) {
+          try {
+            const observed = await readCurrentOwner(cwd, ref);
+            if (observed && observed.owner?.token === ownerToken) currentOid = observed.oid;
+          } catch { /* best effort; the delete below still uses the last known OID */ }
         }
         let deleted = false;
         let deleteError = null;
@@ -320,6 +390,7 @@ function createLease({ cwd, ref, oid, owner, heartbeatMs }) {
         }
         if (deleteError) throw deleteError;
         released = true;
+        if (deleted) await writeRunHistory(cwd, ref, currentOwner);
         if (lostError) throw lostError;
         if (!deleted) throw new Error("workspace lock ownership changed before release");
       })();
@@ -343,6 +414,7 @@ export async function tryAcquireGitWorkspaceLock({
   ownerPid = process.pid,
   now = Date.now(),
   processProbe = probeProcess,
+  operatorCleared = null,
 } = {}) {
   checkInterrupted(cancel, deadline);
   const ref = workspaceLockRef(key);
@@ -352,7 +424,7 @@ export async function tryAcquireGitWorkspaceLock({
   const locallyAbandoned = Boolean(current && abandonedOid === current.oid);
   if (!current || (abandonedOid && !locallyAbandoned)) locallyAbandonedRefs.delete(localRefKey);
   if (current && !locallyAbandoned && !await canReclaim(current.owner, {
-    now, staleMs, hostIdentity, processProbe,
+    now, staleMs, hostIdentity, processProbe, operatorCleared,
   })) {
     return { acquired: false, reason: "held" };
   }

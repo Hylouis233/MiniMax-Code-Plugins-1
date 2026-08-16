@@ -124,6 +124,13 @@ you already obtained a valid ID from that backend outside this Plugin.
   confirmed dead; malformed, foreign-host, starting, running, or uncertain records fail closed.
   A crashed bridge cannot reconstruct descendants that escaped into another POSIX session from the
   recorded worker PID alone, so inspect leftover processes and clear those hidden refs manually.
+- Worktrees of the same repository serialize independently (each has its own lock), but Git refs
+  are shared by the whole repository. When another delegation was active in the same repository
+  during a run - detected from live leases plus the run-history record each completed delegation
+  leaves under a hidden `.history` ref - the result sets `repositoryConcurrency: true` and the
+  commits section is labelled as attributed rather than exact, because ref movements may include
+  the other worker's commits. Perfect attribution across shared refs would require serializing
+  the entire repository, which would break parallel independent-worktree runs.
 - Locking leaves the worktree and index unchanged, but it requires writable Git object/ref metadata:
   each acquisition writes an owner blob and temporarily updates a hidden ref. Repository
   reference-transaction hooks can observe or reject those updates, and released owner blobs remain
@@ -131,13 +138,18 @@ you already obtained a valid ID from that backend outside this Plugin.
   read-only in its MCP annotations even though the snapshot itself does not edit worktree files.
 - Cancellation and timeout confirm that the delegated process tree has exited before releasing
   the workspace mutex. A lightweight ancestry monitor records descendants that create a new POSIX
-  session/process group so cancellation still terminates them. If termination cannot be confirmed,
-  the bridge writes a shared quarantine marker and every bridge process refuses further delegation
-  until an operator checks for leftovers and deliberately removes the reported quarantinePath.
-  A retained Git-ref lease may also require deliberate removal after that process check; Windows
-  cannot safely reclaim a stale lease that recorded a running worker because descendant liveness
-  cannot be proven. The quarantine marker itself lives in a current-user-scoped OS temporary
-  directory.
+  session/process group so cancellation still terminates them; tracked PIDs are matched against
+  their recorded start identity (process start time on POSIX, creation time on Windows) so a
+  reused PID is never signaled, and a POSIX process group is only signaled while its original
+  leader identity still matches. If termination cannot be confirmed, the bridge writes a shared
+  quarantine marker, moves its lease into the recoverable `quarantined` state, and every bridge
+  process refuses further delegation until an operator checks for leftovers and deliberately
+  removes the reported quarantinePath - removing that marker also authorizes the next delegation
+  to reclaim the quarantined lease. If the bridge crashes mid-run, a lease recording a running
+  worker still cannot be reclaimed automatically (descendant liveness cannot be proven); delete
+  the hidden lock ref recorded in the quarantine marker (or run `git update-ref -d` on the ref
+  under `refs/cli-agent-bridge/workspace-locks/`) after checking for leftover processes. The
+  quarantine marker itself lives in a current-user-scoped OS temporary directory.
   On Linux, zombie-only tracked trees count as terminated; zombies cannot edit the workspace and
   may otherwise persist when container PID 1 does not reap them.
 - Cancelling a workspace_status request interrupts its queued lock wait or Git snapshot and returns
@@ -146,8 +158,12 @@ you already obtained a valid ID from that backend outside this Plugin.
   the worker, and post-run snapshots. Safe process-tree termination can
   extend beyond that deadline by the documented kill grace period.
 - Snapshots include all Git refs as well as HEAD, so a worker that commits on a new branch and
-  returns to the original branch still reports the created ref and commit. Any bounded Git capture
-  that truncates is rejected as an unreliable snapshot; backend output truncation is disclosed.
+  returns to the original branch still reports the created ref and commit. Commits are attributed
+  to the worker only when they are not reachable from any pre-delegation ref, so checking out an
+  existing divergent branch is reported as a HEAD move with no new commits, and refs pointing at
+  non-commit objects (for example a blob tag) are reported without failing the delegation. Any
+  bounded Git capture that truncates is rejected as an unreliable snapshot; backend output
+  truncation is disclosed.
 - zcode and dsh backends are experimental: ZCode desktop builds have no verified headless CLI,
   and dsh needs a headless profile present under DSH_HOME/profiles.
 - Custom wrapper shims that re-bind dashed flags can misreport a backend as unavailable; point
@@ -164,10 +180,13 @@ node --test plugins/Hylouis233/cli-agent-bridge/tests/workspace-lock.test.mjs
 ```
 
 They cover the full MCP flow plus in-process and cross-process canonical worktree locking, stale
-owner compare-and-swap, live-owner non-steal, shared quarantine markers, queued and discovery-phase
-cancellation, overall deadlines, cancel/timeout process-tree termination, escaped POSIX descendants
-and zombie-only Linux groups, unusual Git pathnames, JSON-RPC id typing, unborn HEAD and non-HEAD
-ref changes, capture truncation, and Codex prompt delimiters on Windows and POSIX.
+owner compare-and-swap, live-owner non-steal, quarantined-lease recovery after the operator
+removes the marker, interruptible lease state updates, shared quarantine markers, queued and
+discovery-phase cancellation, overall deadlines, cancel/timeout process-tree termination, escaped
+POSIX descendants and zombie-only Linux groups, PID-reuse identity checks before signaling,
+unusual Git pathnames, JSON-RPC id typing, unborn HEAD and non-HEAD ref changes, checkout-only
+HEAD moves, non-commit refs, repository-concurrency disclosure between linked worktrees, capture
+truncation, and Codex prompt delimiters on Windows and POSIX.
 
 ## License
 

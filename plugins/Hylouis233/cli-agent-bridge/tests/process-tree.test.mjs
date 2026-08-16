@@ -7,7 +7,10 @@ import test from "node:test";
 import {
   isProcessTreeAlive,
   linuxProcessGroupHasLiveMembers,
+  refreshProcessTree,
+  signalProcessTree,
   waitForProcessTreeExit,
+  windowsProcessTreePids,
 } from "../process-tree.mjs";
 
 async function writeProcStat(root, pid, { state, group, command = "worker" }) {
@@ -78,4 +81,70 @@ test("zombie-only groups count as exited only for the final post-SIGKILL wait", 
   assert.equal(await isProcessTreeAlive(child, treeState, { ...common, ignoreZombieOnly: true }), false);
   assert.equal(await waitForProcessTreeExit(child, 0, treeState, common), false);
   assert.equal(await waitForProcessTreeExit(child, 0, treeState, { ...common, ignoreZombieOnly: true }), true);
+});
+
+function snapshotOf(processes) {
+  const list = processes.map((item) => ({ startIdentity: "", ...item }));
+  list.incomplete = false;
+  return async () => list;
+}
+
+test("the process group is signaled only while its leader identity is original", async () => {
+  const child = { pid: 9001 };
+  const treeState = { knownPids: new Set([9001, 9002]), knownStarts: new Map() };
+  const original = snapshotOf([
+    { pid: 9001, parentPid: 1, processGroupId: 9001, state: "S", startIdentity: "start-a" },
+    { pid: 9002, parentPid: 9001, processGroupId: 9001, state: "S", startIdentity: "start-b" },
+  ]);
+  await refreshProcessTree(child, treeState, { platform: "linux", posixProcessSnapshot: original });
+
+  const groupSignals = [];
+  const oneSignals = [];
+  await signalProcessTree(child, "SIGTERM", treeState, {
+    platform: "linux",
+    posixProcessSnapshot: original,
+    killGroup: (pgid) => { groupSignals.push(pgid); },
+    killOne: (pid) => { oneSignals.push(pid); },
+  });
+  assert.deepEqual(groupSignals, [9001], "the original group is signaled");
+  assert.ok(oneSignals.includes(9002), "tracked descendants are signaled individually");
+
+  // The leader exits; during the kill grace its PID is reused by an unrelated
+  // process that leads a new group. The saved PGID must never be signaled.
+  const reused = snapshotOf([
+    { pid: 9002, parentPid: 1, processGroupId: 9001, state: "S", startIdentity: "start-b" },
+    { pid: 9001, parentPid: 404, processGroupId: 9001, state: "S", startIdentity: "start-reused" },
+  ]);
+  const groupSignalsAfterReuse = [];
+  await signalProcessTree(child, "SIGKILL", treeState, {
+    platform: "linux",
+    posixProcessSnapshot: reused,
+    killGroup: (pgid) => { groupSignalsAfterReuse.push(pgid); },
+    killOne: () => {},
+  });
+  assert.deepEqual(groupSignalsAfterReuse, [], "a reused leader identity stops group signaling");
+});
+
+test("windows tree inspection drops known PIDs whose creation identity changed", async () => {
+  const treeState = {
+    knownPids: new Set([500, 501]),
+    knownStarts: new Map([[500, "ticks-1"], [501, "ticks-2"]]),
+  };
+  const fakeUtility = async (command, args) => {
+    assert.match(args.join(" "), /CreationTicks/u, "the CIM projection must request creation times");
+    return {
+      exitCode: 0,
+      stdout: JSON.stringify([
+        { ProcessId: 500, ParentProcessId: 1, CreationTicks: "ticks-REUSED" },
+        { ProcessId: 501, ParentProcessId: 500, CreationTicks: "ticks-2" },
+        { ProcessId: 502, ParentProcessId: 501, CreationTicks: "ticks-3" },
+      ]),
+      stderr: "",
+    };
+  };
+  const pids = await windowsProcessTreePids(500, treeState, { runUtility: fakeUtility });
+  assert.ok(pids.includes(501) && pids.includes(502), "genuine descendants are kept");
+  assert.ok(!pids.includes(500), "the reused root PID is dropped from the tree");
+  assert.ok(!treeState.knownPids.has(500), "the reused PID leaves the tracked set");
+  assert.equal(treeState.knownStarts.get(500), "ticks-1", "the original identity is retained for comparison");
 });

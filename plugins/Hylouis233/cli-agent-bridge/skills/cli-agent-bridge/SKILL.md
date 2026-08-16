@@ -27,6 +27,9 @@ inside the target git repository, and their results come back as a git diff for 
    files including staged and new files), changed refs and the commits block when the worker committed, the
    output and stderr tails, and the exit code. A failed, timed-out, or cancelled run reports
    ok=false (and isError=true at the protocol level); never treat such a result as success.
+   When repositoryConcurrency is true, another delegation was active in the same repository
+   during the run, so the commits block lists attributed commits that may overlap the other
+   worker - do not present them as this worker's exclusive output.
 5. If the result is wrong, delegate a follow-up task. delegate_task results do not carry the
    backend's own session id, so use resumeSessionId only when the user already knows one (for
    example from the backend CLI's session history); otherwise start a fresh delegation with the
@@ -69,7 +72,8 @@ inside the target git repository, and their results come back as a git diff for 
   reference-transaction hooks may observe or reject the lock update.
 - Only stale idle locks with a positively dead same-host owner are reclaimed automatically. A stale
   starting/running ref fails closed because escaped descendants cannot be reconstructed after a
-  bridge crash; inspect the process tree before deliberately clearing that hidden ref.
+  bridge crash; inspect the process tree before deliberately clearing that hidden ref. A lease
+  moved to the quarantined state is reclaimable once the operator removes the quarantine marker.
 
 ## Notes
 

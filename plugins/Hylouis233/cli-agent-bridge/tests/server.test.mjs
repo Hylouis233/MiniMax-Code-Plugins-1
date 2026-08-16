@@ -758,6 +758,69 @@ test("closing MCP stdin terminates active worker descendants", async (context) =
   await assert.rejects(access(path.join(workspace, "shutdown-descendant-survived.txt")), /ENOENT/u);
 });
 
+test("checking out a pre-existing divergent branch is not reported as worker commits", async (context) => {
+  const { workspace, client } = await makeHarness(context);
+  // Create a divergent branch whose commits predate the delegation.
+  await execFileAsync("git", ["checkout", "-b", "divergent"], { cwd: workspace });
+  await writeFile(path.join(workspace, "divergent.txt"), "pre-existing history\n");
+  await execFileAsync("git", ["add", "divergent.txt"], { cwd: workspace });
+  await execFileAsync("git", ["commit", "-m", "pre-existing divergent commit"], { cwd: workspace });
+  await execFileAsync("git", ["checkout", "main"], { cwd: workspace });
+
+  const response = await client.request("tools/call", taskArguments(workspace, {
+    name: "checkout-only", checkoutExisting: true, branchName: "divergent",
+  }));
+  const out = response.result.structuredContent;
+  assert.equal(out.ok, true, JSON.stringify(out.error));
+  assert.notEqual(out.gitBefore.head, out.git.head, "worker must have moved HEAD");
+  assert.ok(out.commits, "a HEAD movement must still produce a commits block");
+  assert.match(out.commits.log, /branch checkout or reset/u);
+  assert.doesNotMatch(out.commits.log, /pre-existing divergent commit/u,
+    "history that predates the delegation must not be attributed to the worker");
+});
+
+test("a worker ref pointing at a non-commit object is reported without failing the delegation", async (context) => {
+  const { workspace, client } = await makeHarness(context);
+  const response = await client.request("tools/call", taskArguments(workspace, {
+    name: "blob-tag", blobTag: true, refName: "refs/tags/blobtag",
+  }));
+  assert.equal(response.result.error, undefined, "the delegation must not surface a JSON-RPC error");
+  const out = response.result.structuredContent;
+  assert.equal(out.ok, true, JSON.stringify(out.error));
+  assert.ok(out.commits.refsChanged.some((item) => item.ref === "refs/tags/blobtag" && item.after),
+    JSON.stringify(out.commits.refsChanged));
+  assert.match(out.commits.log, /non-commit object/u);
+});
+
+test("parallel worktree delegations disclose repository concurrency", async (context) => {
+  const harness = await makeHarness(context);
+  const { tempRoot, workspace, configPath } = harness;
+  // A second independent worktree of the same repository: per-worktree locks
+  // are distinct while repository refs are shared.
+  const secondWorktree = path.join(tempRoot, "second-worktree");
+  await execFileAsync("git", ["worktree", "add", secondWorktree], { cwd: workspace });
+
+  const eventFile = path.join(tempRoot, "parallel-events.log");
+  const slowSpec = { name: "slow", delayMs: 3_000, eventFile };
+  const fastClient = new McpClient(configPath);
+  await fastClient.initialize();
+  context.after(async () => { await fastClient.close(); });
+
+  const slowPromise = harness.client.request("tools/call", taskArguments(workspace, slowSpec));
+  await waitFor(async () => (await events(eventFile)).some((item) => item.event === "start"));
+  const overlapping = await fastClient.request("tools/call", taskArguments(secondWorktree, {
+    name: "fast-in-worktree", delayMs: 0,
+  }));
+  const overlappingOut = overlapping.result.structuredContent;
+  assert.equal(overlappingOut.ok, true, JSON.stringify(overlappingOut.error));
+  assert.equal(overlappingOut.repositoryConcurrency, true,
+    "an overlapping delegation in a linked worktree must disclose concurrency");
+  const slowOut = (await slowPromise).result.structuredContent;
+  assert.equal(slowOut.ok, true, JSON.stringify(slowOut.error));
+  assert.equal(slowOut.repositoryConcurrency, true,
+    "the slow delegation observed the overlapping worker in its after snapshot");
+});
+
 test("PowerShell shim runner fails closed for a missing backend", {
   skip: process.platform !== "win32",
 }, async () => {

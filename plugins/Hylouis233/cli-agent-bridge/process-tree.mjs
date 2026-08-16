@@ -36,13 +36,17 @@ function runUtility(command, args, timeoutMs = 5_000) {
   });
 }
 
-async function windowsProcessTreePids(rootPid, knownPids = new Set()) {
+export async function windowsProcessTreePids(
+  rootPid,
+  treeState = { knownPids: new Set(), knownStarts: new Map() },
+  { runUtility: run = runUtility } = {},
+) {
   const script = [
     "$ErrorActionPreference='Stop'",
-    "$items=@(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId)",
+    "$items=@(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,@{n='CreationTicks';e={$_.CreationDate.ToUniversalTime().Ticks}})",
     "$items | ConvertTo-Json -Compress",
   ].join("; ");
-  const result = await runUtility("powershell.exe", [
+  const result = await run("powershell.exe", [
     "-NoProfile", "-NonInteractive", "-Command", script,
   ]);
   if (result.exitCode !== 0) {
@@ -54,11 +58,30 @@ async function windowsProcessTreePids(rootPid, knownPids = new Set()) {
   const processes = (Array.isArray(parsed) ? parsed : [parsed]).map((item) => ({
     pid: Number(item.ProcessId),
     parentPid: Number(item.ParentProcessId),
+    startIdentity: String(item.CreationTicks ?? ""),
   }));
+  treeState.knownStarts ??= new Map();
+  const liveIdentities = new Map(processes.map((item) => [item.pid, item.startIdentity]));
+  // A known PID whose creation time changed is an unrelated process that reused
+  // the ID; it must leave the tracked tree before anything is signaled.
+  for (const pid of [...treeState.knownPids]) {
+    const expected = treeState.knownStarts.get(pid);
+    const observed = liveIdentities.get(pid);
+    if (expected && observed && expected !== observed) treeState.knownPids.delete(pid);
+  }
   const livePids = new Set(processes.map((item) => item.pid));
-  const descendants = new Set([...knownPids].filter((pid) => livePids.has(pid)));
-  if (livePids.has(rootPid)) descendants.add(rootPid);
-  const parents = new Set([rootPid, ...knownPids]);
+  const descendants = new Set([...treeState.knownPids].filter((pid) => livePids.has(pid)));
+  if (livePids.has(rootPid)) {
+    const rootExpected = treeState.knownStarts.get(rootPid);
+    const rootObserved = liveIdentities.get(rootPid);
+    // Record the root identity on first observation; afterwards a mismatch
+    // means the backend PID already exited and was reused.
+    if (!rootExpected || !rootObserved || rootExpected === rootObserved) {
+      descendants.add(rootPid);
+      if (rootObserved) treeState.knownStarts.set(rootPid, rootObserved);
+    }
+  }
+  const parents = new Set([rootPid, ...treeState.knownPids]);
   let changed = true;
   while (changed) {
     changed = false;
@@ -70,7 +93,11 @@ async function windowsProcessTreePids(rootPid, knownPids = new Set()) {
       }
     }
   }
-  for (const pid of descendants) knownPids.add(pid);
+  for (const pid of descendants) {
+    const identity = liveIdentities.get(pid);
+    if (identity && !treeState.knownStarts.has(pid)) treeState.knownStarts.set(pid, identity);
+  }
+  for (const pid of descendants) treeState.knownPids.add(pid);
   return [...descendants];
 }
 
@@ -160,13 +187,19 @@ export async function refreshProcessTree(child, treeState, options = {}) {
   if (!Number.isInteger(child.pid)) return null;
   const platform = options.platform ?? process.platform;
   if (platform === "win32") {
-    await windowsProcessTreePids(child.pid, treeState.knownPids);
+    await windowsProcessTreePids(child.pid, treeState, options);
     return null;
   }
-  const processes = await posixProcessSnapshot(options);
+  const processes = await (options.posixProcessSnapshot ?? posixProcessSnapshot)(options);
   if (processes === null) return null;
   treeState.knownStarts ??= new Map();
   const byPid = new Map(processes.map((item) => [item.pid, item]));
+  // Remember the leader's own start identity so a later signal or liveness
+  // check can detect that the PID exited and was reused by another process.
+  const leader = byPid.get(child.pid);
+  if (leader?.startIdentity && !treeState.knownStarts.has(child.pid)) {
+    treeState.knownStarts.set(child.pid, leader.startIdentity);
+  }
   const matchesKnownIdentity = (item) => {
     const expected = treeState.knownStarts.get(item.pid);
     return !expected || !item.startIdentity || expected === item.startIdentity;
@@ -201,14 +234,18 @@ export async function isProcessTreeAlive(child, treeState, {
 } = {}) {
   if (!Number.isInteger(child.pid)) return false;
   if (platform === "win32") {
-    return (await windowsProcessTreePids(child.pid, treeState.knownPids)).length > 0;
+    return (await windowsProcessTreePids(child.pid, treeState)).length > 0;
   }
   const processes = await refreshProcessTree(child, treeState, { platform, procRoot, fsOps });
   if (processes !== null) {
     const knownStarts = treeState.knownStarts ?? new Map();
+    const leaderStart = knownStarts.get(child.pid);
     const trackedLive = processes.some((item) => {
       if (!isLiveState(item.state)) return false;
-      if (item.processGroupId === child.pid) return true;
+      if (item.processGroupId === child.pid) {
+        // A reused PID leading an unrelated group must not count as our tree.
+        return !leaderStart || !item.startIdentity || item.startIdentity === leaderStart;
+      }
       if (!treeState.knownPids.has(item.pid)) return false;
       const expected = knownStarts.get(item.pid);
       return !expected || !item.startIdentity || expected === item.startIdentity;
@@ -231,34 +268,53 @@ export async function isProcessTreeAlive(child, treeState, {
   return true;
 }
 
-export async function signalProcessTree(child, signal, treeState) {
+export async function signalProcessTree(child, signal, treeState, {
+  platform = process.platform,
+  posixProcessSnapshot: snapshot = posixProcessSnapshot,
+  runUtility: run = runUtility,
+  killOne = (pid, sig) => process.kill(pid, sig),
+  killGroup = (pgid, sig) => process.kill(-pgid, sig),
+} = {}) {
   if (!Number.isInteger(child.pid)) return;
-  if (process.platform === "win32") {
+  if (platform === "win32") {
     // Windows has no portable SIGTERM equivalent for arbitrary console CLIs;
     // /T /F is required to terminate the complete tree deterministically.
-    await runUtility("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"]);
+    await run("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"]);
     // If the root exited first, taskkill cannot traverse it. Win32_Process
     // normally retains the old parent PID, while known PIDs survive re-parenting.
-    const remaining = await windowsProcessTreePids(child.pid, treeState.knownPids);
+    // windowsProcessTreePids drops any known PID whose creation identity changed,
+    // so reused PIDs are never signaled.
+    const remaining = await windowsProcessTreePids(child.pid, treeState, { runUtility: run });
     for (const pid of remaining.reverse()) {
-      await runUtility("taskkill.exe", ["/PID", String(pid), "/T", "/F"]);
+      await run("taskkill.exe", ["/PID", String(pid), "/T", "/F"]);
     }
     return;
   }
-  await refreshProcessTree(child, treeState);
-  try {
-    process.kill(-child.pid, signal);
-  } catch (error) {
-    if (error.code !== "ESRCH") throw error;
-  }
-  const processes = await posixProcessSnapshot();
+  await refreshProcessTree(child, treeState, { platform, posixProcessSnapshot: snapshot });
+  const processes = await snapshot();
   const byPid = processes === null ? new Map() : new Map(processes.map((item) => [item.pid, item]));
+  // Signal the process group only while it is still provably ours: the leader
+  // must be alive, still lead the group, and match its recorded start identity.
+  // Otherwise the PGID may have been recycled onto an unrelated group.
+  const leader = byPid.get(child.pid);
+  const leaderStart = treeState.knownStarts?.get(child.pid);
+  const groupIsOriginal = Boolean(leader) &&
+    leader.processGroupId === child.pid &&
+    isLiveState(leader.state) &&
+    (!leaderStart || !leader.startIdentity || leader.startIdentity === leaderStart);
+  if (groupIsOriginal) {
+    try {
+      killGroup(child.pid, signal);
+    } catch (error) {
+      if (error.code !== "ESRCH") throw error;
+    }
+  }
   for (const pid of [...treeState.knownPids].reverse()) {
     if (pid === child.pid) continue;
     const item = byPid.get(pid);
     const expected = treeState.knownStarts?.get(pid);
     if (item && expected && item.startIdentity && expected !== item.startIdentity) continue;
-    try { process.kill(pid, signal); }
+    try { killOne(pid, signal); }
     catch (error) { if (error.code !== "ESRCH") throw error; }
   }
 }
