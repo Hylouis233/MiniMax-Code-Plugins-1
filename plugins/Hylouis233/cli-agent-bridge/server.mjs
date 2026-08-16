@@ -776,11 +776,12 @@ async function committedDelta(worktreeRoot, before, after, options = {}) {
       externalRefChanges.push(change);
       continue;
     }
-    if (!change.ref.startsWith("refs/tags/") || !change.after) continue;
+    if (!change.ref.startsWith("refs/tags/") || change.before || !change.after) continue;
     const tagCommit = await peelCommitish(worktreeRoot, change.after, cache, options);
-    // A tag arriving without a moved local HEAD/branch at the same commit is
-    // conservatively treated as fetch-sourced. A tag attached to the worker's
-    // exact new local tip remains a contributing attribution label.
+    // A newly arriving tag without a moved local HEAD/branch at the same commit
+    // is conservatively treated as fetch-sourced. Existing tags may be moved by
+    // the worker (including from a non-commit object) and remain attribution
+    // labels because a before/after snapshot cannot prove such a move was fetch.
     if (tagCommit && !movedLocalTargets.has(tagCommit)) externalRefChanges.push(change);
   }
   for (const change of externalRefChanges) await addBaseline(change.after);
