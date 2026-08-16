@@ -266,6 +266,21 @@ def non_cell_references(workbook):
     return refs
 
 
+def cell_formula_references(workbook):
+    refs = []
+    for sheet in workbook.worksheets:
+        for row in sheet.iter_rows():
+            for cell in row:
+                if cell.data_type == "f":
+                    value = cell.value
+                    refs.append((
+                        "cell formula",
+                        f"{sheet.title}!{cell.coordinate}",
+                        getattr(value, "text", None) or str(value),
+                    ))
+    return refs
+
+
 class LegacyDefinedNames:
     """Minimal openpyxl 3.0-style DefinedNameList surface."""
     definedName = [DefinedName("LegacyRange", attr_text="'Legacy'!$A$1")]
@@ -289,6 +304,7 @@ audit_ws.title = "Audit"
 audit_ws.append(["Value"])
 audit_ws.append([1])
 audit_ws.append([2])
+audit_ws["C1"] = "=SUM(A2:A3)"
 audit_wb.defined_names.add(DefinedName("AuditRange", attr_text="'Audit'!$A$2:$A$3"))
 audit_ws.add_table(Table(displayName="AuditTable", ref="A1:A3"))
 audit_ws.merge_cells("B2:B3")
@@ -304,6 +320,7 @@ chart = BarChart()
 chart.add_data(Reference(audit_ws, min_col=1, min_row=1, max_row=3), titles_from_data=True)
 audit_ws.add_chart(chart, "C1")
 reference_kinds = {kind for kind, _, _ in non_cell_references(audit_wb)}
+formula_references = cell_formula_references(audit_wb)
 check(
     "structural audit covers names, tables, filters, validation, formatting, and charts",
     {"defined name", "table", "merged range", "auto filter", "print area",
@@ -311,6 +328,25 @@ check(
      "data validation formula", "conditional formatting range",
      "conditional formatting formula", "chart series"} <= reference_kinds,
     reference_kinds,
+)
+check(
+    "structural audit snapshots ordinary cell formulas before row insertion",
+    formula_references == [("cell formula", "Audit!C1", "=SUM(A2:A3)")],
+    formula_references,
+)
+
+stale_wb = openpyxl.Workbook()
+stale_ws = stale_wb.active
+stale_ws["A5"], stale_ws["A6"] = 10, 20
+stale_ws["B1"] = "=SUM(A5:A6)"
+stale_formula_before = cell_formula_references(stale_wb)
+stale_ws.insert_rows(5)
+check(
+    "insert_rows leaves intersecting formulas stale (negative control)",
+    stale_formula_before == [("cell formula", "Sheet!B1", "=SUM(A5:A6)")]
+    and stale_ws["B1"].value == "=SUM(A5:A6)"
+    and (stale_ws["A6"].value, stale_ws["A7"].value) == (10, 20),
+    (stale_formula_before, stale_ws["B1"].value),
 )
 
 # and the edit itself still works after the warning path
@@ -454,8 +490,11 @@ check("corrupted dimension truncates streaming (negative control)",
       dim_ws_ro.max_row == 1, dim_ws_ro.max_row)
 streamed_before_reset = [row for row in dim_ws_ro.iter_rows(values_only=True)]
 dim_ws_ro.reset_dimensions()
+forced_extent = dim_ws_ro.calculate_dimension(force=True)
 streamed_after_reset = [row for row in dim_ws_ro.iter_rows(values_only=True)]
 dim_value.close()
+check("forced dimension calculation sizes a reset read-only sheet",
+      forced_extent == "A1:B3", forced_extent)
 check("reset_dimensions restores the real extent",
       len(streamed_after_reset) == 3 and streamed_after_reset[2] == (3, 4),
       (len(streamed_before_reset), streamed_after_reset[-1]))

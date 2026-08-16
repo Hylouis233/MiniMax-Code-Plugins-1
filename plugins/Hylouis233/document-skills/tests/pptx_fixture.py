@@ -152,7 +152,13 @@ def extract_slide_content(slide):
     shapes = list(iter_shapes(slide.shapes))
     text = [sh.text_frame.text for sh in shapes if sh.has_text_frame and sh.text_frame.text]
     tables = [
-        [[cell.text for cell in row.cells] for row in sh.table.rows]
+        [[{
+            "text": cell.text,
+            "is_merge_origin": cell.is_merge_origin,
+            "is_spanned": cell.is_spanned,
+            "span_width": cell.span_width,
+            "span_height": cell.span_height,
+        } for cell in row.cells] for row in sh.table.rows]
         for sh in shapes if sh.has_table
     ]
     charts = []
@@ -196,7 +202,8 @@ def extract_slide_content(slide):
 
 content = extract_slide_content(Presentation("input.pptx").slides[0])
 check("content inventory emits body text", any("old wording" in value for value in content["text"]), content)
-check("content inventory emits table cell text", content["tables"][0][0][1] == "old cell text", content["tables"])
+check("content inventory emits table cell text",
+      content["tables"][0][0][1]["text"] == "old cell text", content["tables"])
 check(
     "content inventory emits chart title, categories, series, and values",
     content["charts"][0]["title"] == "Units by region"
@@ -206,6 +213,22 @@ check(
     content["charts"],
 )
 check("content inventory emits notes text", "regional split" in content["notes"], content["notes"])
+
+merge_prs = Presentation()
+merge_slide = merge_prs.slides.add_slide(merge_prs.slide_layouts[6])
+merge_shape = merge_slide.shapes.add_table(2, 3, 0, 0, 4000000, 2000000)
+merge_origin = merge_shape.table.cell(0, 0)
+merge_origin.text = "Merged heading"
+merge_origin.merge(merge_shape.table.cell(0, 1))
+merged_inventory = extract_slide_content(merge_slide)["tables"][0][0]
+check(
+    "table inventory preserves merge origin and span metadata",
+    merged_inventory[0]["is_merge_origin"]
+    and merged_inventory[0]["span_width"] == 2
+    and merged_inventory[0]["span_height"] == 1
+    and merged_inventory[1]["is_spanned"],
+    merged_inventory,
+)
 
 # XY scatter and bubble plots do not have category/value-series semantics.
 xy_prs = Presentation()
@@ -587,23 +610,28 @@ check("compact extraction is provably lossy (negative control)",
 from pptx.oxml import parse_xml as pptx_parse_xml2
 from pptx.oxml.ns import qn
 
-def explicit_run_face(run, text, script_tags_fn):
+def explicit_run_faces(run, text, script_tags_fn):
     rPr = run._r.find(qn("a:rPr"))
     if rPr is None:
-        return None
+        return []
     declared = {}
     for slot, tag in (("latin", "a:latin"), ("eastAsia", "a:ea"), ("complexScript", "a:cs")):
         node = rPr.find(qn(tag))
         if node is not None and node.get("typeface"):
             declared[slot] = node.get("typeface")
     if not declared:
-        return None
+        return []
     tags = script_tags_fn(text)
-    if any(tag in ("Hans", "Hant", "Jpan", "Hang") for tag in tags) and "eastAsia" in declared:
-        return declared["eastAsia"]
-    if any(tag in ("Arab", "Hebr", "Deva") for tag in tags) and "complexScript" in declared:
-        return declared["complexScript"]
-    return declared.get("latin")
+    slots = []
+    if any(ch.isascii() and ch.isalnum() for ch in text):
+        slots.append("latin")
+    if any(tag in ("Hans", "Hant", "Jpan", "Hang") for tag in tags):
+        slots.append("eastAsia")
+    if any(tag in ("Arab", "Hebr", "Deva") for tag in tags):
+        slots.append("complexScript")
+    if not slots:
+        slots.append("latin")
+    return list(dict.fromkeys(declared[slot] for slot in slots if slot in declared))
 
 run_xml = (
     '<a:r xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
@@ -614,7 +642,9 @@ dual_run = pptx_parse_xml2(run_xml)
 class FakeRun:
     _r = dual_run
 check("a CJK run with latin+ea declared resolves to the eastAsia face",
-      explicit_run_face(FakeRun(), "\u6d4b\u8bd5", script_tags) == "SimSun")
+      explicit_run_faces(FakeRun(), "\u6d4b\u8bd5", script_tags) == ["SimSun"])
+check("a mixed Latin+CJK run reports both applicable declared faces",
+      explicit_run_faces(FakeRun(), "Q3 \u6d4b\u8bd5", script_tags) == ["Arial", "SimSun"])
 check("run.font.name alone would report only the Latin face (negative control)",
       dual_run.find(qn("a:rPr")).find(qn("a:latin")).get("typeface") == "Arial")
 

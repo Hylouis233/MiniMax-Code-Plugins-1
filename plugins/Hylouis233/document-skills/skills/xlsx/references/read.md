@@ -25,7 +25,9 @@ for sheet_name in value_wb.sheetnames:
         value_ws.reset_dimensions()
         formula_ws.reset_dimensions()
         print(f"--- {sheet_name} --- implausible dimension {declared!r}; reset, real extent:")
-    print(f"--- {sheet_name} --- dims:", value_ws.calculate_dimension())
+    # reset_dimensions() makes a read-only worksheet unsized; force=True scans
+    # the stream to rebuild its bounds instead of raising "Worksheet is unsized".
+    print(f"--- {sheet_name} --- dims:", value_ws.calculate_dimension(force=True))
 
     rows = value_ws.iter_rows(values_only=True)
     header = next(rows, None)

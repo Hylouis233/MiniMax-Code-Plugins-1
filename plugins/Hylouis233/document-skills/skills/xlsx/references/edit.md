@@ -51,6 +51,21 @@ def non_cell_references(workbook):
                     refs.append(("chart series", f"{owner} chart {index}", element.text))
     return refs
 
+def cell_formula_references(workbook):
+    """Inventory ordinary, array, and data-table formulas before row/column moves."""
+    refs = []
+    for sheet in workbook.worksheets:
+        for row in sheet.iter_rows():
+            for cell in row:
+                if cell.data_type == "f":
+                    value = cell.value
+                    refs.append((
+                        "cell formula",
+                        f"{sheet.title}!{cell.coordinate}",
+                        getattr(value, "text", None) or str(value),
+                    ))
+    return refs
+
 # Address cells directly; check the header to confirm column meaning first
 ws["D2"] = "=C2*1.08"                      # real formula
 ws["E2"] = date(2025, 9, 30)
@@ -58,14 +73,15 @@ ws["E2"].number_format = "yyyy-mm-dd"
 ws["F2"] = 1234.5
 ws["F2"].number_format = "#,##0.00"
 
-# Insert/delete does not adjust formulas or non-cell dependencies. Fail closed until every
-# reported reference that can intersect the shifted region has an explicit rewrite plan.
-references_before = non_cell_references(wb)
+# Insert/delete does not adjust formulas or non-cell dependencies. Snapshot both inventories
+# before moving anything; fail closed until every reference that can intersect row 5 or below
+# has an explicit old -> new rewrite plan.
+references_before = cell_formula_references(wb) + non_cell_references(wb)
 if references_before:
     for reference in references_before:
         print("structural-edit dependency:", reference)
     raise RuntimeError(
-        "insert_rows is unsafe until chart/name/table/filter/validation/format references are audited"
+        "insert_rows is unsafe until cell formulas and non-cell references are audited"
     )
 ws.insert_rows(5)
 
@@ -81,14 +97,10 @@ for row in summary["A1:B1"]:
     for cell in row:
         cell.font = header_font
 
-# References to the shifted region may live on any sheet; inspect every formula, then rerun
-# non_cell_references and verify every planned rewrite before saving.
-for formula_ws in wb.worksheets:
-    for row in formula_ws.iter_rows():
-        for cell in row:
-            if cell.data_type == "f":
-                formula = getattr(cell.value, "text", None) or str(cell.value)
-                print(f"{formula_ws.title}!{cell.coordinate}: {formula}")
+# After applying the planned rewrites, rerun both inventories and compare them with the
+# pre-edit snapshot before saving. A post-edit listing alone cannot reveal a stale formula.
+print("cell formulas after planned rewrites:", cell_formula_references(wb))
+print("non-cell references after planned rewrites:", non_cell_references(wb))
 
 wb.save("input-edited.xlsx")
 ```

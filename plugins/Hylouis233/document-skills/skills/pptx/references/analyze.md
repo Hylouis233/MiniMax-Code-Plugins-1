@@ -37,7 +37,13 @@ for i, slide in enumerate(prs.slides):
     shapes = list(iter_shapes(slide.shapes))   # flattened; groups are common in template decks
     text = [sh.text_frame.text for sh in shapes if sh.has_text_frame and sh.text_frame.text]
     tables = [
-        [[cell.text for cell in row.cells] for row in sh.table.rows]
+        [[{
+            "text": cell.text,
+            "is_merge_origin": cell.is_merge_origin,
+            "is_spanned": cell.is_spanned,
+            "span_width": cell.span_width,
+            "span_height": cell.span_height,
+        } for cell in row.cells] for row in sh.table.rows]
         for sh in shapes if sh.has_table
     ]
     charts = []
@@ -177,7 +183,17 @@ placeholder, layout, master, or theme. Resolve what you can and name the fallbac
 ```python
 import xml.etree.ElementTree as ET
 from pptx import Presentation
+from pptx.enum.shapes import MSO_SHAPE_TYPE
 from pptx.opc.constants import RELATIONSHIP_TYPE as RT
+from pptx.oxml.ns import qn
+
+def iter_shapes(shapes):
+    """Self-contained recursive walker for this independently runnable block."""
+    for shape in shapes:
+        if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
+            yield from iter_shapes(shape.shapes)
+        else:
+            yield shape
 
 prs = Presentation("deck.pptx")
 
@@ -248,24 +264,29 @@ def theme_candidates(role_fonts, text):
 # 2. Per run: explicit value, else paragraph defaults, else report as inherited.
 # run.font.name exposes only the LATIN typeface; a run that also declares a:ea
 # or a:cs must be resolved per the scripts present in its own text first.
-def explicit_run_face(run, text):
-    """The run's direct a:latin/a:ea/a:cs typeface chosen by its scripts (or None)."""
+def explicit_run_faces(run, text):
+    """Distinct direct a:latin/a:ea/a:cs faces applicable to scripts in this run."""
     rPr = run._r.find(qn("a:rPr"))
     if rPr is None:
-        return None
+        return []
     declared = {}
     for slot, tag in (("latin", "a:latin"), ("eastAsia", "a:ea"), ("complexScript", "a:cs")):
         node = rPr.find(qn(tag))
         if node is not None and node.get("typeface"):
             declared[slot] = node.get("typeface")
     if not declared:
-        return None
+        return []
     tags = script_tags(text)
-    if any(tag in ("Hans", "Hant", "Jpan", "Hang") for tag in tags) and "eastAsia" in declared:
-        return declared["eastAsia"]
-    if any(tag in ("Arab", "Hebr", "Deva") for tag in tags) and "complexScript" in declared:
-        return declared["complexScript"]
-    return declared.get("latin")
+    slots = []
+    if any(ch.isascii() and ch.isalnum() for ch in text):
+        slots.append("latin")
+    if any(tag in ("Hans", "Hant", "Jpan", "Hang") for tag in tags):
+        slots.append("eastAsia")
+    if any(tag in ("Arab", "Hebr", "Deva") for tag in tags):
+        slots.append("complexScript")
+    if not slots:
+        slots.append("latin")
+    return list(dict.fromkeys(declared[slot] for slot in slots if slot in declared))
 
 def iter_text_frames(shapes):
     """Shape text frames plus every table cell's text frame (a graphic frame
@@ -286,9 +307,9 @@ for i, slide in enumerate(prs.slides):
         holder = getattr(frame, "_parent", None)  # the shape for ordinary frames
         for paragraph in frame.paragraphs:
             for run in paragraph.runs:
-                explicit = explicit_run_face(run, run.text)
+                explicit = explicit_run_faces(run, run.text)
                 if explicit:
-                    face, source = explicit, "run script face (a:latin/a:ea/a:cs)"
+                    face, source = explicit, "run script faces (a:latin/a:ea/a:cs)"
                 elif run.font.name:
                     face, source = run.font.name, "run latin"
                 elif paragraph.font.name:
