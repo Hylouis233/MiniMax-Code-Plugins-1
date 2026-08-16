@@ -309,6 +309,7 @@ check("hyperlink CJK text resolves through the east-Asian font slot",
 SAFE_RUN_CHILDREN = {
     qn("w:rPr"), qn("w:t"), qn("w:tab"), qn("w:cr"),
 }
+MODELED_PARAGRAPH_CHILDREN = {qn("w:pPr"), qn("w:r")}
 
 
 def unsafe_run_content(run):
@@ -325,6 +326,13 @@ def unsafe_run_content(run):
 def replace_across_runs(paragraph, old, new):
     if not old:
         raise ValueError("old must not be empty")
+    unmodeled = [
+        child.tag.rsplit("}", 1)[-1]
+        for child in paragraph._p
+        if child.tag not in MODELED_PARAGRAPH_CHILDREN
+    ]
+    if unmodeled:
+        raise ValueError(f"paragraph contains unmodeled inline containers: {unmodeled}")
     runs = list(paragraph.runs)
     text = "".join(run.text for run in runs)
     starts = []
@@ -412,6 +420,33 @@ except ValueError:
 check("replacement rejects a wrapping break with clear semantics", clear_break_rejected)
 check("rejected clear-break replacement is atomic",
       etree.tostring(clear_run._r) == clear_before)
+
+container_doc = Document()
+container_paragraph = container_doc.add_paragraph()
+container_paragraph.add_run("T")
+container_hyperlink = OxmlElement("w:hyperlink")
+container_hyperlink.set(qn("w:anchor"), "fixture-target")
+container_link_run = OxmlElement("w:r")
+container_link_text = OxmlElement("w:t")
+container_link_text.text = "link"
+container_link_run.append(container_link_text)
+container_hyperlink.append(container_link_run)
+container_paragraph._p.append(container_hyperlink)
+container_paragraph.add_run("BD")
+container_before = etree.tostring(container_paragraph._p)
+check("Paragraph.runs can manufacture a false match across a hyperlink (negative control)",
+      "".join(run.text for run in container_paragraph.runs) == "TBD"
+      and paragraph_text(container_paragraph) == "TlinkBD")
+try:
+    replace_across_runs(container_paragraph, "TBD", "Done")
+    rejected_inline_container = False
+except ValueError:
+    rejected_inline_container = True
+check("replacement rejects unmodeled inline containers before matching",
+      rejected_inline_container)
+check("rejected inline-container replacement is atomic",
+      etree.tostring(container_paragraph._p) == container_before
+      and paragraph_text(container_paragraph) == "TlinkBD")
 
 
 def list_number_num_id(doc):

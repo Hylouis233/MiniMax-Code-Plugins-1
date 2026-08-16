@@ -5,6 +5,7 @@
 #   python pptx_fixture.py  (deps: python-pptx)
 #   python xlsx_fixture.py  (deps: openpyxl)
 #   python docx_fixture.py  (deps: python-docx, pymupdf, soffice on PATH)
+import base64
 import copy
 import sys
 import xml.etree.ElementTree as ET
@@ -15,7 +16,7 @@ from pptx import Presentation
 from pptx.chart.data import BubbleChartData, ChartData, XyChartData
 from pptx.dml.color import RGBColor
 from pptx.enum.chart import XL_CHART_TYPE
-from pptx.enum.shapes import MSO_SHAPE_TYPE
+from pptx.enum.shapes import MSO_SHAPE_TYPE, PP_PLACEHOLDER
 from pptx.opc.constants import RELATIONSHIP_TYPE as RT
 from pptx.util import Inches, Pt
 
@@ -251,6 +252,19 @@ def table_cells(table):
     ] for row_index, row in enumerate(table.rows)]
 
 
+def picture_content(shape):
+    try:
+        image = shape.image
+    except (AttributeError, ValueError):
+        return None
+    return {
+        "name": shape.name,
+        "filename": image.filename,
+        "extension": image.ext,
+        "bytes": len(image.blob),
+    }
+
+
 def cached_numeric_points(source):
     if source is None:
         return None
@@ -310,7 +324,12 @@ def extract_slide_content(slide):
             plots.append({"kind": type(plot).__name__, "categories": categories, "series": series})
         charts.append({"title": chart_title, "plots": plots})
     notes = slide.notes_slide.notes_text_frame.text if slide.has_notes_slide else ""
-    return {"text": text, "tables": tables, "charts": charts, "notes": notes}
+    pictures = [
+        info for shape in shapes
+        if (info := picture_content(shape)) is not None
+    ]
+    return {"text": text, "tables": tables, "charts": charts,
+            "pictures": pictures, "notes": notes}
 
 
 content = extract_slide_content(Presentation("input.pptx").slides[0])
@@ -337,6 +356,40 @@ check("content inventory emits bubble x/y/size points",
       and chart_by_title["Bubble risk"]["plots"][0]["series"][0]["bubble_points"]
       == [(0, 5.0)])
 check("content inventory emits notes text", "regional split" in content["notes"], content["notes"])
+
+placeholder_png = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZlRYAAAAASUVORK5CYII="
+)
+with open("placeholder-picture.png", "wb") as stream:
+    stream.write(placeholder_png)
+placeholder_prs = Presentation()
+picture_layout = next(
+    layout for layout in placeholder_prs.slide_layouts
+    if any(
+        shape.placeholder_format.type == PP_PLACEHOLDER.PICTURE
+        for shape in layout.placeholders
+    )
+)
+placeholder_slide = placeholder_prs.slides.add_slide(picture_layout)
+picture_placeholder = next(
+    shape for shape in placeholder_slide.placeholders
+    if shape.placeholder_format.type == PP_PLACEHOLDER.PICTURE
+)
+placeholder_picture = picture_placeholder.insert_picture("placeholder-picture.png")
+placeholder_prs.save("picture-placeholder.pptx")
+placeholder_reopened = Presentation("picture-placeholder.pptx").slides[0]
+reopened_picture = next(
+    shape for shape in placeholder_reopened.placeholders if hasattr(shape, "image")
+)
+placeholder_inventory = extract_slide_content(placeholder_reopened)["pictures"]
+check("picture placeholder remains a placeholder after image insertion",
+      reopened_picture.shape_type == MSO_SHAPE_TYPE.PLACEHOLDER,
+      reopened_picture.shape_type)
+check("picture inventory includes populated picture placeholders and image metadata",
+      len(placeholder_inventory) == 1
+      and placeholder_inventory[0]["extension"] == "png"
+      and placeholder_inventory[0]["bytes"] == len(placeholder_png),
+      placeholder_inventory)
 
 merged_prs = Presentation()
 merged_slide = merged_prs.slides.add_slide(merged_prs.slide_layouts[6])
@@ -841,6 +894,8 @@ east_only_run.text = "A汉"
 east_only = OxmlElement("a:ea")
 east_only.set("typeface", "East Only")
 east_only_run._r.get_or_add_rPr().append(east_only)
+cyrillic_cjk_run = partial_paragraph.add_run()
+cyrillic_cjk_run.text = "Тест 汉"
 
 token_fallback_fonts = {
     "major": {"latin": "Major Latin", "eastAsia": "", "complexScript": "",
@@ -855,6 +910,9 @@ detected_faces = {
 }
 latin_only_faces = font_candidates(latin_only_run, partial_paragraph, script_fonts, "minor")
 east_only_faces = font_candidates(east_only_run, partial_paragraph, script_fonts, "minor")
+cyrillic_cjk_faces = font_candidates(
+    cyrillic_cjk_run, partial_paragraph, script_fonts, "minor"
+)
 check("font triage reports the run face and source",
       ("latin", "Run Face", "run") in detected_faces["run override"], detected_faces)
 check(
@@ -882,6 +940,10 @@ check("mixed run combines inherited Latin with a direct east-Asian face",
       {("latin", "Latin Body"), ("eastAsia", "East Only")}
       <= {(slot, face) for slot, face, _ in east_only_faces},
       east_only_faces)
+check("Cyrillic plus CJK requires both Latin and east-Asian theme slots",
+      {("latin", "Cyrillic Theme"), ("eastAsia", "Simplified Chinese Theme")}
+      <= {(slot, face) for slot, face, _ in cyrillic_cjk_faces},
+      cyrillic_cjk_faces)
 check("empty +mj-ea generic face falls back to the major script mapping",
       ("eastAsia", "Major Hans", "major theme script Hans")
       in font_candidates(token_run, font_paragraph, token_fallback_fonts, "minor"),

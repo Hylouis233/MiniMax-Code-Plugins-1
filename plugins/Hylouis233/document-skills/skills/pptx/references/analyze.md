@@ -30,6 +30,19 @@ def table_cells(table):
         for column_index, cell in enumerate(row.cells)
     ] for row_index, row in enumerate(table.rows)]
 
+def picture_content(shape):
+    """Inventory ordinary pictures and populated picture placeholders alike."""
+    try:
+        image = shape.image
+    except (AttributeError, ValueError):
+        return None
+    return {
+        "name": shape.name,
+        "filename": image.filename,
+        "extension": image.ext,
+        "bytes": len(image.blob),
+    }
+
 def cached_numeric_points(source):
     """Return indexed cached points, or None when the cache metadata is unavailable."""
     if source is None:
@@ -92,7 +105,10 @@ for i, slide in enumerate(prs.slides):
             series = [series_content(item) for item in items]
             plots.append({"kind": type(plot).__name__, "categories": categories, "series": series})
         charts.append({"title": chart_title, "plots": plots})
-    pictures = [sh.name for sh in shapes if sh.shape_type == MSO_SHAPE_TYPE.PICTURE]
+    pictures = [
+        content for sh in shapes
+        if (content := picture_content(sh)) is not None
+    ]
 
     # These full values - not only counts or lengths - are the evidence for summaries and
     # repurposing. Keep notes verbatim so markdown output can preserve them as blockquotes.

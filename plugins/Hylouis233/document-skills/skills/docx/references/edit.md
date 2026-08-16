@@ -15,6 +15,7 @@ from docx.oxml.ns import qn
 SAFE_RUN_CHILDREN = {
     qn("w:rPr"), qn("w:t"), qn("w:tab"), qn("w:cr"),
 }
+MODELED_PARAGRAPH_CHILDREN = {qn("w:pPr"), qn("w:r")}
 
 def unsafe_run_content(run):
     unsafe = []
@@ -31,6 +32,14 @@ def replace_across_runs(paragraph, old, new):
     """Replace text-only matches; reject drawings, fields, and other lossy run content."""
     if not old:
         raise ValueError("old must not be empty")
+
+    unmodeled = [
+        child.tag.rsplit("}", 1)[-1]
+        for child in paragraph._p
+        if child.tag not in MODELED_PARAGRAPH_CHILDREN
+    ]
+    if unmodeled:
+        raise ValueError(f"paragraph contains unmodeled inline containers: {unmodeled}")
 
     runs = list(paragraph.runs)
     text = "".join(run.text for run in runs)
@@ -103,9 +112,9 @@ doc.save("input.edited.docx")
 
 The replacement text inherits the first matched run's formatting. Unmatched text before and
 after it stays in its original runs, so its formatting is preserved. The routine fails before
-making changes if any matched run contains a drawing, field, reference, typed page/column break,
-or a text-wrapping break with `w:clear` that `run.text` would destroy. Use raw OOXML for those cases and for tracked changes or
-other content that `paragraph.runs` does not expose.
+making changes if the paragraph contains an inline container that `paragraph.runs` does not expose,
+or if any matched run contains a drawing, field, reference, typed page/column break, or a
+text-wrapping break with `w:clear` that `run.text` would destroy. Use raw OOXML for those cases.
 
 ## Tier 2 - raw OOXML surgery (only when Tier 1 cannot express it)
 

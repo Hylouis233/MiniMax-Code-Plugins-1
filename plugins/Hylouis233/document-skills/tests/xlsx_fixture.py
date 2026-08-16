@@ -313,7 +313,7 @@ def formula_may_intersect_rows(owner_sheet, formula, shifted_sheet, start_row):
             if "[" in qualifier or ":" in qualifier:
                 return True
             target_sheet = qualifier.strip("'").replace("''", "'")
-        if target_sheet != shifted_sheet:
+        if target_sheet.casefold() != shifted_sheet.casefold():
             continue
         try:
             _, min_row, _, max_row = range_boundaries(reference.replace("$", ""))
@@ -381,6 +381,10 @@ check("intersecting formula ranges are blocked before row insertion",
       formula_may_intersect_rows("Audit", "=SUM(A2:A3)", "Audit", 3))
 check("audited formula ranges above the insertion can proceed",
       not formula_may_intersect_rows("Data", "=C2*1.08", "Data", 5))
+check("sheet qualifiers are matched case-insensitively",
+      formula_may_intersect_rows("Summary", "=SUM(data!A5:A6)", "Data", 5))
+check("a genuinely different sheet remains outside the shifted rows",
+      not formula_may_intersect_rows("Summary", "=SUM(Archive!A5:A6)", "Data", 5))
 
 stale_wb = openpyxl.Workbook()
 stale_ws = stale_wb.active
