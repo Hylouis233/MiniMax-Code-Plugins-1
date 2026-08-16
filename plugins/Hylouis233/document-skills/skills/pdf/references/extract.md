@@ -11,7 +11,7 @@ for page in doc:
     page_number = page.number + 1
 
     # Plain text
-    text = page.get_text("text")       # reading order text
+    text = page.get_text("text", sort=True)  # position-sorted reading order for simple layouts
     print(f"--- page {page_number} ---")
     print(text)
 
@@ -22,12 +22,17 @@ for page in doc:
                 print(page_number, round(span["bbox"][0]),
                       round(span["bbox"][1]), span["text"])
 
-    # Images. Pixmap keeps the image's own colorspace: CMYK/ICC pixmaps cannot be
-    # saved as PNG directly, so convert anything not Gray/RGB to RGB first.
+    # Images. Apply a soft mask (xref at info[1]) before saving or transparency is lost.
+    # Pixmap keeps the image's own colorspace: convert CMYK/ICC bases to RGB first.
     for i, info in enumerate(page.get_images(full=True), start=1):
-        pix = fitz.Pixmap(doc, info[0])
-        if pix.colorspace and pix.colorspace not in (fitz.csGRAY, fitz.csRGB):
-            pix = fitz.Pixmap(fitz.csRGB, pix)
+        base = fitz.Pixmap(doc, info[0])
+        if base.colorspace and base.colorspace not in (fitz.csGRAY, fitz.csRGB):
+            base = fitz.Pixmap(fitz.csRGB, base)
+        if info[1] > 0:
+            mask = fitz.Pixmap(doc, info[1])
+            pix = fitz.Pixmap(base, mask)
+        else:
+            pix = base
         pix.save(f"img-p{page_number}-{i}.png")
 
     # Rasterize (for visual checks or OCR preprocessing)

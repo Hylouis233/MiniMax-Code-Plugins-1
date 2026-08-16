@@ -8,8 +8,11 @@
 import sys
 
 from pptx import Presentation
+from pptx.chart.data import ChartData
 from pptx.dml.color import RGBColor
+from pptx.enum.chart import XL_CHART_TYPE
 from pptx.enum.shapes import MSO_SHAPE_TYPE
+from pptx.opc.constants import RELATIONSHIP_TYPE as RT
 from pptx.util import Inches, Pt
 
 failures = []
@@ -45,6 +48,18 @@ cr = cp.add_run()
 cr.text = "old cell text"
 cr.font.bold = True
 cr.font.color.rgb = RGBColor(0x00, 0x70, 0xC0)
+
+chart_data = ChartData()
+chart_data.categories = ["EU", "US"]
+chart_data.add_series("Units", (120, 80))
+chart = slide.shapes.add_chart(
+    XL_CHART_TYPE.COLUMN_CLUSTERED,
+    Inches(7.2), Inches(2.5), Inches(2), Inches(2),
+    chart_data,
+).chart
+chart.has_title = True
+chart.chart_title.text_frame.text = "Units by region"
+slide.notes_slide.notes_text_frame.text = "Speaker note: explain the regional split."
 
 prs.save("input.pptx")
 
@@ -124,6 +139,52 @@ def iter_shapes(shapes):
             yield shape
 
 
+def extract_slide_content(slide):
+    shapes = list(iter_shapes(slide.shapes))
+    text = [sh.text_frame.text for sh in shapes if sh.has_text_frame and sh.text_frame.text]
+    tables = [
+        [[cell.text for cell in row.cells] for row in sh.table.rows]
+        for sh in shapes if sh.has_table
+    ]
+    charts = []
+    for sh in shapes:
+        if not sh.has_chart:
+            continue
+        chart = sh.chart
+        chart_title = (
+            chart.chart_title.text_frame.text
+            if chart.has_title and chart.chart_title.has_text_frame else ""
+        )
+        plots = []
+        for plot in chart.plots:
+            categories = [
+                [str(level) for level in label]
+                for label in plot.categories.flattened_labels
+            ]
+            series = [
+                {"name": item.name, "values": list(item.values)}
+                for item in plot.series
+            ]
+            plots.append({"categories": categories, "series": series})
+        charts.append({"title": chart_title, "plots": plots})
+    notes = slide.notes_slide.notes_text_frame.text if slide.has_notes_slide else ""
+    return {"text": text, "tables": tables, "charts": charts, "notes": notes}
+
+
+content = extract_slide_content(Presentation("input.pptx").slides[0])
+check("content inventory emits body text", any("old wording" in value for value in content["text"]), content)
+check("content inventory emits table cell text", content["tables"][0][0][1] == "old cell text", content["tables"])
+check(
+    "content inventory emits chart title, categories, series, and values",
+    content["charts"][0]["title"] == "Units by region"
+    and content["charts"][0]["plots"][0]["categories"] == [["EU"], ["US"]]
+    and content["charts"][0]["plots"][0]["series"]
+    == [{"name": "Units", "values": [120.0, 80.0]}],
+    content["charts"],
+)
+check("content inventory emits notes text", "regional split" in content["notes"], content["notes"])
+
+
 sp_element = slide6.shapes[-1]._element  # the textbox; layout 5 still carries a Title placeholder
 group_element = parse_xml(GRP)
 sp_element.getparent().replace(sp_element, group_element)
@@ -177,19 +238,78 @@ found = [sh for sh in iter_shapes(prs_g.slides[0].shapes)
          if getattr(sh, "text_frame", None) is not None and sh.text_frame.text == new_w]
 check("group member edit persists after save", len(found) == 1)
 
-# ---- analyze.md snippet: theme font resolution ---------------------------------
+# ---- analyze.md snippet: per-master theme font resolution ----------------------
 import re
 
 prs7 = Presentation("input.pptx")
-theme_xml = next(
-    part.blob.decode("utf-8", "ignore")
-    for part in prs7.part.package.iter_parts()
-    if str(part.partname).startswith("/ppt/theme/")
+theme_cache = {}
+
+
+def theme_faces_for_slide(slide):
+    master_part = slide.slide_layout.slide_master.part
+    cache_key = str(master_part.partname)
+    if cache_key not in theme_cache:
+        theme_part = master_part.part_related_by(RT.THEME)
+        theme_xml = theme_part.blob.decode("utf-8", "ignore")
+        matches = {
+            "major (headings)": re.search(
+                r'<a:majorFont>\s*<a:latin typeface="([^"]*)"', theme_xml
+            ),
+            "minor (body)": re.search(
+                r'<a:minorFont>\s*<a:latin typeface="([^"]*)"', theme_xml
+            ),
+        }
+        theme_cache[cache_key] = {
+            kind: match.group(1) if match else "(not set)"
+            for kind, match in matches.items()
+        }
+    return cache_key, theme_cache[cache_key]
+
+
+master_name, theme_faces = theme_faces_for_slide(prs7.slides[0])
+check(
+    "theme major/minor fonts resolve through the slide master relationship",
+    all(value != "(not set)" for value in theme_faces.values()),
+    (master_name, theme_faces),
 )
-major = re.search(r'<a:majorFont>\s*<a:latin typeface="([^"]*)"', theme_xml)
-minor = re.search(r'<a:minorFont>\s*<a:latin typeface="([^"]*)"', theme_xml)
-check("theme major/minor fonts resolve", bool(major) and bool(minor), (major and major.group(1), minor and minor.group(1)))
-print("theme fonts:", major.group(1), "/", minor.group(1))
+print("theme fonts:", theme_faces)
+
+
+class StubThemePart:
+    def __init__(self, major, minor):
+        self.blob = (
+            f'<a:theme xmlns:a="stub"><a:themeElements><a:fontScheme>'
+            f'<a:majorFont><a:latin typeface="{major}"/></a:majorFont>'
+            f'<a:minorFont><a:latin typeface="{minor}"/></a:minorFont>'
+            f'</a:fontScheme></a:themeElements></a:theme>'
+        ).encode()
+
+
+class StubMasterPart:
+    def __init__(self, name, major, minor):
+        self.partname = name
+        self.theme_part = StubThemePart(major, minor)
+
+    def part_related_by(self, relationship_type):
+        assert relationship_type == RT.THEME
+        return self.theme_part
+
+
+def stub_slide(name, major, minor):
+    master = type("Master", (), {"part": StubMasterPart(name, major, minor)})()
+    layout = type("Layout", (), {"slide_master": master})()
+    return type("Slide", (), {"slide_layout": layout})()
+
+
+_, first_faces = theme_faces_for_slide(stub_slide("/ppt/slideMasters/one.xml", "Head One", "Body One"))
+_, second_faces = theme_faces_for_slide(stub_slide("/ppt/slideMasters/two.xml", "Head Two", "Body Two"))
+check(
+    "different slide masters resolve their own theme faces",
+    first_faces["major (headings)"] == "Head One"
+    and second_faces["major (headings)"] == "Head Two"
+    and first_faces != second_faces,
+    (first_faces, second_faces),
+)
 
 check(
     "unstyled runs report as inherited, not as a concrete face",

@@ -83,7 +83,20 @@ with zipfile.ZipFile("extended.xlsx", "w", zipfile.ZIP_DEFLATED) as zout:
     for name, data in payload.items():
         zout.writestr(name, data)
 
-EXTENSION_MARKERS = (b"<extLst", b"x14:", b"mc:AlternateContent")
+EXTENSION_MARKERS = {
+    "extLst": b"<extLst",
+    "x14": b"x14:",
+    "AlternateContent": b"mc:AlternateContent",
+}
+
+
+def stripped_extension_markers(before, after):
+    return sorted(
+        (name, label)
+        for name in set(before) & set(after)
+        for label, marker in EXTENSION_MARKERS.items()
+        if marker in before[name] and marker not in after[name]
+    )
 
 
 def round_trip_changes(path, **load_options):
@@ -95,19 +108,23 @@ def round_trip_changes(path, **load_options):
     with zipfile.ZipFile(buf) as z:
         after = {name: z.read(name) for name in z.namelist()}
     dropped = sorted(set(before) - set(after))
-    stripped_extensions = sorted(
-        name for name in set(before) & set(after)
-        if any(marker in before[name] for marker in EXTENSION_MARKERS)
-        and not any(marker in after[name] for marker in EXTENSION_MARKERS)
-    )
+    stripped_extensions = stripped_extension_markers(before, after)
     return dropped, stripped_extensions
 
 
 dropped, stripped = round_trip_changes("extended.xlsx")
 check("injected slicer-like part is detected as dropped", "xl/slicers/slicer1.xml" in dropped, dropped)
 check("in-part x14 extension strip is detected (same part name)",
-      "xl/worksheets/sheet1.xml" in stripped, stripped)
+      ("xl/worksheets/sheet1.xml", "x14") in stripped, stripped)
 check("clean workbook reports nothing", round_trip_changes("plain.xlsx") == ([], []))
+partial_before = {"xl/worksheets/sheet1.xml": b"<worksheet><extLst><x14:stub/></extLst></worksheet>"}
+partial_after = {"xl/worksheets/sheet1.xml": b"<worksheet><extLst/></worksheet>"}
+check(
+    "marker comparison catches x14 loss while extLst survives",
+    stripped_extension_markers(partial_before, partial_after)
+    == [("xl/worksheets/sheet1.xml", "x14")],
+    stripped_extension_markers(partial_before, partial_after),
+)
 
 # ---- formatting.md snippet: sheet references built from the real sheet title -------
 wb_f = openpyxl.Workbook()
@@ -147,6 +164,27 @@ agg["B4"] = f"=SUM({sheet_ref(hyphen_sheet)}A:A)"
 wb_f.save("hyphen-agg.xlsx")
 hyphen_formula = openpyxl.load_workbook("hyphen-agg.xlsx")["ByRegion"]["B4"].value
 check("ambiguous punctuation is protected by quoting", hyphen_formula == "=SUM('Q1-Data'!A:A)", hyphen_formula)
+
+# Falsey values are valid categories; blank filtering must not discard or conflate them.
+falsey_ws = openpyxl.Workbook().active
+for value in ("Category", 0, False, "", None, 0, False):
+    falsey_ws.append([value])
+regions = []
+seen_region_keys = set()
+for (region,) in falsey_ws.iter_rows(min_row=2, min_col=1, max_col=1, values_only=True):
+    if region is None or region == "":
+        continue
+    key = (type(region), region)
+    if key not in seen_region_keys:
+        seen_region_keys.add(key)
+        regions.append(region)
+check(
+    "aggregation preserves numeric zero and boolean false as distinct categories",
+    len(regions) == 2
+    and type(regions[0]) is int and regions[0] == 0
+    and type(regions[1]) is bool and regions[1] is False,
+    [(type(value).__name__, value) for value in regions],
+)
 
 # and the edit itself still works after the warning path
 wb2 = openpyxl.load_workbook("plain.xlsx")

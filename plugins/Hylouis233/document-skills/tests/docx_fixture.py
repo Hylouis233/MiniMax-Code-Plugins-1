@@ -40,6 +40,97 @@ hostile_xml = (
 parsed = etree.fromstring(hostile_xml, parser=safe_xml_parser)
 check("DOCX XML parser leaves external entities unresolved", parsed.text is None and len(parsed) == 1)
 
+# ---- edit.md guarded cross-run replacement ------------------------------------
+SAFE_RUN_CHILDREN = {
+    qn("w:rPr"), qn("w:t"), qn("w:tab"), qn("w:br"), qn("w:cr"),
+}
+
+
+def unsafe_run_content(run):
+    unsafe = []
+    for child in run._r:
+        typed_break = child.tag == qn("w:br") and child.get(qn("w:type")) not in (
+            None, "textWrapping",
+        )
+        if child.tag not in SAFE_RUN_CHILDREN or typed_break:
+            unsafe.append(child.tag.rsplit("}", 1)[-1])
+    return unsafe
+
+
+def replace_across_runs(paragraph, old, new):
+    if not old:
+        raise ValueError("old must not be empty")
+    runs = list(paragraph.runs)
+    text = "".join(run.text for run in runs)
+    starts = []
+    position = 0
+    while (start := text.find(old, position)) != -1:
+        starts.append(start)
+        position = start + len(old)
+    spans = []
+    position = 0
+    for index, run in enumerate(runs):
+        end = position + len(run.text)
+        if end > position:
+            spans.append((index, position, end))
+        position = end
+    matches = []
+    for start in starts:
+        end = start + len(old)
+        first, first_start, _ = next(s for s in spans if s[1] <= start < s[2])
+        last, last_start, _ = next(s for s in spans if s[1] < end <= s[2])
+        matches.append((start, end, first, first_start, last, last_start))
+    affected_indexes = {
+        index
+        for _, _, first, _, last, _ in matches
+        for index in range(first, last + 1)
+    }
+    unsafe = {}
+    for index in affected_indexes:
+        if children := unsafe_run_content(runs[index]):
+            unsafe[index] = children
+    if unsafe:
+        raise ValueError(f"matched runs contain non-text content: {unsafe}")
+    for start, end, first, first_start, last, last_start in reversed(matches):
+        prefix = runs[first].text[:start - first_start]
+        suffix = runs[last].text[end - last_start:]
+        if first == last:
+            runs[first].text = prefix + new + suffix
+        else:
+            runs[first].text = prefix + new
+            for index in range(first + 1, last):
+                runs[index].text = ""
+            runs[last].text = suffix
+    return len(starts)
+
+
+safe_doc = Document()
+safe_paragraph = safe_doc.add_paragraph()
+safe_first = safe_paragraph.add_run("T")
+safe_first.bold = True
+safe_paragraph.add_run("B")
+safe_paragraph.add_run("D")
+check("text-only cross-run match is replaced", replace_across_runs(safe_paragraph, "TBD", "Done") == 1)
+check("safe replacement keeps first-run formatting", safe_paragraph.text == "Done" and safe_first.bold)
+
+icon = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 4, 4), False)
+icon.clear_with(200)
+icon.save("inline-icon.png")
+guard_doc = Document()
+guard_paragraph = guard_doc.add_paragraph()
+guard_run = guard_paragraph.add_run("TBD")
+guard_run.add_picture("inline-icon.png")
+try:
+    replace_across_runs(guard_paragraph, "TBD", "Done")
+    rejected_drawing_run = False
+except ValueError:
+    rejected_drawing_run = True
+check("replacement rejects a matched run containing a drawing", rejected_drawing_run)
+check(
+    "rejected replacement leaves text and drawing untouched",
+    guard_run.text == "TBD" and len(guard_run._r.findall(qn("w:drawing"))) == 1,
+)
+
 
 def list_number_num_id(doc):
     """The numId that the ListNumber style binds to in this document part."""

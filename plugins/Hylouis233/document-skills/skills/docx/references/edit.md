@@ -10,9 +10,25 @@ paragraph text.
 
 ```python
 from docx import Document
+from docx.oxml.ns import qn
+
+SAFE_RUN_CHILDREN = {
+    qn("w:rPr"), qn("w:t"), qn("w:tab"), qn("w:br"), qn("w:cr"),
+}
+
+def unsafe_run_content(run):
+    unsafe = []
+    for child in run._r:
+        # Assigning run.text can reconstruct text, tabs, and ordinary line breaks only.
+        typed_break = child.tag == qn("w:br") and child.get(qn("w:type")) not in (
+            None, "textWrapping",
+        )
+        if child.tag not in SAFE_RUN_CHILDREN or typed_break:
+            unsafe.append(child.tag.rsplit("}", 1)[-1])
+    return unsafe
 
 def replace_across_runs(paragraph, old, new):
-    """Replace non-overlapping matches, including matches split across runs."""
+    """Replace text-only matches; reject drawings, fields, and other lossy run content."""
     if not old:
         raise ValueError("old must not be empty")
 
@@ -33,11 +49,30 @@ def replace_across_runs(paragraph, old, new):
             spans.append((index, position, end))
         position = end
 
-    # Work backwards so changing a later match cannot move an earlier match.
-    for start in reversed(starts):
+    matches = []
+    for start in starts:
         end = start + len(old)
         first, first_start, _ = next(s for s in spans if s[1] <= start < s[2])
         last, last_start, _ = next(s for s in spans if s[1] < end <= s[2])
+        matches.append((start, end, first, first_start, last, last_start))
+
+    # Validate every affected run before mutating any of them. Assigning run.text replaces the
+    # run XML and would otherwise silently delete an inline drawing, field, footnote reference,
+    # or a page/column break.
+    affected_indexes = {
+        index
+        for _, _, first, _, last, _ in matches
+        for index in range(first, last + 1)
+    }
+    unsafe = {}
+    for index in affected_indexes:
+        if children := unsafe_run_content(runs[index]):
+            unsafe[index] = children
+    if unsafe:
+        raise ValueError(f"matched runs contain non-text content: {unsafe}")
+
+    # Work backwards so changing a later match cannot move an earlier match.
+    for start, end, first, first_start, last, last_start in reversed(matches):
         prefix = runs[first].text[:start - first_start]
         suffix = runs[last].text[end - last_start:]
 
@@ -67,8 +102,10 @@ doc.save("input.edited.docx")
 ```
 
 The replacement text inherits the first matched run's formatting. Unmatched text before and
-after it stays in its original runs, so its formatting is preserved. Use raw OOXML for fields,
-tracked changes, or other content that `paragraph.runs` does not expose.
+after it stays in its original runs, so its formatting is preserved. The routine fails before
+making changes if any matched run contains a drawing, field, reference, or typed page/column
+break that `run.text` would destroy. Use raw OOXML for those cases and for tracked changes or
+other content that `paragraph.runs` does not expose.
 
 ## Tier 2 - raw OOXML surgery (only when Tier 1 cannot express it)
 

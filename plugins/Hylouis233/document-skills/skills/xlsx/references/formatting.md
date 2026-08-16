@@ -75,7 +75,15 @@ one you took:
        return f"'{escaped}'!"
 
    src = sheet_ref(ws)                              # e.g. "'Sales'!" or "'Raw Data'!"
-   regions = sorted({r[0] for r in ws.iter_rows(min_row=2, min_col=1, values_only=True) if r[0]})
+   regions = []
+   seen_region_keys = set()
+   for (region,) in ws.iter_rows(min_row=2, min_col=1, max_col=1, values_only=True):
+       if region is None or region == "":             # keep valid falsey values: 0 and False
+           continue
+       key = (type(region), region)                    # do not collapse False and numeric 0
+       if key not in seen_region_keys:
+           seen_region_keys.add(key)
+           regions.append(region)                     # stable source order; no mixed-type sort
    for i, region in enumerate(regions, start=2):
        ws2.cell(row=i, column=1, value=region)
        ws2.cell(row=i, column=2, value=f"=SUMIF({src}A:A,A{i},{src}C:C)")

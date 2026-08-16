@@ -50,7 +50,20 @@ wb.save("input-edited.xlsx")
   import zipfile
   from io import BytesIO
 
-  EXTENSION_MARKERS = (b"<extLst", b"x14:", b"mc:AlternateContent")
+  EXTENSION_MARKERS = {
+      "extLst": b"<extLst",
+      "x14": b"x14:",
+      "AlternateContent": b"mc:AlternateContent",
+  }
+
+  def stripped_extension_markers(before, after):
+      """Return every (part, marker) that was present before and absent after."""
+      return sorted(
+          (name, label)
+          for name in set(before) & set(after)
+          for label, marker in EXTENSION_MARKERS.items()
+          if marker in before[name] and marker not in after[name]
+      )
 
   def round_trip_changes(path, **load_options):
       with zipfile.ZipFile(path) as z:
@@ -61,23 +74,19 @@ wb.save("input-edited.xlsx")
       with zipfile.ZipFile(buf) as z:
           after = {name: z.read(name) for name in z.namelist()}
       dropped = sorted(set(before) - set(after))
-      stripped_extensions = sorted(
-          name for name in set(before) & set(after)
-          if any(marker in before[name] for marker in EXTENSION_MARKERS)
-          and not any(marker in after[name] for marker in EXTENSION_MARKERS)
-      )
+      stripped_extensions = stripped_extension_markers(before, after)
       return dropped, stripped_extensions
 
   dropped, stripped = round_trip_changes("input.xlsx")
   if dropped or stripped:
       print("WARNING: saving with openpyxl will drop:", dropped)
-      print("WARNING: saving with openpyxl will strip extensions from:", stripped)
+      print("WARNING: saving with openpyxl will strip (part, marker):", stripped)
       # report to the user and get confirmation before the first save
   ```
 
   (openpyxl re-serializes every sheet it touches, so byte-identity of sheets is not a
-  meaningful check; the extension-marker comparison above is what catches silent feature
-  loss.)
+  meaningful check; comparing each marker independently is what catches partial loss when, for
+  example, `<extLst>` survives but its `x14:` content does not.)
 
 ## Rules
 

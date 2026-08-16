@@ -39,9 +39,11 @@ file is not.
    only when the user asked for a rasterized look or provides only images.
 2. **Page geometry is explicit**: A4 = 595.27 x 841.89 pt, US Letter = 612 x 792 pt. Declare
    the target size and margins up front; re-check fit after generation.
-3. **Fonts**: standard 14 fonts always work; embedding a custom TTF is allowed only with its
-   license permitting distribution. CJK requires an embedded font - there is no built-in CJK
-   face; if unavailable, report the limitation instead of emitting tofu.
+3. **Fonts**: the standard 14 fonts cover only limited encodings; they do not automatically
+   support arbitrary Unicode. Check that the selected face contains every requested character.
+   If any glyph is unsupported - including CJK, Cyrillic, Arabic, Devanagari, or emoji - embed
+   one or more licensed TTF/OTF fonts with the required coverage and use them for those runs.
+   If no suitable embeddable font is available, report the limitation instead of emitting tofu.
 4. **Overflow is a defect**: content that spills past the last page or the margin must be
    detected in postcheck and fixed (shrink, paginate, or cut), never shipped.
 5. Write output to a new path; keep inputs untouched unless in-place was requested.

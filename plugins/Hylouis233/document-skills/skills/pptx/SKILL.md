@@ -60,5 +60,11 @@ equals the slide count:
 soffice --headless --convert-to pdf output.pptx --outdir <tmp>
 ```
 
+Page count is only a structural smoke test. Rasterize and inspect **every rendered slide** for
+horizontal clipping and for a final line clipped or missing at the bottom; follow the text-fit
+procedure in [references/analyze.md](references/analyze.md). Fix and render again if any text
+overflows. If no production-equivalent renderer is available, report overflow as unverified -
+do not claim that shape bounds or page count prove that text fits.
+
 Report: output path, slide inventory (index, layout name, title), verification done, and any
-layout risks (long CJK strings, tight two-column slides) that only a human eye can confirm.
+remaining layout risks (long CJK strings, tight two-column slides).

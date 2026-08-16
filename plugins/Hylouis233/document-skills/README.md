@@ -75,9 +75,10 @@ versus what was assumed.
 
 The [`tests/`](tests/) directory ships one runnable fixture script per format covering the
 snippets with the worst silent-failure modes (PDF AcroForm clone-and-fill, watermark write,
-CMYK pixmap conversion; PPTX run-preserving edits, table-cell run edits, grouped-shape walking;
-XLSX dialect sniffing, round-trip part-loss detection; DOCX numbering restart rendered through
-LibreOffice). Each script is self-contained and exits non-zero on failure.
+CMYK conversion, soft-mask extraction; PPTX run-preserving edits, actual content extraction,
+grouped-shape walking, per-master themes; XLSX dialect sniffing, independent extension-marker
+loss, falsey aggregation categories; DOCX guarded cross-run replacement and numbering restart
+rendered through LibreOffice). Each script is self-contained and exits non-zero on failure.
 
 ## Requirements
 

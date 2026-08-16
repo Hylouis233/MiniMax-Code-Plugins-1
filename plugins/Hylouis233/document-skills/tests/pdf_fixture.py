@@ -114,6 +114,36 @@ check("CMYK pixmap converts to a saved PNG", os.path.getsize("cmyk-converted.png
 rgb = fitz.Pixmap("cmyk-converted.png")
 check("converted pixmap is RGB", "RGB" in str(rgb.colorspace), rgb.colorspace)
 
+# ---- extract.md soft-mask composition: transparent image keeps alpha -----------
+rgba = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 8, 8), True)
+for y in range(rgba.height):
+    for x in range(rgba.width):
+        rgba.set_pixel(x, y, (255, 0, 0, 255 if x < 4 else 64))
+rgba.save("transparent-source.png")
+
+transparent_pdf = canvas.Canvas("transparent-image.pdf", pagesize=A4)
+transparent_pdf.drawImage(
+    "transparent-source.png", 72, 700, width=80, height=80, mask="auto"
+)
+transparent_pdf.save()
+
+transparent_doc = fitz.open("transparent-image.pdf")
+image_info = transparent_doc[0].get_images(full=True)[0]
+check("transparent PDF image exposes a soft-mask xref", image_info[1] > 0, image_info)
+base = fitz.Pixmap(transparent_doc, image_info[0])
+if base.colorspace and base.colorspace not in (fitz.csGRAY, fitz.csRGB):
+    base = fitz.Pixmap(fitz.csRGB, base)
+mask = fitz.Pixmap(transparent_doc, image_info[1])
+composited = fitz.Pixmap(base, mask)
+composited.save("transparent-extracted.png")
+reopened_composite = fitz.Pixmap("transparent-extracted.png")
+check("soft-mask composition keeps an alpha channel", reopened_composite.alpha == 1)
+check(
+    "soft-mask composition keeps varying transparency",
+    len(set(reopened_composite.samples[3::4])) > 1,
+    set(reopened_composite.samples[3::4]),
+)
+
 # ---- create.md rule: escape plain text before Paragraph ------------------------
 from reportlab.lib.pagesizes import A4 as A4_SIZE
 from reportlab.lib.styles import getSampleStyleSheet
