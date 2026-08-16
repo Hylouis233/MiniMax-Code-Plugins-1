@@ -63,8 +63,12 @@ theme = {
     "major (headings)": re.search(r'<a:majorFont>\s*<a:latin typeface="([^"]*)"', theme_xml),
     "minor (body)": re.search(r'<a:minorFont>\s*<a:latin typeface="([^"]*)"', theme_xml),
 }
-for kind, match in theme.items():
-    print("theme", kind, "->", match.group(1) if match else "(not set)")
+theme_faces = {
+    kind: match.group(1) if match else "(not set)"
+    for kind, match in theme.items()
+}
+for kind, face in theme_faces.items():
+    print("theme", kind, "->", face)
 
 # 2. Per run: explicit value, else paragraph defaults, else report as inherited.
 for i, slide in enumerate(prs.slides):
@@ -74,12 +78,13 @@ for i, slide in enumerate(prs.slides):
         for paragraph in shape.text_frame.paragraphs:
             for run in paragraph.runs:
                 if run.font.name:
-                    source = "run"
+                    face, source = run.font.name, "run"
                 elif paragraph.font.name:
-                    source = "paragraph defaults"
+                    face, source = paragraph.font.name, "paragraph defaults"
                 else:
-                    source = "inherited (placeholder/layout/master chain, theme fallback)"
-                print(i, shape.name, repr(run.text[:20]), source)
+                    face = f"major={theme_faces['major (headings)']}; minor={theme_faces['minor (body)']}"
+                    source = "inherited candidate (verify placeholder/layout/master chain)"
+                print(i, shape.name, repr(run.text[:20]), "font:", face, "source:", source)
 ```
 
 python-pptx does not evaluate the full placeholder -> layout -> master inheritance chain; when

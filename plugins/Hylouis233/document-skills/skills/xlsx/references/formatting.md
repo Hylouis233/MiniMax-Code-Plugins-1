@@ -69,8 +69,9 @@ one you took:
    ws2.append(["Region", "Units", "Revenue"])
 
    def sheet_ref(sheet):
-       # quote the title only when it contains characters a formula would misread
-       return f"'{sheet.title}'!" if any(c in sheet.title for c in " !'") else f"{sheet.title}!"
+       # Excel escapes an apostrophe inside a quoted sheet title by doubling it.
+       escaped = sheet.title.replace("'", "''")
+       return f"'{escaped}'!" if any(c in sheet.title for c in " !'") else f"{escaped}!"
 
    src = sheet_ref(ws)                              # e.g. "Sales!" or "'Raw Data'!"
    regions = sorted({r[0] for r in ws.iter_rows(min_row=2, min_col=1, values_only=True) if r[0]})
@@ -89,7 +90,7 @@ one you took:
    write values, and **label the sheet** ("values as of generation, not recalculated").
 
 3. **User's Excel/template pivot** - when the workbook already has slicers or a pivot the
-  user maintains, edit around it and re-run the `round_trip_losses` check from
+  user maintains, edit around it and re-run the `round_trip_changes` check from
   [edit.md](edit.md) before saving.
 
 ## Postcheck additions

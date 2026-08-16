@@ -17,6 +17,13 @@ import zipfile
 from lxml import etree
 
 path = "input.docx"
+safe_xml_parser = etree.XMLParser(
+    load_dtd=False,
+    resolve_entities=False,
+    no_network=True,
+    huge_tree=False,
+    recover=False,
+)
 with zipfile.ZipFile(path) as z:
     bad = z.testzip()
     assert bad is None, f"corrupt entry: {bad}"
@@ -24,7 +31,7 @@ with zipfile.ZipFile(path) as z:
     assert "[Content_Types].xml" in names and "word/document.xml" in names
     for part in names:
         if part.endswith(('.xml', '.rels')):
-            etree.fromstring(z.read(part))  # raises on malformed XML
+            etree.fromstring(z.read(part), parser=safe_xml_parser)  # malformed XML still raises
 ```
 
 Then the SKILL.md postcheck (python-docx re-open, optional soffice PDF smoke test).

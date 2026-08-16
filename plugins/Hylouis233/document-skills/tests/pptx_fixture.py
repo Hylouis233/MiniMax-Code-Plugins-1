@@ -186,5 +186,26 @@ check(
     all(run.font.name is None for sh in prs7.slides[0].shapes if sh.has_text_frame for par in sh.text_frame.paragraphs for run in par.runs),
 )
 
+font_box = prs7.slides[0].shapes.add_textbox(Inches(1), Inches(4), Inches(4), Inches(1))
+font_paragraph = font_box.text_frame.paragraphs[0]
+font_paragraph.font.name = "Paragraph Face"
+paragraph_run = font_paragraph.add_run()
+paragraph_run.text = "paragraph default"
+explicit_run = font_paragraph.add_run()
+explicit_run.text = "run override"
+explicit_run.font.name = "Run Face"
+detected_faces = []
+for run in font_paragraph.runs:
+    if run.font.name:
+        detected_faces.append((run.font.name, "run"))
+    elif font_paragraph.font.name:
+        detected_faces.append((font_paragraph.font.name, "paragraph defaults"))
+check("font triage reports the run face and source", ("Run Face", "run") in detected_faces, detected_faces)
+check(
+    "font triage reports the paragraph face and source",
+    ("Paragraph Face", "paragraph defaults") in detected_faces,
+    detected_faces,
+)
+
 print("\n" + ("ALL PPTX FIXTURES PASSED" if not failures else f"{len(failures)} FAILURES: {failures}"))
 sys.exit(0 if not failures else 1)

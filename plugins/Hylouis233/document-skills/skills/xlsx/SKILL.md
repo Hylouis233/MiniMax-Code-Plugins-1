@@ -58,6 +58,10 @@ import sys
 if len(sys.argv) < 3:
     raise SystemExit("usage: python postcheck.py OUTPUT.xlsx EXPECTED_SHEET [...]")
 output_path, *expected_sheets = sys.argv[1:]
+# Populate this whenever the task requested specific display formats.
+expected_number_formats = {
+    # "Sales": {"D2": "#,##0.00", "E2": "yyyy-mm-dd"},
+}
 wb = openpyxl.load_workbook(output_path)
 print("sheets:", wb.sheetnames)
 missing = set(expected_sheets) - set(wb.sheetnames)
@@ -67,9 +71,15 @@ for ws in wb.worksheets:
     formulas = [(c.coordinate, c.value) for row in ws.iter_rows() for c in row
                 if isinstance(c.value, str) and c.value.startswith("=")]
     print(f"{ws.title} formula cells:", formulas[:10])
+    for coordinate, expected_format in expected_number_formats.get(ws.title, {}).items():
+        actual_format = ws[coordinate].number_format
+        assert actual_format == expected_format, (
+            f"{ws.title}!{coordinate}: expected format {expected_format!r}, got {actual_format!r}"
+        )
 wb.close()
 ```
 
 Confirm: expected sheet names exist; used range matches expectations; intended formula cells
-contain formula strings; number formats survive. Report what was verified and note that final
+contain formula strings; every task-specific formatted cell is listed in
+`expected_number_formats` and matches. Report what was verified and note that final
 rendered values require opening in a spreadsheet application.

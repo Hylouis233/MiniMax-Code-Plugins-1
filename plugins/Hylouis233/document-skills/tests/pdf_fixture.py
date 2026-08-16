@@ -44,6 +44,17 @@ check(
     page_sizes,
 )
 
+# ---- SKILL.md postcheck: encrypted output is reopened with its password -------
+encrypted_writer = pypdf.PdfWriter()
+encrypted_writer.append(r)
+encrypted_writer.encrypt("fixture-password")
+with open("encrypted.pdf", "wb") as f:
+    encrypted_writer.write(f)
+probe = pypdf.PdfReader("encrypted.pdf")
+check("encrypted fixture is detected before page access", probe.is_encrypted)
+encrypted_r = pypdf.PdfReader("encrypted.pdf", password="fixture-password")
+check("password-authenticated postcheck can access every page", len(encrypted_r.pages) == 2)
+
 # ---- transform.md AcroForm snippet: clone into writer, fill on writer pages ----
 from pypdf import PdfReader, PdfWriter
 

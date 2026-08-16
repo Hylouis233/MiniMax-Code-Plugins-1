@@ -49,8 +49,16 @@ file is not.
 ## Step 3 - Postcheck (mandatory)
 
 ```python
+import os
 import pypdf
-r = pypdf.PdfReader("output.pdf")
+
+output_path = "output.pdf"
+password = os.environ.get("PDF_PASSWORD")
+r = pypdf.PdfReader(output_path)
+if r.is_encrypted:
+    if not password:
+        raise RuntimeError("set PDF_PASSWORD so the encrypted output can be postchecked")
+    r = pypdf.PdfReader(output_path, password=password)  # wrong passwords fail here
 page_count = len(r.pages)
 page_texts = {
     number: (page.extract_text() or "").strip()

@@ -45,7 +45,16 @@ with open("output.csv", "w", newline="", encoding="utf-8") as f:
 ## Converting
 
 - CSV -> XLSX: read with `csv`, write with openpyxl; convert values to real types on the way
-  through (dates via `datetime.strptime` with the format actually observed).
+  through (dates via `datetime.strptime` with the format actually observed). Treat every
+  remaining CSV field as data, not a formula. In particular, force strings beginning with `=`
+  back to the string data type unless the user explicitly requested formula interpretation:
+
+  ```python
+  def write_csv_field(cell, value):
+      cell.value = value
+      if isinstance(value, str) and value.startswith("="):
+          cell.data_type = "s"  # openpyxl otherwise promotes it to an XLSX formula
+  ```
 - XLSX -> CSV: `iter_rows(values_only=True)`; format numbers yourself only if the user needs a
   fixed display format - otherwise write raw values and say so.
 - Large CSV -> keep it CSV or move to SQLite/Parquet; loading it all into one sheet to

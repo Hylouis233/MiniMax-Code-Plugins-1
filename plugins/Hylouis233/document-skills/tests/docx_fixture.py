@@ -14,6 +14,7 @@ from docx import Document
 from docx.opc.constants import RELATIONSHIP_TYPE as RT
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
+from lxml import etree
 
 failures = []
 
@@ -22,6 +23,22 @@ def check(name, cond, extra=""):
     print(("PASS " if cond else "FAIL ") + name + ((" :: " + str(extra)) if not cond and extra else ""))
     if not cond:
         failures.append(name)
+
+
+# ---- review.md health check: external entities stay unresolved ---------------
+safe_xml_parser = etree.XMLParser(
+    load_dtd=False,
+    resolve_entities=False,
+    no_network=True,
+    huge_tree=False,
+    recover=False,
+)
+hostile_xml = (
+    b'<!DOCTYPE root [<!ENTITY xxe SYSTEM "file:///definitely-not-readable">]>'
+    b'<root>&xxe;</root>'
+)
+parsed = etree.fromstring(hostile_xml, parser=safe_xml_parser)
+check("DOCX XML parser leaves external entities unresolved", parsed.text is None and len(parsed) == 1)
 
 
 def list_number_num_id(doc):

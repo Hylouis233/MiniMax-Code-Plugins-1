@@ -41,6 +41,21 @@ with open("input.csv", newline="", encoding="utf-8-sig") as f:
     naive = next(csv.DictReader(f))
 check("default reader is proven wrong here (negative control)", list(naive.keys())[0] == "region;units;note", naive)
 
+# ---- csv.md conversion: formula-looking input remains literal text -----------
+formula_looking = '=HYPERLINK("https://example.invalid", "click")'
+csv_wb = openpyxl.Workbook()
+csv_cell = csv_wb.active["A1"]
+csv_cell.value = formula_looking
+csv_cell.data_type = "s"
+csv_wb.save("csv-text.xlsx")
+csv_reopened = openpyxl.load_workbook("csv-text.xlsx", data_only=False)
+check("formula-looking CSV field keeps its exact text", csv_reopened.active["A1"].value == formula_looking)
+check("formula-looking CSV field is not an XLSX formula", csv_reopened.active["A1"].data_type == "s")
+
+unsafe_wb = openpyxl.Workbook()
+unsafe_wb.active["A1"] = formula_looking
+check("plain assignment is proven unsafe (negative control)", unsafe_wb.active["A1"].data_type == "f")
+
 # ---- edit.md snippet: round_trip_changes detects dropped parts AND stripped extensions ----
 from io import BytesIO
 
@@ -105,7 +120,8 @@ agg = wb_f.create_sheet("ByRegion")
 
 
 def sheet_ref(sheet):
-    return f"'{sheet.title}'!" if any(c in sheet.title for c in " !'") else f"{sheet.title}!"
+    escaped = sheet.title.replace("'", "''")
+    return f"'{escaped}'!" if any(c in sheet.title for c in " !'") else f"{escaped}!"
 
 
 ref = sheet_ref(src)
@@ -115,13 +131,31 @@ agg["B2"] = f"=SUMIF({ref}A:A,A2,{ref}B:B)"
 wb_f.save("agg.xlsx")
 wb_g = openpyxl.load_workbook("agg.xlsx")
 check("formula references the real sheet name", wb_g["ByRegion"]["B2"].value == "=SUMIF('Raw Data'!A:A,A2,'Raw Data'!B:B)", wb_g["ByRegion"]["B2"].value)
+apostrophe_sheet = wb_f.create_sheet("O'Brien")
+apostrophe_sheet["A1"] = 1
+agg["B3"] = f"=SUM({sheet_ref(apostrophe_sheet)}A:A)"
+wb_f.save("apostrophe-agg.xlsx")
+apostrophe_formula = openpyxl.load_workbook("apostrophe-agg.xlsx")["ByRegion"]["B3"].value
+check(
+    "quoted sheet reference doubles apostrophes",
+    apostrophe_formula == "=SUM('O''Brien'!A:A)",
+    apostrophe_formula,
+)
 
 # and the edit itself still works after the warning path
 wb2 = openpyxl.load_workbook("plain.xlsx")
 wb2["Data"]["B2"] = "=B2*1"  # formula stays a formula
+wb2["Data"]["B2"].number_format = "#,##0.00"
 wb2.save("edited.xlsx")
 wb3 = openpyxl.load_workbook("edited.xlsx")
 check("edited cell keeps a formula string", isinstance(wb3["Data"]["B2"].value, str) and wb3["Data"]["B2"].value.startswith("="))
+expected_number_formats = {"Data": {"B2": "#,##0.00"}}
+format_matches = all(
+    wb3[sheet][coordinate].number_format == expected
+    for sheet, cells in expected_number_formats.items()
+    for coordinate, expected in cells.items()
+)
+check("task-specific number format mapping is verified", format_matches)
 
 # ---- read.md snippet: multi-sheet profiles cover every sheet ----------------------
 wb_h = openpyxl.Workbook()
