@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { access, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
@@ -25,10 +25,10 @@ class McpClient {
     const lines = createInterface({ input: this.child.stdout, crlfDelay: Infinity });
     lines.on("line", (line) => {
       const message = JSON.parse(line);
-      const entry = this.pending.get(String(message.id));
+      const entry = this.pending.get(message.id);
       if (!entry) return;
       clearTimeout(entry.timer);
-      this.pending.delete(String(message.id));
+      this.pending.delete(message.id);
       entry.resolve(message);
     });
     this.child.on("exit", (code) => {
@@ -53,10 +53,10 @@ class McpClient {
   request(method, params, id = this.nextId++) {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        this.pending.delete(String(id));
+        this.pending.delete(id);
         reject(new Error("timed out waiting for request " + String(id) + ": " + this.stderr));
       }, 25_000);
-      this.pending.set(String(id), { resolve, reject, timer });
+      this.pending.set(id, { resolve, reject, timer });
       this.child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
     });
   }
@@ -172,6 +172,99 @@ test("canonical Git worktree locking serializes root and symlink paths", async (
     "start:first", "end:first", "start:second", "end:second",
   ]);
   assert.equal(firstResponse.result.structuredContent.worktreeRoot, secondResponse.result.structuredContent.worktreeRoot);
+});
+
+test("workspace status reports NUL-delimited root-relative paths from a subdirectory", async (context) => {
+  const { workspace, client } = await makeHarness(context);
+  const nested = path.join(workspace, "nested", "deep");
+  await mkdir(nested, { recursive: true });
+  await execFileAsync("git", ["config", "core.quotePath", "true"], { cwd: workspace });
+
+  const leading = path.join(nested, " leading.txt");
+  await writeFile(leading, "before\n");
+  await execFileAsync("git", ["add", "nested/deep/ leading.txt"], { cwd: workspace });
+  await execFileAsync("git", ["commit", "-m", "add unusual path"], { cwd: workspace });
+  await writeFile(leading, "after\n");
+  await writeFile(path.join(nested, "café-staged.txt"), "staged\n");
+  await execFileAsync("git", ["add", "nested/deep/café-staged.txt"], { cwd: workspace });
+  await writeFile(path.join(nested, "café-untracked.txt"), "untracked\n");
+  await writeFile(path.join(workspace, "root-new.txt"), "root\n");
+
+  const response = await client.request("tools/call", {
+    name: "workspace_status",
+    arguments: { workspacePath: nested },
+  });
+  const changed = response.result.structuredContent.git.changedFiles;
+  assert.ok(changed.includes("nested/deep/ leading.txt"), JSON.stringify(changed));
+  assert.ok(changed.includes("nested/deep/café-staged.txt"), JSON.stringify(changed));
+  assert.ok(changed.includes("nested/deep/café-untracked.txt"), JSON.stringify(changed));
+  assert.ok(changed.includes("root-new.txt"), JSON.stringify(changed));
+  assert.equal(response.result.structuredContent.worktreeRoot, await realpath(workspace));
+});
+
+test("workspace status waits for an active delegation on the canonical worktree lock", async (context) => {
+  const { tempRoot, workspace, client } = await makeHarness(context);
+  const nested = path.join(workspace, "nested");
+  await mkdir(nested);
+  const eventFile = path.join(tempRoot, "status-lock-events.jsonl");
+  const delegated = client.request("tools/call", taskArguments(workspace, {
+    name: "writer", eventFile, delayMs: 900, writeFile: "finished.txt",
+  }), 311);
+  await waitFor(async () => (await events(eventFile)).some((item) => item.event === "start"));
+
+  const status = client.request("tools/call", {
+    name: "workspace_status",
+    arguments: { workspacePath: nested },
+  }, 312);
+  const early = await Promise.race([
+    status.then(() => "completed"),
+    new Promise((resolve) => setTimeout(() => resolve("pending"), 250)),
+  ]);
+  assert.equal(early, "pending", "status must wait while the delegation owns the workspace lock");
+  const [delegatedResponse, statusResponse] = await Promise.all([delegated, status]);
+  assert.equal(delegatedResponse.result.structuredContent.ok, true);
+  assert.ok(statusResponse.result.structuredContent.git.changedFiles.includes("finished.txt"));
+});
+
+test("cancellation distinguishes numeric and string JSON-RPC request ids", async (context) => {
+  const { tempRoot, workspace, client } = await makeHarness(context);
+  const other = path.join(tempRoot, "workspace-other");
+  await mkdir(other);
+  await execFileAsync("git", ["init", "-b", "main"], { cwd: other });
+  await execFileAsync("git", ["config", "user.name", "Bridge Test"], { cwd: other });
+  await execFileAsync("git", ["config", "user.email", "bridge-test@example.invalid"], { cwd: other });
+  await writeFile(path.join(other, "baseline.txt"), "baseline\n");
+  await execFileAsync("git", ["add", "baseline.txt"], { cwd: other });
+  await execFileAsync("git", ["commit", "-m", "baseline"], { cwd: other });
+  const eventFile = path.join(tempRoot, "id-events.jsonl");
+
+  const numeric = client.request("tools/call", taskArguments(workspace, {
+    name: "numeric", eventFile, delayMs: 1_200, writeFile: "numeric.txt",
+  }), 313);
+  const string = client.request("tools/call", taskArguments(other, {
+    name: "string", eventFile, delayMs: 1_200, writeFile: "string.txt",
+  }), "313");
+  await waitFor(async () => {
+    const seen = await events(eventFile);
+    return seen.some((item) => item.name === "numeric" && item.event === "start")
+      && seen.some((item) => item.name === "string" && item.event === "start");
+  });
+  client.notify("notifications/cancelled", { requestId: 313, reason: "numeric only" });
+
+  const [numericResponse, stringResponse] = await Promise.all([numeric, string]);
+  assert.equal(numericResponse.result.structuredContent.cancelled, true);
+  assert.equal(stringResponse.result.structuredContent.cancelled, false);
+  assert.equal(stringResponse.result.structuredContent.ok, true);
+});
+
+test("PowerShell runner returns nonzero when the backend command is missing", {
+  skip: process.platform !== "win32",
+}, async () => {
+  const runner = path.join(pluginRoot, "ps1-runner.ps1");
+  await assert.rejects(execFileAsync("powershell.exe", [
+    "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", runner,
+    "cli-agent-bridge-command-that-does-not-exist-7f0d0f5b",
+  ]), (error) => error.code === 127);
 });
 
 test("a request cancelled while queued never starts its backend", async (context) => {

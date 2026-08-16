@@ -193,6 +193,14 @@ function capture() {
 
 async function runCommand(command, args, options = {}) {
   const spawnOnce = (argv, shellArgs) => new Promise((resolve) => {
+    if (typeof options.shouldCancel === "function" && options.shouldCancel()) {
+      resolve({
+        stdout: "", stderr: "", exitCode: null, timedOut: false, killed: false,
+        orphanedProcesses: false, treeTerminated: true, terminationError: "",
+        errorMessage: "command cancelled before spawn", spawnError: null,
+      });
+      return;
+    }
     const manageProcessTree = options.manageProcessTree === true;
     const child = shellArgs
       ? spawn(shellArgs[0], shellArgs.slice(1), {
@@ -391,10 +399,10 @@ async function gitSnapshot(workspacePath) {
   const jobs = [
     ["git status --short", "status", ["status", "--short"]],
     ["git diff --stat", "diffStat", ["diff", "--stat"]],
-    ["git diff --name-only", "diffNames", ["diff", "--name-only"]],
+    ["git diff --name-only -z", "diffNames", ["diff", "--name-only", "-z"]],
     ["git diff --cached --stat", "cachedDiffStat", ["diff", "--cached", "--stat"]],
-    ["git diff --cached --name-only", "cachedDiffNames", ["diff", "--cached", "--name-only"]],
-    ["git ls-files --others --exclude-standard", "untracked", ["ls-files", "--others", "--exclude-standard"]],
+    ["git diff --cached --name-only -z", "cachedDiffNames", ["diff", "--cached", "--name-only", "-z"]],
+    ["git ls-files --others --exclude-standard -z", "untracked", ["ls-files", "--others", "--exclude-standard", "-z"]],
     ["git rev-parse --verify --quiet HEAD", "head", ["rev-parse", "--verify", "--quiet", "HEAD"], true],
   ];
   // Run serially: status/diff may both refresh the index, so concurrent Git
@@ -419,10 +427,11 @@ async function gitSnapshot(workspacePath) {
     throw new Error("git snapshot unreliable: " + failures.join("; "));
   }
   const seen = new Set();
+  const nulNames = (value) => String(value ?? "").split("\0").filter((name) => name.length > 0);
   const changedFiles = [
-    ...String(out.diffNames ?? "").split(/\r?\n/).map((l) => l.trim()).filter(Boolean),
-    ...String(out.cachedDiffNames ?? "").split(/\r?\n/).map((l) => l.trim()).filter(Boolean),
-    ...String(out.untracked ?? "").split(/\r?\n/).map((l) => l.trim()).filter(Boolean),
+    ...nulNames(out.diffNames),
+    ...nulNames(out.cachedDiffNames),
+    ...nulNames(out.untracked),
   ].filter((f) => (seen.has(f) ? false : (seen.add(f), true)));
   const diffStat = [String(out.diffStat ?? "").trim(), String(out.cachedDiffStat ?? "").trim()]
     .filter(Boolean)
@@ -562,7 +571,7 @@ async function delegateTask(rawArgs, cancel) {
       return cancelledDelegation({ backend, workspacePath, worktreeRoot, spec });
     }
     const allowDirty = rawArgs.allowDirty === true;
-    const before = await gitSnapshot(workspacePath);
+    const before = await gitSnapshot(worktreeRoot);
     if (cancel && cancel.cancelled) {
       return cancelledDelegation({ backend, workspacePath, worktreeRoot, spec, before });
     }
@@ -614,8 +623,8 @@ async function delegateTask(rawArgs, cancel) {
       onChild: (controller) => { if (cancel) cancel.controller = controller; },
     });
     if (!result.treeTerminated) quarantinedWorkspaces.add(lockKey);
-    const after = result.treeTerminated ? await gitSnapshot(workspacePath) : before;
-    const commits = result.treeTerminated ? await committedDelta(workspacePath, before.head, after.head) : null;
+    const after = result.treeTerminated ? await gitSnapshot(worktreeRoot) : before;
+    const commits = result.treeTerminated ? await committedDelta(worktreeRoot, before.head, after.head) : null;
     let error = "";
     if (!result.treeTerminated) {
       error = "backend process tree could not be confirmed terminated; the workspace is quarantined until the bridge restarts";
@@ -690,7 +699,7 @@ async function handleMessage(message) {
   }
   if (message.method === "notifications/cancelled") {
     const requestId = message.params?.requestId ?? message.params?.id;
-    const entry = activeRequests.get(String(requestId));
+    const entry = activeRequests.get(requestId);
     if (entry && entry.cancel) {
       entry.cancel.cancelled = true;
       if (entry.cancel.controller) {
@@ -739,15 +748,17 @@ async function handleMessage(message) {
         if (params.name === "workspace_status") {
           const workspacePath = await validateWorkspace(args.workspacePath);
           await requireGitRepo(workspacePath);
-          const git = await gitSnapshot(workspacePath);
+          const worktreeRoot = await gitWorktreeRoot(workspacePath);
+          const git = await withWorkspaceLock(workspaceLockKey(worktreeRoot), () => gitSnapshot(worktreeRoot));
           return jsonRpcResult(message.id, {
             content: [{ type: "text", text: textResult("Workspace Status", { workspacePath, git }) }],
-            structuredContent: { ok: true, workspacePath, git },
+            structuredContent: { ok: true, workspacePath, worktreeRoot, git },
           });
         }
         if (params.name === "delegate_task") {
           const cancel = { controller: null, cancelled: false };
-          activeRequests.set(String(message.id), { cancel });
+          const entry = { cancel };
+          activeRequests.set(message.id, entry);
           try {
             const out = await delegateTask(args, cancel);
             return jsonRpcResult(message.id, {
@@ -756,7 +767,7 @@ async function handleMessage(message) {
               isError: !out.ok,
             });
           } finally {
-            activeRequests.delete(String(message.id));
+            if (activeRequests.get(message.id) === entry) activeRequests.delete(message.id);
           }
         }
         return jsonRpcError(message.id, -32602, "Unknown tool: " + params.name);

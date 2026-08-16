@@ -3,6 +3,14 @@
 # signs survive verbatim.
 $Command = $args[0]
 $rest = $args | Select-Object -Skip 1
-& $Command @rest
-exit $LASTEXITCODE
+$ErrorActionPreference = "Stop"
+$global:LASTEXITCODE = $null
+try {
+    & $Command @rest
+    if ($null -eq $LASTEXITCODE) { exit 0 }
+    exit [int]$LASTEXITCODE
+} catch {
+    [Console]::Error.WriteLine($_.Exception.Message)
+    exit 127
+}
 
