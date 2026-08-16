@@ -10,6 +10,7 @@ import subprocess
 import sys
 import zipfile
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import fitz
 from docx import Document
@@ -405,7 +406,20 @@ def face_from_rpr(rpr, slot):
     if rpr is None:
         return None
     rfonts = rpr.find(qn("w:rFonts"))
-    return None if rfonts is None else rfonts.get(qn("w:" + slot))
+    if rfonts is None:
+        return None
+    theme_attribute = {
+        "ascii": "asciiTheme", "hAnsi": "hAnsiTheme",
+        "eastAsia": "eastAsiaTheme", "cs": "cstheme",
+    }[slot]
+    theme_token = rfonts.get(qn("w:" + theme_attribute))
+    if theme_token is not None:
+        literal = rfonts.get(qn("w:" + slot))
+        raise LookupError(
+            f"unresolved direct {theme_attribute}={theme_token!r}"
+            + (f" alongside {slot}={literal!r}" if literal is not None else "")
+        )
+    return rfonts.get(qn("w:" + slot))
 
 
 def style_faces(style, slot):
@@ -446,6 +460,35 @@ def effective_face(run, slot):
         if face := next(style_faces(style, slot), None):
             return face
     raise LookupError(slot)
+
+
+theme_attribute_by_slot = {
+    "ascii": "asciiTheme", "hAnsi": "hAnsiTheme",
+    "eastAsia": "eastAsiaTheme", "cs": "cstheme",
+}
+for slot, theme_attribute in theme_attribute_by_slot.items():
+    themed_run = font_doc.add_paragraph().add_run("漢" if slot == "eastAsia" else "A")
+    themed_fonts = themed_run._r.get_or_add_rPr().get_or_add_rFonts()
+    themed_fonts.set(qn("w:" + theme_attribute), "majorEastAsia" if slot == "eastAsia" else "minorAscii")
+    try:
+        effective_face(themed_run, slot)
+        direct_theme_rejected = False
+    except LookupError:
+        direct_theme_rejected = True
+    check(f"direct {theme_attribute} does not fall through to an inherited literal face",
+          direct_theme_rejected)
+
+ambiguous_theme_run = font_doc.add_paragraph().add_run("漢")
+ambiguous_fonts = ambiguous_theme_run._r.get_or_add_rPr().get_or_add_rFonts()
+ambiguous_fonts.set(qn("w:eastAsia"), "Literal Face")
+ambiguous_fonts.set(qn("w:eastAsiaTheme"), "majorEastAsia")
+try:
+    effective_face(ambiguous_theme_run, "eastAsia")
+    literal_and_theme_rejected = False
+except LookupError:
+    literal_and_theme_rejected = True
+check("same-slot literal plus theme font declaration fails closed",
+      literal_and_theme_rejected)
 
 
 check("header part has no document back-reference (negative control)",
@@ -906,6 +949,53 @@ check("raw w:t joining concatenates paragraphs (negative control)",
       "Firstafter tab" in joined_raw, joined_raw)
 check("tc_text preserves the paragraph boundary", " / Second" in extracted, extracted)
 check("tc_text keeps tabs visible", "<tab>after tab" in extracted, extracted)
+
+
+# ---- edit.md raw OOXML repack: every input gets a fresh extraction tree ---------
+media_doc = Document()
+media_doc.add_paragraph("first document")
+media_doc.add_picture("inline-icon.png")
+media_doc.save("repack-with-media.docx")
+plain_doc = Document()
+plain_doc.add_paragraph("second document")
+plain_doc.save("repack-without-media.docx")
+
+
+def repack_tree(source, output, extraction_root):
+    with zipfile.ZipFile(source) as archive:
+        archive.extractall(extraction_root)
+    content_types = Path(extraction_root) / "[Content_Types].xml"
+    files = sorted(
+        (path for path in Path(extraction_root).rglob("*")
+         if path.is_file() and path != content_types),
+        key=lambda path: path.relative_to(extraction_root).as_posix(),
+    )
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED, strict_timestamps=False) as archive:
+        archive.write(content_types, "[Content_Types].xml")
+        for path in files:
+            archive.write(path, path.relative_to(extraction_root).as_posix())
+
+
+reused_root = Path("reused-docx-work")
+reused_root.mkdir()
+repack_tree("repack-with-media.docx", "reused-first.docx", reused_root)
+repack_tree("repack-without-media.docx", "reused-second.docx", reused_root)
+with zipfile.ZipFile("reused-second.docx") as archive:
+    reused_names = archive.namelist()
+check("reusing an extraction tree demonstrably leaks a prior document's media",
+      any(name.startswith("word/media/") for name in reused_names), reused_names)
+
+with TemporaryDirectory(prefix="docx-edit-") as scratch:
+    repack_tree("repack-without-media.docx", "fresh-second.docx", Path(scratch))
+with zipfile.ZipFile("fresh-second.docx") as archive:
+    fresh_names = archive.namelist()
+check("fresh extraction excludes media absent from the current input",
+      not any(name.startswith("word/media/") for name in fresh_names), fresh_names)
+check("fresh repack writes Content_Types exactly once and first",
+      fresh_names[0] == "[Content_Types].xml"
+      and fresh_names.count("[Content_Types].xml") == 1, fresh_names[:3])
+check("freshly repacked DOCX reopens with only the current document's content",
+      Document("fresh-second.docx").paragraphs[0].text == "second document")
 
 
 print("\n" + ("ALL DOCX FIXTURES PASSED" if not failures else f"{len(failures)} FAILURES: {failures}"))

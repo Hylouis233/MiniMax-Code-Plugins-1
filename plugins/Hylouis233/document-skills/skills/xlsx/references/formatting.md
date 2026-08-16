@@ -90,8 +90,60 @@ one you took:
    hard-coding `Data!` breaks on any workbook whose sheet is named differently:
 
    ```python
-   ws2 = wb.create_sheet("ByRegion")
-   ws2.append(["Region", "Units", "Revenue"])
+   import openpyxl
+   import posixpath
+   import zipfile
+   from xml.etree import ElementTree as ET
+
+   MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+   DOC_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+   PKG_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+
+   def cached_formula_coordinates_for_sheet(path, sheet_name):
+       """Distinguish a typed cached blank from a formula with no cached result."""
+       with zipfile.ZipFile(path) as archive:
+           workbook = ET.fromstring(archive.read("xl/workbook.xml"))
+           sheet = next(
+               item for item in workbook.iter(f"{{{MAIN_NS}}}sheet")
+               if item.attrib["name"] == sheet_name
+           )
+           relationship_id = sheet.attrib[f"{{{DOC_REL_NS}}}id"]
+           relationships = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+           target = next(
+               item.attrib["Target"]
+               for item in relationships.iter(f"{{{PKG_REL_NS}}}Relationship")
+               if item.attrib["Id"] == relationship_id
+           )
+           part = target.lstrip("/") if target.startswith("/") else posixpath.normpath(
+               posixpath.join("xl", target)
+           )
+           cached = set()
+           coordinate = cell_type = value_text = None
+           has_formula = value_seen = False
+           with archive.open(part) as source:
+               for event, element in ET.iterparse(source, events=("start", "end")):
+                   if event == "start" and element.tag == f"{{{MAIN_NS}}}c":
+                       coordinate = element.attrib["r"]
+                       cell_type = element.attrib.get("t")
+                       has_formula = value_seen = False
+                       value_text = None
+                   elif event == "end" and coordinate is not None:
+                       if element.tag == f"{{{MAIN_NS}}}f":
+                           has_formula = True
+                       elif element.tag == f"{{{MAIN_NS}}}v":
+                           value_seen = True
+                           value_text = element.text
+                       elif element.tag == f"{{{MAIN_NS}}}c":
+                           valid_cache = value_seen and (
+                               value_text not in (None, "") or cell_type == "str"
+                           )
+                           if has_formula and valid_cache:
+                               cached.add(coordinate)
+                           coordinate = None
+                       element.clear()
+                   elif event == "end":
+                       element.clear()
+       return cached
 
    def sheet_ref(sheet):
        # Always quote: valid titles such as Q1-Data are ambiguous when left bare.
@@ -100,15 +152,37 @@ one you took:
        return f"'{escaped}'!"
 
    src = sheet_ref(ws)                              # e.g. "'Sales'!" or "'Raw Data'!"
+   source_path = "input.xlsx"  # the same original path used to load formula-preserving `wb`
+   cached_region_formulas = cached_formula_coordinates_for_sheet(source_path, ws.title)
+   value_wb = openpyxl.load_workbook(source_path, read_only=True, data_only=True)
+   value_ws = value_wb[ws.title]
+   value_ws.reset_dimensions()
    regions = []
    seen_region_keys = set()
-   for (region,) in ws.iter_rows(min_row=2, min_col=1, max_col=1, values_only=True):
+   missing_region_caches = []
+   source_rows = ws.iter_rows(min_row=2, min_col=1, max_col=1)
+   value_rows = value_ws.iter_rows(min_row=2, min_col=1, max_col=1)
+   for source_row, value_row in zip(source_rows, value_rows):
+       source_cell, value_cell = source_row[0], value_row[0]
+       region = value_cell.value if source_cell.data_type == "f" else source_cell.value
+       if (source_cell.data_type == "f" and region is None
+               and source_cell.coordinate not in cached_region_formulas):
+           missing_region_caches.append(source_cell.coordinate)
+           continue
        if region is None or region == "":             # keep valid falsey values: 0 and False
            continue
        key = (type(region), region)                    # do not collapse False and numeric 0
        if key not in seen_region_keys:
            seen_region_keys.add(key)
            regions.append(region)                     # stable source order; no mixed-type sort
+   value_wb.close()
+   if missing_region_caches:
+       raise RuntimeError(
+           f"aggregation keys have no cached value: {missing_region_caches}"
+       )
+
+   ws2 = wb.create_sheet("ByRegion")
+   ws2.append(["Region", "Units", "Revenue"])
    for i, region in enumerate(regions, start=2):
        ws2.cell(row=i, column=1, value=region)
        ws2.cell(row=i, column=2, value=f"=SUMIF({src}A:A,A{i},{src}C:C)")

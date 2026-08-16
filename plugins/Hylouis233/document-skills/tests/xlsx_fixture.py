@@ -9,6 +9,7 @@ import base64
 import csv
 import sys
 import zipfile
+from pathlib import Path
 from tempfile import TemporaryFile
 
 import openpyxl
@@ -68,6 +69,13 @@ def spreadsheet_csv_field(value, *, mode="safe"):
     return value
 
 
+def delimiter_for(path):
+    delimiter = {".csv": ",", ".tsv": "\t"}.get(Path(path).suffix.lower())
+    if delimiter is None:
+        raise ValueError("output must use a .csv or .tsv extension")
+    return delimiter
+
+
 formula_like_fields = ["=1+1", "+SUM(A1:A2)", "-2+3", "@cmd", "plain", "-7", -7]
 with open("spreadsheet-safe.csv", "w", newline="", encoding="utf-8") as output:
     csv.writer(output).writerow([spreadsheet_csv_field(value) for value in formula_like_fields])
@@ -86,6 +94,21 @@ try:
 except ValueError:
     invalid_csv_mode_rejected = True
 check("CSV export rejects an ambiguous safety mode", invalid_csv_mode_rejected)
+
+tabular_rows = [["Region", "Units", "Note"], ["EU, West", 120, "contains\ttab"]]
+with open("spreadsheet-safe.TSV", "w", newline="", encoding="utf-8") as output:
+    csv.writer(output, delimiter=delimiter_for("spreadsheet-safe.TSV")).writerows(tabular_rows)
+with open("spreadsheet-safe.TSV", newline="", encoding="utf-8") as exported:
+    tsv_rows = list(csv.reader(exported, delimiter="\t"))
+check("TSV export selects a tab delimiter case-insensitively",
+      tsv_rows == [[str(value) for value in row] for row in tabular_rows], tsv_rows)
+check("CSV export retains its comma delimiter", delimiter_for("output.csv") == ",")
+try:
+    delimiter_for("output.txt")
+    unknown_tabular_suffix_rejected = False
+except ValueError:
+    unknown_tabular_suffix_rejected = True
+check("tabular export rejects an unknown extension", unknown_tabular_suffix_rejected)
 
 # ---- edit.md snippet: round_trip_changes detects dropped parts AND stripped extensions ----
 from collections import Counter
@@ -632,8 +655,6 @@ check("task-specific number format mapping is verified", format_matches)
 
 # ---- read.md snippet: multi-sheet profiles cover every sheet ----------------------
 import posixpath
-from pathlib import Path
-
 from openpyxl.worksheet.formula import ArrayFormula, DataTableFormula
 
 MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
@@ -860,6 +881,120 @@ check("XML cache inventory accepts nonempty and typed empty-string caches",
 check("XML cache inventory rejects bare empty <v/> and an absent cache",
       bare_empty_cells == truly_missing_cells == set(),
       (bare_empty_cells, truly_missing_cells))
+
+
+def profile_missing_formula_caches(source_path):
+    with zipfile.ZipFile(source_path) as archive:
+        cached_cells = cached_formula_coordinates(archive, worksheet_part(archive, "Data"))
+    formula_book = openpyxl.load_workbook(source_path, read_only=True, data_only=False)
+    value_book = openpyxl.load_workbook(source_path, read_only=True, data_only=True)
+    formula_sheet, value_sheet = formula_book["Data"], value_book["Data"]
+    formula_sheet.reset_dimensions()
+    value_sheet.reset_dimensions()
+    missing = [
+        formula_cell.coordinate
+        for formula_row, value_row in zip(formula_sheet.iter_rows(), value_sheet.iter_rows())
+        for formula_cell, value_cell in zip(formula_row, value_row)
+        if (formula_cell.data_type == "f" and value_cell.value is None
+            and formula_cell.coordinate not in cached_cells)
+    ]
+    formula_book.close()
+    value_book.close()
+    return missing
+
+
+check("workbook profiling accepts nonempty and typed blank formula caches",
+      profile_missing_formula_caches("cached-value.xlsx") == []
+      and profile_missing_formula_caches("cached-empty.xlsx") == [])
+check("workbook profiling reports absent and untyped empty formula caches",
+      profile_missing_formula_caches("missing-cache.xlsx") == ["A1"]
+      and profile_missing_formula_caches("bare-empty-cache.xlsx") == ["A1"])
+
+
+def write_region_key_fixture(path, cache_kind):
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = "Data"
+    sheet.append(["Region", "Units", "Revenue", "Source Region"])
+    sheet.append(["=D2", 2, 4, "EU"])
+    workbook.save(path)
+    with zipfile.ZipFile(path) as archive:
+        members = {name: archive.read(name) for name in archive.namelist()}
+    root = ET.fromstring(members["xl/worksheets/sheet1.xml"])
+    cell = next(item for item in root.iter(CELL_TAG) if item.attrib["r"] == "A2")
+    value = cell.find(VALUE_TAG)
+    if cache_kind == "nonempty":
+        cell.set("t", "str")
+        if value is None:
+            value = ET.SubElement(cell, VALUE_TAG)
+        value.text = "EU"
+    elif cache_kind == "empty-string":
+        cell.set("t", "str")
+        if value is None:
+            value = ET.SubElement(cell, VALUE_TAG)
+        value.text = None
+    elif cache_kind == "absent":
+        cell.attrib.pop("t", None)
+        if value is not None:
+            cell.remove(value)
+    else:
+        raise ValueError(cache_kind)
+    members["xl/worksheets/sheet1.xml"] = ET.tostring(
+        root, encoding="utf-8", xml_declaration=True,
+    )
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name, data in members.items():
+            archive.writestr(name, data)
+
+
+def aggregation_regions(source_path):
+    formula_book = openpyxl.load_workbook(source_path, data_only=False)
+    source_sheet = formula_book["Data"]
+    with zipfile.ZipFile(source_path) as archive:
+        cached_cells = cached_formula_coordinates(archive, worksheet_part(archive, "Data"))
+    value_book = openpyxl.load_workbook(source_path, read_only=True, data_only=True)
+    value_sheet = value_book["Data"]
+    value_sheet.reset_dimensions()
+    regions = []
+    missing = []
+    for source_row, value_row in zip(
+        source_sheet.iter_rows(min_row=2, min_col=1, max_col=1),
+        value_sheet.iter_rows(min_row=2, min_col=1, max_col=1),
+    ):
+        source_cell, value_cell = source_row[0], value_row[0]
+        region = value_cell.value if source_cell.data_type == "f" else source_cell.value
+        if (source_cell.data_type == "f" and region is None
+                and source_cell.coordinate not in cached_cells):
+            missing.append(source_cell.coordinate)
+            continue
+        if region is not None and region != "":
+            regions.append(region)
+    value_book.close()
+    formula_book.close()
+    if missing:
+        raise RuntimeError(f"aggregation keys have no cached value: {missing}")
+    return regions
+
+
+write_region_key_fixture("region-key-cached.xlsx", "nonempty")
+write_region_key_fixture("region-key-empty.xlsx", "empty-string")
+write_region_key_fixture("region-key-missing.xlsx", "absent")
+cached_regions = aggregation_regions("region-key-cached.xlsx")
+aggregate_book = openpyxl.Workbook()
+aggregate_book.active["A1"] = cached_regions[0]
+check("formula-backed aggregation key is copied from its cached displayed value",
+      aggregate_book.active["A1"].value == "EU"
+      and aggregate_book.active["A1"].data_type != "f")
+check("typed cached blank aggregation keys are skipped",
+      aggregation_regions("region-key-empty.xlsx") == [])
+try:
+    aggregation_regions("region-key-missing.xlsx")
+    missing_region_cache_rejected = False
+except RuntimeError as error:
+    missing_region_cache_rejected = "A2" in str(error)
+check("aggregation fails closed when a formula key has no cached value",
+      missing_region_cache_rejected)
+
 export_formula_values("cached-value.xlsx", "cached-value.csv")
 with open("cached-value.csv", newline="", encoding="utf-8") as exported:
     cached_value_rows = list(csv.reader(exported))
@@ -1039,6 +1174,8 @@ def discover_dimension(worksheet):
     min_row = min_column = max_row = max_column = None
     for row in worksheet.iter_rows():
         for cell in row:
+            if getattr(cell, "value", None) is None and getattr(cell, "data_type", None) != "f":
+                continue
             row_index = getattr(cell, "row", None)
             column_index = getattr(cell, "column", None)
             if row_index is None or column_index is None:
@@ -1066,10 +1203,11 @@ discovered_formula_dimension, discovered_formula_first_row = discover_dimension(
 streamed_after_reset = [row for row in dim_ws_ro.iter_rows(values_only=True)]
 dim_value.close()
 dim_formula.close()
-check("dimension scan recovers plausible row/column truncation in both workbook views",
-      discovered_value_dimension == "A1:C4"
-      and discovered_formula_dimension == "A1:C4"
-      and discovered_value_first_row == discovered_formula_first_row == 1,
+check("formula-preserving dimension scan retains uncached formulas in the logical range",
+      discovered_formula_dimension == "A1:C4"
+      and discovered_formula_first_row == 1
+      and discovered_value_dimension == "A1:B3"
+      and discovered_value_first_row == 1,
       ((discovered_value_dimension, discovered_value_first_row),
        (discovered_formula_dimension, discovered_formula_first_row)))
 check("reset_dimensions restores the real extent",
@@ -1101,6 +1239,8 @@ offset_wb = openpyxl.Workbook()
 offset_ws = offset_wb.active
 offset_ws["A7"], offset_ws["B7"] = "Region", "Units"
 offset_ws["A8"], offset_ws["B8"] = "EU", 120
+offset_ws["A2"].number_format = "0.00"  # styled but empty: not part of the data range
+offset_ws["C8"] = "=SUM(B8)"            # uncached formula: remains part of the range
 offset_wb.save("leading-blank-rows.xlsx")
 offset_formula_wb = openpyxl.load_workbook(
     "leading-blank-rows.xlsx", read_only=True, data_only=False,
@@ -1109,17 +1249,15 @@ offset_value_wb = openpyxl.load_workbook(
     "leading-blank-rows.xlsx", read_only=True, data_only=True,
 )
 offset_formula_extent, offset_formula_first = discover_dimension(offset_formula_wb.active)
-offset_value_extent, offset_value_first = discover_dimension(offset_value_wb.active)
+offset_value_wb.active.reset_dimensions()
 offset_rows = offset_value_wb.active.iter_rows(
-    min_row=offset_value_first, values_only=True,
+    min_row=offset_formula_first, values_only=True,
 )
 offset_header = next(offset_rows, None)
 offset_sample = next(offset_rows, None)
-check("dimension discovery retains the first populated row in both read-only views",
-      (offset_formula_extent, offset_formula_first) == ("A7:B8", 7)
-      and (offset_value_extent, offset_value_first) == ("A7:B8", 7),
-      ((offset_formula_extent, offset_formula_first),
-       (offset_value_extent, offset_value_first)))
+check("styled empty cells do not move the formula-preserving logical range",
+      (offset_formula_extent, offset_formula_first) == ("A7:C8", 7),
+      (offset_formula_extent, offset_formula_first))
 check("header sampling skips six leading blank rows",
       offset_header[:2] == ("Region", "Units")
       and offset_sample[:2] == ("EU", 120),

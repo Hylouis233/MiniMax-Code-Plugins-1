@@ -196,7 +196,7 @@ Encryption and forms:
       writer.write(f)
 
   check = PdfReader("filled.pdf")
-  value = str((check.get_fields() or {}).get("applicant_name", {}).get("/V", ""))
+  value = str((check.get_fields() or {}).get(field_name, {}).get("/V", ""))
   if value.strip("/") != "Ada Byron":
       raise ValueError(f"filled field did not round-trip: {value!r}")
   ```

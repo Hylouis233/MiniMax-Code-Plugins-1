@@ -61,6 +61,20 @@ def cached_numeric_points(source):
         if point.get("idx") is not None and (value := point.find(qn("c:v"))) is not None
     ]
 
+def cached_category_labels(plot):
+    """Return flattened labels, or None when a formula has no category cache."""
+    category_nodes = plot._element.xpath("./c:ser[1]/c:cat")
+    if not category_nodes:
+        return []
+    cache_payload = category_nodes[0].xpath(
+        "./c:strRef/c:strCache/c:ptCount | ./c:numRef/c:numCache/c:ptCount | "
+        "./c:multiLvlStrRef/c:multiLvlStrCache/c:ptCount | "
+        "./c:strLit/c:ptCount | ./c:numLit/c:ptCount"
+    )
+    if not cache_payload:
+        return None
+    return [[str(level) for level in label] for label in plot.categories.flattened_labels]
+
 def series_content(series):
     x_source = getattr(series._element, "xVal", None)
     if x_source is None:                    # category/value chart
@@ -137,11 +151,17 @@ for i, slide in enumerate(prs.slides):
         for plot in chart.plots:
             items = list(plot.series)
             has_xy_values = any(getattr(item._element, "xVal", None) is not None for item in items)
-            categories = [] if has_xy_values else [
-                [str(level) for level in label] for label in plot.categories.flattened_labels
-            ]
+            categories = [] if has_xy_values else cached_category_labels(plot)
             series = [series_content(item) for item in items]
-            plots.append({"kind": type(plot).__name__, "categories": categories, "series": series})
+            plots.append({
+                "kind": type(plot).__name__,
+                "categories": categories,
+                "category_cache_status": (
+                    "not-applicable" if has_xy_values else
+                    "unavailable" if categories is None else "available"
+                ),
+                "series": series,
+            })
         charts.append({
             "title": chart_title,
             "axis_titles": chart_axis_titles(chart),
@@ -281,6 +301,7 @@ prs = Presentation("deck.pptx")
 # multiple masters with different themes, so the first /ppt/theme/* part is not a safe default.
 theme_cache = {}
 DRAWINGML = {"a": "http://schemas.openxmlformats.org/drawingml/2006/main"}
+DIAGRAM_NS = "http://schemas.openxmlformats.org/drawingml/2006/diagram"
 
 def read_theme_role(root, role):
     node = root.find(f".//a:{role}Font", DRAWINGML)
@@ -423,11 +444,22 @@ def iter_text_frames(shapes):
                 for cell in row.cells:
                     yield cell.text_frame
 
+def unresolved_graphic_font_regions(shapes):
+    """Mark text systems whose full font cascade python-pptx does not expose."""
+    for shape in shapes:
+        if getattr(shape, "has_chart", False):
+            yield {"shape": shape.name, "kind": "chart"}
+        graphic_data = shape._element.find(".//" + qn("a:graphicData"))
+        if graphic_data is not None and graphic_data.get("uri") == DIAGRAM_NS:
+            yield {"shape": shape.name, "kind": "SmartArt"}
+
+unresolved_fonts = []
 for i, slide in enumerate(prs.slides):
     master_name, theme_fonts = theme_faces_for_slide(slide)
     print(i, "master:", master_name, "theme:", ascii(theme_fonts))
     title_shape = slide.shapes.title
-    for frame in iter_text_frames(iter_shapes(slide.shapes)):
+    shapes = list(iter_shapes(slide.shapes))
+    for frame in iter_text_frames(shapes):
         holder = getattr(frame, "_parent", None)  # the shape for ordinary frames
         for paragraph in frame.paragraphs:
             for run in paragraph.runs:
@@ -437,6 +469,14 @@ for i, slide in enumerate(prs.slides):
                 ) else "minor"
                 faces = font_candidates(run, paragraph, theme_fonts, role)
                 print(i, repr(run.text[:20]), "font candidates:", ascii(faces))
+    unresolved_fonts.extend(
+        {"slide": i + 1, **record} for record in unresolved_graphic_font_regions(shapes)
+    )
+if unresolved_fonts:
+    raise LookupError(
+        "font audit cannot verify chart/SmartArt text properties: "
+        f"{unresolved_fonts}; inspect those package parts or render with production fonts"
+    )
 ```
 
 `run.font.name` exposes only the Latin slot, so it must not short-circuit inspection of explicit
@@ -445,6 +485,9 @@ master inheritance chain; the output above remains a candidate list. Check match
 placeholders when the exact face matters. Han text needs the deck locale to distinguish Hans,
 Hant, Japanese, and Korean mappings; add other script ranges when the task uses them rather than
 claiming the Latin fallback is definitive.
+Chart titles, legends, tick labels, data labels, and SmartArt nodes use additional DrawingML
+font cascades across chart/diagram parts. The guard above deliberately fails closed until those
+parts are audited directly or the deck is rendered and inspected with the production fonts.
 
 ## Text-fit verification
 

@@ -33,6 +33,30 @@ def open_pdf(path, password=None):
     return reader
 
 
+def authenticate_for_extraction(document, password=None):
+    """Mirror extract.md: try the valid blank user password before requiring env input."""
+    if document.needs_pass and document.authenticate("") <= 0:
+        if not password or document.authenticate(password) <= 0:
+            raise RuntimeError("set PDF_PASSWORD to the correct password before extracting")
+
+
+class BlankPasswordDocument:
+    needs_pass = True
+
+    def __init__(self):
+        self.attempts = []
+
+    def authenticate(self, password):
+        self.attempts.append(password)
+        return 2 if password == "" else 0
+
+
+blank_password_stub = BlankPasswordDocument()
+authenticate_for_extraction(blank_password_stub)
+check("PDF extraction authenticates the blank password before requiring environment input",
+      blank_password_stub.attempts == [""], blank_password_stub.attempts)
+
+
 # ---- build a 2-page A4 PDF with one AcroForm text field on page 1 -------------
 c = canvas.Canvas("form.pdf", pagesize=A4)
 c.setFont("Helvetica", 16)
@@ -42,6 +66,22 @@ c.showPage()
 c.setFont("Helvetica", 16)
 c.drawString(72, 780, "Second page content")
 c.save()
+
+# Current PyMuPDF opens a permission-encrypted PDF with an empty user password directly
+# (`needs_pass == 0`). Keep this real-file proof in addition to the branch-order stub above.
+blank_user_writer = pypdf.PdfWriter()
+blank_user_writer.append(pypdf.PdfReader("form.pdf"))
+blank_user_writer.encrypt(user_password="", owner_password="fixture-owner")
+with open("blank-user-password.pdf", "wb") as output:
+    blank_user_writer.write(output)
+blank_user_doc = fitz.open("blank-user-password.pdf")
+authenticate_for_extraction(blank_user_doc)
+check("blank-user permission-encrypted PDF extracts without PDF_PASSWORD",
+      "Application form" in blank_user_doc[0].get_text(), blank_user_doc.needs_pass)
+blank_user_doc.close()
+
+check("ordinary ReportLab output is not a tagged PDF/UA document",
+      "/StructTreeRoot" not in pypdf.PdfReader("form.pdf").trailer["/Root"])
 
 # ---- SKILL.md postcheck snippet: width/height pairs from the 4-coordinate box --
 r = pypdf.PdfReader("form.pdf")
@@ -348,12 +388,18 @@ hierarchy_value = str(
     (PdfReader("hierarchical-form-filled.pdf").get_fields() or {})
     .get(hierarchical_field_name, {}).get("/V", "")
 )
+hierarchy_literal_value = str(
+    (PdfReader("hierarchical-form-filled.pdf").get_fields() or {})
+    .get("applicant_name", {}).get("/V", "")
+)
 check("qualified field lookup locates the hierarchical widget page",
       len(hierarchy_target_pages) == 1
       and hierarchy_target_pages[0] is hierarchy_fill_writer.pages[1],
       len(hierarchy_target_pages))
 check("hierarchical field value round-trips",
       hierarchy_value.strip("/") == "Ada Hierarchical", repr(hierarchy_value))
+check("literal applicant_name lookup is a proven false negative for a qualified field",
+      hierarchy_literal_value == "", repr(hierarchy_literal_value))
 
 # ---- transform.md merge imports outline navigation ----------------------------
 appendix_writer = PdfWriter()

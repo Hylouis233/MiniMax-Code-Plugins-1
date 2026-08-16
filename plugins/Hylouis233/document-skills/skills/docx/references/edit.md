@@ -122,36 +122,45 @@ For field codes, sectPr surgery, tracked changes, or parts python-docx does not 
 Rules that keep the archive valid:
 
 1. Operate on a **copy** of the file.
-2. Unzip preserving structure: `python -m zipfile -e input.docx work/` or use `zipfile` in
-   Python with `ZIP_DEFLATED` on repack.
+2. Extract into a **new empty temporary directory for every input**. Never reuse a fixed `work/`
+   directory: members absent from the next DOCX would remain there and be repacked as stale or
+   confidential content.
 3. Parse XML with `lxml`/`xml.etree` - never string replace. Text lives in `w:t` inside runs
    (`w:r`) inside paragraphs (`w:p`); a logical sentence can span several runs.
 4. Repack with `[Content_Types].xml` first and stored/deflated entries only:
 
 ```python
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from zipfile import ZIP_DEFLATED, ZipFile
 
-src = Path("work")
-content_types = src / "[Content_Types].xml"
-if not content_types.is_file():
-    raise FileNotFoundError(content_types)
+input_path = Path("input.docx")
+output_path = Path("output.docx").resolve()  # keep output outside the temporary tree
+with TemporaryDirectory(prefix="docx-edit-") as scratch:
+    src = Path(scratch)
+    with ZipFile(input_path) as archive:
+        archive.extractall(src)
 
-files = sorted(
-    (path for path in src.rglob("*") if path.is_file() and path != content_types),
-    key=lambda path: path.relative_to(src).as_posix(),
-)
+    # Apply the required XML edits under `src` here, using an XML parser.
+    content_types = src / "[Content_Types].xml"
+    if not content_types.is_file():
+        raise FileNotFoundError(content_types)
+    files = sorted(
+        (path for path in src.rglob("*") if path.is_file() and path != content_types),
+        key=lambda path: path.relative_to(src).as_posix(),
+    )
 
-with ZipFile(
-    "output.docx", "w", compression=ZIP_DEFLATED, strict_timestamps=False
-) as archive:
-    archive.write(content_types, "[Content_Types].xml")
-    for path in files:
-        archive.write(path, path.relative_to(src).as_posix())
+    with ZipFile(
+        output_path, "w", compression=ZIP_DEFLATED, strict_timestamps=False
+    ) as archive:
+        archive.write(content_types, "[Content_Types].xml")
+        for path in files:
+            archive.write(path, path.relative_to(src).as_posix())
 ```
 
-   This writes relative POSIX archive names, does not add directory entries, and excludes
-   `[Content_Types].xml` from the remaining files so it cannot be added twice.
+   The temporary directory is deleted after repacking. This writes relative POSIX archive names,
+   does not add directory entries, and excludes `[Content_Types].xml` from the remaining files so
+   it cannot be added twice.
 5. If you touched part names or added parts, update `[Content_Types].xml` and
    `word/_rels/document.xml.rels` consistently - a mismatch here is the classic silent corrupt.
 

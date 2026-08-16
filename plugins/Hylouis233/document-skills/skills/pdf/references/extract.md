@@ -5,7 +5,7 @@ import os
 import fitz  # pymupdf
 
 doc = fitz.open("input.pdf")
-if doc.needs_pass:
+if doc.needs_pass and doc.authenticate("") <= 0:
     password = os.environ.get("PDF_PASSWORD")
     if not password or not doc.authenticate(password):
         raise RuntimeError("set PDF_PASSWORD to the correct password before extracting")

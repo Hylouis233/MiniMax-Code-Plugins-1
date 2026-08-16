@@ -404,6 +404,20 @@ def cached_numeric_points(source):
     ]
 
 
+def cached_category_labels(plot):
+    category_nodes = plot._element.xpath("./c:ser[1]/c:cat")
+    if not category_nodes:
+        return []
+    cache_payload = category_nodes[0].xpath(
+        "./c:strRef/c:strCache/c:ptCount | ./c:numRef/c:numCache/c:ptCount | "
+        "./c:multiLvlStrRef/c:multiLvlStrCache/c:ptCount | "
+        "./c:strLit/c:ptCount | ./c:numLit/c:ptCount"
+    )
+    if not cache_payload:
+        return None
+    return [[str(level) for level in label] for label in plot.categories.flattened_labels]
+
+
 def series_content(series):
     x_source = getattr(series._element, "xVal", None)
     if x_source is None:
@@ -480,11 +494,17 @@ def extract_slide_content(slide):
         for plot in chart.plots:
             items = list(plot.series)
             has_xy_values = any(getattr(item._element, "xVal", None) is not None for item in items)
-            categories = [] if has_xy_values else [
-                [str(level) for level in label] for label in plot.categories.flattened_labels
-            ]
+            categories = [] if has_xy_values else cached_category_labels(plot)
             series = [series_content(item) for item in items]
-            plots.append({"kind": type(plot).__name__, "categories": categories, "series": series})
+            plots.append({
+                "kind": type(plot).__name__,
+                "categories": categories,
+                "category_cache_status": (
+                    "not-applicable" if has_xy_values else
+                    "unavailable" if categories is None else "available"
+                ),
+                "series": series,
+            })
         charts.append({
             "title": chart_title,
             "axis_titles": chart_axis_titles(chart),
@@ -585,6 +605,39 @@ check(
     category_inventory_series[1] == {"name": "Cached series", "values": [3.0, 4.0]},
     category_inventory_series,
 )
+
+category_labels_mutated = Presentation("category-cache-source.pptx")
+category_labels_chart = next(
+    shape.chart for shape in category_labels_mutated.slides[0].shapes if shape.has_chart
+)
+category_ref = category_labels_chart.plots[0]._element.xpath(
+    "./c:ser[1]/c:cat/c:strRef"
+)[0]
+category_formula_before = category_ref.find(qn("c:f")).text
+category_ref.remove(category_ref.find(qn("c:strCache")))
+category_labels_mutated.save("category-label-cacheless.pptx")
+category_labels_reopened = Presentation("category-label-cacheless.pptx")
+category_labels_chart = next(
+    shape.chart for shape in category_labels_reopened.slides[0].shapes if shape.has_chart
+)
+category_ref = category_labels_chart.plots[0]._element.xpath(
+    "./c:ser[1]/c:cat/c:strRef"
+)[0]
+with zipfile.ZipFile("category-label-cacheless.pptx") as category_archive:
+    category_workbook_remains = any(
+        name.startswith("ppt/embeddings/") for name in category_archive.namelist()
+    )
+category_labels_inventory = extract_slide_content(category_labels_reopened.slides[0])
+category_plot_inventory = category_labels_inventory["charts"][0]["plots"][0]
+check("cacheless categories retain their worksheet formula and embedded workbook",
+      category_ref.find(qn("c:f")).text == category_formula_before
+      and category_ref.find(qn("c:strCache")) is None
+      and category_workbook_remains)
+check("missing category cache is reported without aborting later chart inventory",
+      category_plot_inventory["categories"] is None
+      and category_plot_inventory["category_cache_status"] == "unavailable"
+      and category_plot_inventory["series"][1]["values"] == [3.0, 4.0],
+      category_plot_inventory)
 
 diagram_frame = etree.fromstring(f'''<p:graphicFrame
     xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
@@ -1334,11 +1387,43 @@ def iter_text_frames(shapes):
             for row in shape.table.rows:
                 for cell in row.cells:
                     yield cell.text_frame
+
+
+def unresolved_graphic_font_regions(shapes):
+    for shape in shapes:
+        if getattr(shape, "has_chart", False):
+            yield {"shape": shape.name, "kind": "chart"}
+        graphic_data = shape._element.find(".//" + qn("a:graphicData"))
+        if graphic_data is not None and graphic_data.get("uri") == DIAGRAM_NS:
+            yield {"shape": shape.name, "kind": "SmartArt"}
+
+
 frames = list(iter_text_frames(triage_reopened.slides[0].shapes))
 check("table-cell text frames are reached by the triage walker",
       any("\u8868\u683c\u6587\u672c" in f.text for f in frames), [f.text for f in frames])
 check("the table graphic frame itself has no text frame (negative control)",
       not triage_table_shape.has_text_frame)
+
+chart_shape_for_font_audit = next(
+    shape for shape in Presentation("input.pptx").slides[0].shapes if shape.has_chart
+)
+unresolved_graphics = list(unresolved_graphic_font_regions([
+    chart_shape_for_font_audit, diagram_shape, triage_table_shape,
+]))
+check("font triage marks both charts and SmartArt as unresolved regions",
+      {item["kind"] for item in unresolved_graphics} == {"chart", "SmartArt"},
+      unresolved_graphics)
+check("ordinary table graphic frames are not mislabeled as chart or SmartArt",
+      all(item["shape"] != triage_table_shape.name for item in unresolved_graphics),
+      unresolved_graphics)
+try:
+    if unresolved_graphics:
+        raise LookupError(f"unresolved chart/SmartArt fonts: {unresolved_graphics}")
+    graphic_font_audit_rejected = False
+except LookupError:
+    graphic_font_audit_rejected = True
+check("unresolved chart/SmartArt font regions fail closed under optimized Python",
+      graphic_font_audit_rejected)
 
 print("\n" + ("ALL PPTX FIXTURES PASSED" if not failures else f"{len(failures)} FAILURES: {failures}"))
 sys.exit(0 if not failures else 1)

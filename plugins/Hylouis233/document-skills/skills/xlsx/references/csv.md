@@ -35,6 +35,7 @@ with open("input.csv", newline="", encoding="utf-8-sig") as f:   # utf-8-sig str
 
 ```python
 import csv
+from pathlib import Path
 
 FORMULA_PREFIXES = ("=", "+", "-", "@")
 
@@ -45,8 +46,15 @@ def spreadsheet_csv_field(value, *, mode="safe"):
         return "'" + value
     return value
 
-with open("output.csv", "w", newline="", encoding="utf-8") as f:
-    writer = csv.writer(f)
+def delimiter_for(path):
+    delimiter = {".csv": ",", ".tsv": "\t"}.get(Path(path).suffix.lower())
+    if delimiter is None:
+        raise ValueError("output must use a .csv or .tsv extension")
+    return delimiter
+
+output_path = Path("output.csv")  # use .tsv when tab-separated output was requested
+with output_path.open("w", newline="", encoding="utf-8") as f:
+    writer = csv.writer(f, delimiter=delimiter_for(output_path))
     rows = [["Region", "Units", "Note"], ["EU", 120, "=2+2"]]
     writer.writerows([spreadsheet_csv_field(value) for value in row] for row in rows)
 ```
@@ -104,6 +112,12 @@ formula-injection protection**; do not present a raw export as safe to open in a
       if mode == "safe" and isinstance(value, str) and value.startswith(FORMULA_PREFIXES):
           return "'" + value
       return value
+
+  def delimiter_for(path):
+      delimiter = {".csv": ",", ".tsv": "\t"}.get(Path(path).suffix.lower())
+      if delimiter is None:
+          raise ValueError("output must use a .csv or .tsv extension")
+      return delimiter
 
   def worksheet_part(archive, sheet_name):
       workbook = ET.fromstring(archive.read("xl/workbook.xml"))
@@ -170,7 +184,7 @@ formula-injection protection**; do not present a raw export as safe to open in a
   output_path = Path("output.csv")
   temporary_path = output_path.with_suffix(output_path.suffix + ".tmp")
   with temporary_path.open("w", newline="", encoding="utf-8") as output:
-      writer = csv.writer(output)
+      writer = csv.writer(output, delimiter=delimiter_for(output_path))
       for formula_row, value_row in zip(formula_ws.iter_rows(), value_ws.iter_rows()):
           for formula_cell, value_cell in zip(formula_row, value_row):
               if (formula_cell.data_type == "f" and value_cell.value is None

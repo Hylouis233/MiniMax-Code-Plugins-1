@@ -131,7 +131,24 @@ section.left_margin, section.right_margin = Cm(2.8), Cm(2.6)
        if rpr is None:
            return None
        rfonts = rpr.find(qn("w:rFonts"))
-       return None if rfonts is None else rfonts.get(qn("w:" + slot))
+       if rfonts is None:
+           return None
+       theme_attribute = {
+           "ascii": "asciiTheme", "hAnsi": "hAnsiTheme",
+           "eastAsia": "eastAsiaTheme", "cs": "cstheme",
+       }[slot]
+       theme_token = rfonts.get(qn("w:" + theme_attribute))
+       if theme_token is not None:
+           # A direct theme declaration must not fall through to an inherited literal face.
+           # Resolve the document theme/fontScheme (including themeFontLang/script mapping)
+           # before auditing this run. Both a literal and theme attribute for one slot are
+           # ambiguous across consumers, so fail closed in that case too.
+           literal = rfonts.get(qn("w:" + slot))
+           raise LookupError(
+               f"unresolved direct {theme_attribute}={theme_token!r}"
+               + (f" alongside {slot}={literal!r}" if literal is not None else "")
+           )
+       return rfonts.get(qn("w:" + slot))
 
    def style_faces(style, slot):
        while style is not None:

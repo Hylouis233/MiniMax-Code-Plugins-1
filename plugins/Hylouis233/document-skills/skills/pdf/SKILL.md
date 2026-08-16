@@ -47,6 +47,12 @@ file is not.
 4. **Overflow is a defect**: content that spills past the last page or the margin must be
    detected in postcheck and fixed (shrink, paginate, or cut), never shipped.
 5. Write output to a new path; keep inputs untouched unless in-place was requested.
+6. **Accessibility claims require tagged output.** ReportLab does not produce a tagged PDF/UA
+   document, so do not describe ordinary ReportLab output as accessible or screen-reader-ready.
+   When PDF/UA or assistive-technology compatibility is required, use a toolchain that can create
+   and validate tags, reading order, structure roles, language, and alternative text. If that
+   toolchain is unavailable, stop and report the limitation; offer an accessible DOCX or HTML
+   deliverable instead of silently returning an untagged PDF.
 
 ## Step 3 - Postcheck (mandatory)
 
