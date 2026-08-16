@@ -631,7 +631,17 @@ format_matches = all(
 check("task-specific number format mapping is verified", format_matches)
 
 # ---- read.md snippet: multi-sheet profiles cover every sheet ----------------------
+import posixpath
+from pathlib import Path
+
 from openpyxl.worksheet.formula import ArrayFormula, DataTableFormula
+
+MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+DOC_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+PKG_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+CELL_TAG = f"{{{MAIN_NS}}}c"
+FORMULA_TAG = f"{{{MAIN_NS}}}f"
+VALUE_TAG = f"{{{MAIN_NS}}}v"
 
 wb_h = openpyxl.Workbook()
 wb_h.active.title = "First"
@@ -647,6 +657,22 @@ second["A1"] = "plain"
 second["A2"] = "=2+2"
 second["B1"] = DataTableFormula(ref="B1:B2", r1="C1")
 wb_h.save("multi.xlsx")
+# openpyxl writes an empty <v/> for uncached formulas. Remove those elements explicitly so
+# this fixture represents a truly absent cache rather than a cached displayed blank.
+with zipfile.ZipFile("multi.xlsx") as archive:
+    multi_members = {name: archive.read(name) for name in archive.namelist()}
+for name in [item for item in multi_members if item.startswith("xl/worksheets/")
+             and item.endswith(".xml")]:
+    root = ET.fromstring(multi_members[name])
+    for cell in root.iter(CELL_TAG):
+        if cell.find(FORMULA_TAG) is not None:
+            cached_value = cell.find(VALUE_TAG)
+            if cached_value is not None:
+                cell.remove(cached_value)
+    multi_members[name] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+with zipfile.ZipFile("multi.xlsx", "w", zipfile.ZIP_DEFLATED) as archive:
+    for name, data in multi_members.items():
+        archive.writestr(name, data)
 formula_wb = openpyxl.load_workbook("multi.xlsx", read_only=True, data_only=False)
 value_wb = openpyxl.load_workbook("multi.xlsx", read_only=True, data_only=True)
 profiled = list(value_wb.sheetnames)
@@ -666,6 +692,58 @@ formula_wb.close()
 value_wb.close()
 
 # csv.md: value export uses the cached-value workbook and reports every missing cache.
+def worksheet_part(archive, sheet_name):
+    workbook = ET.fromstring(archive.read("xl/workbook.xml"))
+    sheet = next(
+        item for item in workbook.iter(f"{{{MAIN_NS}}}sheet")
+        if item.attrib["name"] == sheet_name
+    )
+    relationship_id = sheet.attrib[f"{{{DOC_REL_NS}}}id"]
+    relationships = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+    target = next(
+        item.attrib["Target"] for item in relationships.iter(f"{{{PKG_REL_NS}}}Relationship")
+        if item.attrib["Id"] == relationship_id
+    )
+    if target.startswith("/"):
+        return target.lstrip("/")
+    return posixpath.normpath(posixpath.join("xl", target))
+
+
+def cached_formula_coordinates(archive, part):
+    cached = set()
+    coordinate = None
+    cell_type = None
+    has_formula = value_seen = False
+    value_text = None
+    with archive.open(part) as source:
+        for event, element in ET.iterparse(source, events=("start", "end")):
+            if event == "start" and element.tag == CELL_TAG:
+                coordinate = element.attrib["r"]
+                cell_type = element.attrib.get("t")
+                has_formula = value_seen = False
+                value_text = None
+            elif event == "end" and coordinate is not None:
+                if element.tag == FORMULA_TAG:
+                    has_formula = True
+                elif element.tag == VALUE_TAG:
+                    value_seen = True
+                    value_text = element.text
+                elif element.tag == CELL_TAG:
+                    valid_cache = value_seen and (
+                        value_text not in (None, "") or cell_type == "str"
+                    )
+                    if has_formula and valid_cache:
+                        cached.add(coordinate)
+                    coordinate = None
+                element.clear()
+            elif event == "end":
+                element.clear()
+    return cached
+
+
+with zipfile.ZipFile("multi.xlsx") as archive:
+    multi_part = worksheet_part(archive, "First")
+    cached_formula_cells = cached_formula_coordinates(archive, multi_part)
 formula_wb = openpyxl.load_workbook("multi.xlsx", read_only=True, data_only=False)
 value_wb = openpyxl.load_workbook("multi.xlsx", read_only=True, data_only=True)
 formula_ws, value_ws = formula_wb["First"], value_wb["First"]
@@ -677,7 +755,8 @@ with open("formula-values.csv", "w", newline="", encoding="utf-8") as output:
     writer = csv.writer(output)
     for formula_row, value_row in zip(formula_ws.iter_rows(), value_ws.iter_rows()):
         for formula_cell, value_cell in zip(formula_row, value_row):
-            if formula_cell.data_type == "f" and value_cell.value is None:
+            if (formula_cell.data_type == "f" and value_cell.value is None
+                    and formula_cell.coordinate not in cached_formula_cells):
                 missing_caches.append(formula_cell.coordinate)
         writer.writerow([
             spreadsheet_csv_field(cell.value, mode=export_mode) for cell in value_row
@@ -692,6 +771,126 @@ check("XLSX-to-CSV safe mode neutralizes cached literal text for spreadsheet con
       exported_values)
 formula_wb.close()
 value_wb.close()
+
+
+def write_formula_cache_fixture(path, cache_kind):
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = "Data"
+    sheet["A1"] = ('=IF(TRUE,"","x")' if cache_kind == "empty-string" else "=1+1")
+    workbook.save(path)
+    with zipfile.ZipFile(path) as archive:
+        members = {name: archive.read(name) for name in archive.namelist()}
+    root = ET.fromstring(members["xl/worksheets/sheet1.xml"])
+    cell = next(item for item in root.iter(CELL_TAG) if item.attrib["r"] == "A1")
+    cached_value = cell.find(VALUE_TAG)
+    if cache_kind == "nonempty":
+        cell.attrib.pop("t", None)
+        if cached_value is None:
+            cached_value = ET.SubElement(cell, VALUE_TAG)
+        cached_value.text = "2"
+    elif cache_kind == "empty-string":
+        cell.set("t", "str")
+        if cached_value is None:
+            cached_value = ET.SubElement(cell, VALUE_TAG)
+        cached_value.text = None
+    elif cache_kind == "bare-empty":
+        cell.attrib.pop("t", None)
+        if cached_value is None:
+            cached_value = ET.SubElement(cell, VALUE_TAG)
+        cached_value.text = None
+    elif cache_kind == "absent":
+        cell.attrib.pop("t", None)
+        if cached_value is not None:
+            cell.remove(cached_value)
+    else:
+        raise ValueError(cache_kind)
+    members["xl/worksheets/sheet1.xml"] = ET.tostring(
+        root, encoding="utf-8", xml_declaration=True,
+    )
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name, data in members.items():
+            archive.writestr(name, data)
+
+
+def export_formula_values(source_path, output_path):
+    sheet_name = "Data"
+    with zipfile.ZipFile(source_path) as archive:
+        part = worksheet_part(archive, sheet_name)
+        cached_cells = cached_formula_coordinates(archive, part)
+    formula_book = openpyxl.load_workbook(source_path, read_only=True, data_only=False)
+    value_book = openpyxl.load_workbook(source_path, read_only=True, data_only=True)
+    formula_sheet, value_sheet = formula_book[sheet_name], value_book[sheet_name]
+    formula_sheet.reset_dimensions()
+    value_sheet.reset_dimensions()
+    missing = []
+    destination = Path(output_path)
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    with temporary.open("w", newline="", encoding="utf-8") as output:
+        writer = csv.writer(output)
+        for formula_row, value_row in zip(formula_sheet.iter_rows(), value_sheet.iter_rows()):
+            for formula_cell, value_cell in zip(formula_row, value_row):
+                if (formula_cell.data_type == "f" and value_cell.value is None
+                        and formula_cell.coordinate not in cached_cells):
+                    missing.append(formula_cell.coordinate)
+            writer.writerow([spreadsheet_csv_field(cell.value) for cell in value_row])
+    formula_book.close()
+    value_book.close()
+    if missing:
+        temporary.unlink(missing_ok=True)
+        raise RuntimeError(f"formula cells have no cached value: {missing}")
+    temporary.replace(destination)
+
+
+write_formula_cache_fixture("cached-value.xlsx", "nonempty")
+write_formula_cache_fixture("cached-empty.xlsx", "empty-string")
+write_formula_cache_fixture("bare-empty-cache.xlsx", "bare-empty")
+write_formula_cache_fixture("missing-cache.xlsx", "absent")
+with zipfile.ZipFile("cached-value.xlsx") as archive:
+    cached_value_cells = cached_formula_coordinates(archive, worksheet_part(archive, "Data"))
+with zipfile.ZipFile("cached-empty.xlsx") as archive:
+    cached_empty_cells = cached_formula_coordinates(archive, worksheet_part(archive, "Data"))
+with zipfile.ZipFile("bare-empty-cache.xlsx") as archive:
+    bare_empty_cells = cached_formula_coordinates(archive, worksheet_part(archive, "Data"))
+with zipfile.ZipFile("missing-cache.xlsx") as archive:
+    truly_missing_cells = cached_formula_coordinates(archive, worksheet_part(archive, "Data"))
+check("XML cache inventory accepts nonempty and typed empty-string caches",
+      cached_value_cells == cached_empty_cells == {"A1"},
+      (cached_value_cells, cached_empty_cells))
+check("XML cache inventory rejects bare empty <v/> and an absent cache",
+      bare_empty_cells == truly_missing_cells == set(),
+      (bare_empty_cells, truly_missing_cells))
+export_formula_values("cached-value.xlsx", "cached-value.csv")
+with open("cached-value.csv", newline="", encoding="utf-8") as exported:
+    cached_value_rows = list(csv.reader(exported))
+check("nonempty cached formula result exports its displayed value",
+      cached_value_rows == [["2"]], cached_value_rows)
+export_formula_values("cached-empty.xlsx", "cached-empty.csv")
+with open("cached-empty.csv", newline="", encoding="utf-8") as exported:
+    cached_empty_rows = list(csv.reader(exported))
+check("cached empty-string formula result exports as a displayed blank",
+      cached_empty_rows == [[""]], cached_empty_rows)
+Path("missing-cache.csv").write_text("sentinel\n", encoding="utf-8")
+try:
+    export_formula_values("missing-cache.xlsx", "missing-cache.csv")
+    missing_cache_rejected = False
+except RuntimeError as error:
+    missing_cache_rejected = "A1" in str(error)
+check("formula with no XML cache element is rejected", missing_cache_rejected)
+check("failed cache audit preserves the prior destination and removes its temporary file",
+      Path("missing-cache.csv").read_text(encoding="utf-8") == "sentinel\n"
+      and not Path("missing-cache.csv.tmp").exists())
+Path("bare-empty-cache.csv").write_text("sentinel\n", encoding="utf-8")
+try:
+    export_formula_values("bare-empty-cache.xlsx", "bare-empty-cache.csv")
+    bare_empty_rejected = False
+except RuntimeError as error:
+    bare_empty_rejected = "A1" in str(error)
+check("untyped bare empty <v/> from an uncalculated formula is rejected",
+      bare_empty_rejected)
+check("bare-empty rejection preserves destination and removes temporary output",
+      Path("bare-empty-cache.csv").read_text(encoding="utf-8") == "sentinel\n"
+      and not Path("bare-empty-cache.csv.tmp").exists())
 
 # SKILL.md contract: fullCalcOnLoad makes viewers recalculate even in manual calc mode.
 calc_wb = openpyxl.Workbook()
@@ -849,9 +1048,10 @@ def discover_dimension(worksheet):
             max_row = row_index if max_row is None else max(max_row, row_index)
             max_column = column_index if max_column is None else max(max_column, column_index)
     if max_row is None:
-        return "A1:A1"
-    return (f"{get_column_letter(min_column)}{min_row}:"
-            f"{get_column_letter(max_column)}{max_row}")
+        return "A1:A1", None
+    extent = (f"{get_column_letter(min_column)}{min_row}:"
+              f"{get_column_letter(max_column)}{max_row}")
+    return extent, min_row
 
 
 dim_value = openpyxl.load_workbook("dimension.xlsx", read_only=True, data_only=True)
@@ -861,15 +1061,17 @@ check("plausible but truncated dimension limits streaming (negative control)",
       dim_ws_ro.calculate_dimension() == "A1:B2" and dim_ws_ro.max_row == 2,
       (dim_ws_ro.calculate_dimension(), dim_ws_ro.max_row))
 streamed_before_reset = [row for row in dim_ws_ro.iter_rows(values_only=True)]
-discovered_value_dimension = discover_dimension(dim_ws_ro)
-discovered_formula_dimension = discover_dimension(dim_formula.active)
+discovered_value_dimension, discovered_value_first_row = discover_dimension(dim_ws_ro)
+discovered_formula_dimension, discovered_formula_first_row = discover_dimension(dim_formula.active)
 streamed_after_reset = [row for row in dim_ws_ro.iter_rows(values_only=True)]
 dim_value.close()
 dim_formula.close()
 check("dimension scan recovers plausible row/column truncation in both workbook views",
       discovered_value_dimension == "A1:C4"
-      and discovered_formula_dimension == "A1:C4",
-      (discovered_value_dimension, discovered_formula_dimension))
+      and discovered_formula_dimension == "A1:C4"
+      and discovered_value_first_row == discovered_formula_first_row == 1,
+      ((discovered_value_dimension, discovered_value_first_row),
+       (discovered_formula_dimension, discovered_formula_first_row)))
 check("reset_dimensions restores the real extent",
       len(streamed_before_reset) == 2
       and len(streamed_after_reset) == 4
@@ -895,11 +1097,41 @@ check("CSV export resets both paired streams before iterating",
 csv_formula_wb.close()
 csv_value_wb.close()
 
+offset_wb = openpyxl.Workbook()
+offset_ws = offset_wb.active
+offset_ws["A7"], offset_ws["B7"] = "Region", "Units"
+offset_ws["A8"], offset_ws["B8"] = "EU", 120
+offset_wb.save("leading-blank-rows.xlsx")
+offset_formula_wb = openpyxl.load_workbook(
+    "leading-blank-rows.xlsx", read_only=True, data_only=False,
+)
+offset_value_wb = openpyxl.load_workbook(
+    "leading-blank-rows.xlsx", read_only=True, data_only=True,
+)
+offset_formula_extent, offset_formula_first = discover_dimension(offset_formula_wb.active)
+offset_value_extent, offset_value_first = discover_dimension(offset_value_wb.active)
+offset_rows = offset_value_wb.active.iter_rows(
+    min_row=offset_value_first, values_only=True,
+)
+offset_header = next(offset_rows, None)
+offset_sample = next(offset_rows, None)
+check("dimension discovery retains the first populated row in both read-only views",
+      (offset_formula_extent, offset_formula_first) == ("A7:B8", 7)
+      and (offset_value_extent, offset_value_first) == ("A7:B8", 7),
+      ((offset_formula_extent, offset_formula_first),
+       (offset_value_extent, offset_value_first)))
+check("header sampling skips six leading blank rows",
+      offset_header[:2] == ("Region", "Units")
+      and offset_sample[:2] == ("EU", 120),
+      (offset_header, offset_sample))
+offset_formula_wb.close()
+offset_value_wb.close()
+
 empty_dimension_wb = openpyxl.Workbook()
 empty_dimension_wb.save("empty-dimension.xlsx")
 empty_dimension_ro = openpyxl.load_workbook("empty-dimension.xlsx", read_only=True)
 check("dimension scan handles an actually empty worksheet",
-      discover_dimension(empty_dimension_ro.active) == "A1:A1")
+      discover_dimension(empty_dimension_ro.active) == ("A1:A1", None))
 empty_dimension_ro.close()
 
 

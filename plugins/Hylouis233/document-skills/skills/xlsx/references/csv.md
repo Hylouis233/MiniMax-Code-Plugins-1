@@ -75,15 +75,28 @@ formula-injection protection**; do not present a raw export as safe to open in a
           cell.data_type = "s"  # openpyxl otherwise promotes it to an XLSX formula
   ```
 - XLSX -> CSV: use a separate `data_only=True` read so formulas export the cached values users
-  see, not formula strings. Pair it with a formula-preserving read and report missing caches;
-  cached values can also be stale until a spreadsheet application recalculates the workbook:
+  see, not formula strings. Pair it with a formula-preserving read and report missing caches.
+  `openpyxl` exposes both a missing cache and a present empty-string cache as `None`, so consult
+  the worksheet XML. A nonempty `<v>` is cached; an empty `<v/>` is a valid displayed blank only
+  when the formula cell explicitly has string-result type `t="str"`. A missing `<v>` or the bare
+  empty `<v/>` that openpyxl writes for an uncalculated formula must fail closed. Cached values
+  can still be stale until a spreadsheet application recalculates the workbook:
 
   ```python
   import csv
   import openpyxl
+  import posixpath
+  import zipfile
   from pathlib import Path
+  from xml.etree import ElementTree as ET
 
   FORMULA_PREFIXES = ("=", "+", "-", "@")
+  MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+  DOC_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+  PKG_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+  CELL_TAG = f"{{{MAIN_NS}}}c"
+  FORMULA_TAG = f"{{{MAIN_NS}}}f"
+  VALUE_TAG = f"{{{MAIN_NS}}}v"
 
   def spreadsheet_csv_field(value, *, mode="safe"):
       if mode not in {"safe", "raw"}:
@@ -92,10 +105,63 @@ formula-injection protection**; do not present a raw export as safe to open in a
           return "'" + value
       return value
 
+  def worksheet_part(archive, sheet_name):
+      workbook = ET.fromstring(archive.read("xl/workbook.xml"))
+      sheet = next(
+          item for item in workbook.iter(f"{{{MAIN_NS}}}sheet")
+          if item.attrib["name"] == sheet_name
+      )
+      relationship_id = sheet.attrib[f"{{{DOC_REL_NS}}}id"]
+      relationships = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+      target = next(
+          item.attrib["Target"] for item in relationships.iter(f"{{{PKG_REL_NS}}}Relationship")
+          if item.attrib["Id"] == relationship_id
+      )
+      if target.startswith("/"):
+          return target.lstrip("/")
+      return posixpath.normpath(posixpath.join("xl", target))
+
+  def cached_formula_coordinates(archive, part):
+      """Find formula cells with a nonempty cache or an explicitly typed empty-string cache."""
+      cached = set()
+      coordinate = None
+      cell_type = None
+      has_formula = value_seen = False
+      value_text = None
+      with archive.open(part) as source:
+          for event, element in ET.iterparse(source, events=("start", "end")):
+              if event == "start" and element.tag == CELL_TAG:
+                  coordinate = element.attrib["r"]
+                  cell_type = element.attrib.get("t")
+                  has_formula = value_seen = False
+                  value_text = None
+              elif event == "end" and coordinate is not None:
+                  if element.tag == FORMULA_TAG:
+                      has_formula = True
+                  elif element.tag == VALUE_TAG:
+                      value_seen = True
+                      value_text = element.text
+                  elif element.tag == CELL_TAG:
+                      valid_cache = value_seen and (
+                          value_text not in (None, "") or cell_type == "str"
+                      )
+                      if has_formula and valid_cache:
+                          cached.add(coordinate)
+                      coordinate = None
+                  element.clear()
+              elif event == "end":
+                  element.clear()
+      return cached
+
+  input_path = "input.xlsx"
+  sheet_name = "Data"
   export_mode = "safe"  # use "raw" only for explicitly requested trusted machine interchange
-  formula_wb = openpyxl.load_workbook("input.xlsx", read_only=True, data_only=False)
-  value_wb = openpyxl.load_workbook("input.xlsx", read_only=True, data_only=True)
-  formula_ws, value_ws = formula_wb["Data"], value_wb["Data"]
+  with zipfile.ZipFile(input_path) as archive:
+      part = worksheet_part(archive, sheet_name)
+      cached_formula_cells = cached_formula_coordinates(archive, part)
+  formula_wb = openpyxl.load_workbook(input_path, read_only=True, data_only=False)
+  value_wb = openpyxl.load_workbook(input_path, read_only=True, data_only=True)
+  formula_ws, value_ws = formula_wb[sheet_name], value_wb[sheet_name]
   # Producer-written <dimension> metadata can look plausible while truncating real cells.
   # Reset both paired streams before their first iter_rows() call.
   formula_ws.reset_dimensions()
@@ -107,7 +173,8 @@ formula-injection protection**; do not present a raw export as safe to open in a
       writer = csv.writer(output)
       for formula_row, value_row in zip(formula_ws.iter_rows(), value_ws.iter_rows()):
           for formula_cell, value_cell in zip(formula_row, value_row):
-              if formula_cell.data_type == "f" and value_cell.value is None:
+              if (formula_cell.data_type == "f" and value_cell.value is None
+                      and formula_cell.coordinate not in cached_formula_cells):
                   missing_caches.append(formula_cell.coordinate)
           writer.writerow([
               spreadsheet_csv_field(cell.value, mode=export_mode) for cell in value_row

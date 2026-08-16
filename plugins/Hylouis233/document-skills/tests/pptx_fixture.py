@@ -407,6 +407,9 @@ def cached_numeric_points(source):
 def series_content(series):
     x_source = getattr(series._element, "xVal", None)
     if x_source is None:
+        value_source = getattr(series._element, "val", None)
+        if cached_numeric_points(value_source) is None:
+            return {"name": series.name, "values": None, "cache_status": "unavailable"}
         return {"name": series.name, "values": list(series.values)}
     x_points = cached_numeric_points(x_source)
     y_points = cached_numeric_points(getattr(series._element, "yVal", None))
@@ -527,6 +530,61 @@ check("content inventory emits bubble x/y/size points",
       and chart_by_title["Bubble risk"]["plots"][0]["series"][0]["bubble_points"]
       == [(0, 5.0)])
 check("content inventory emits notes text", "regional split" in content["notes"], content["notes"])
+
+# Category/value series can retain an external workbook formula without a numCache.
+category_prs = Presentation()
+category_slide = category_prs.slides.add_slide(category_prs.slide_layouts[6])
+category_data = ChartData()
+category_data.categories = ["A", "B"]
+category_data.add_series("Missing cache", (1, 2))
+category_data.add_series("Cached series", (3, 4))
+category_slide.shapes.add_chart(
+    XL_CHART_TYPE.COLUMN_CLUSTERED,
+    Inches(0.5), Inches(0.5), Inches(6), Inches(4), category_data,
+)
+category_prs.save("category-cache-source.pptx")
+
+category_mutated = Presentation("category-cache-source.pptx")
+category_chart = next(
+    shape.chart for shape in category_mutated.slides[0].shapes if shape.has_chart
+)
+category_series = list(category_chart.plots[0].series)
+missing_value_ref = category_series[0]._element.val.find(qn("c:numRef"))
+missing_formula_before = missing_value_ref.find(qn("c:f")).text
+missing_value_ref.remove(missing_value_ref.find(qn("c:numCache")))
+category_mutated.save("category-cacheless.pptx")
+
+category_reopened = Presentation("category-cacheless.pptx")
+category_reopened_chart = next(
+    shape.chart for shape in category_reopened.slides[0].shapes if shape.has_chart
+)
+category_reopened_series = list(category_reopened_chart.plots[0].series)
+reopened_value_ref = category_reopened_series[0]._element.val.find(qn("c:numRef"))
+reopened_formula = reopened_value_ref.find(qn("c:f"))
+with zipfile.ZipFile("category-cacheless.pptx") as category_archive:
+    embedded_workbook_remains = any(
+        name.startswith("ppt/embeddings/") for name in category_archive.namelist()
+    )
+check(
+    "cacheless category series retains its formula and embedded workbook",
+    reopened_formula is not None
+    and reopened_formula.text == missing_formula_before
+    and reopened_value_ref.find(qn("c:numCache")) is None
+    and embedded_workbook_remains,
+)
+category_inventory = extract_slide_content(category_reopened.slides[0])
+category_inventory_series = category_inventory["charts"][0]["plots"][0]["series"]
+check(
+    "cacheless category series is unavailable without aborting inventory",
+    category_inventory_series[0]
+    == {"name": "Missing cache", "values": None, "cache_status": "unavailable"},
+    category_inventory_series,
+)
+check(
+    "cached category series still reports its values after a cacheless sibling",
+    category_inventory_series[1] == {"name": "Cached series", "values": [3.0, 4.0]},
+    category_inventory_series,
+)
 
 diagram_frame = etree.fromstring(f'''<p:graphicFrame
     xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"

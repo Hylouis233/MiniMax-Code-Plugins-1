@@ -62,12 +62,15 @@ for page in doc:
             pix = base
         pix.save(f"img-p{page_number}-{i}.png")
 
-    # Inline images live in the page content stream, not the XObject table, so
-    # get_images() never lists them. Enumerate image blocks from the dict pass
-    # and report both lists: the xref loop is authoritative for XObjects, the
-    # block pass catches inline placements.
+    # Type-1 blocks include both XObjects and inline images. An xref of zero
+    # identifies true inline content; positive xrefs were already exported by
+    # the XObject loop above and must not be written a second time.
+    image_xrefs = {
+        image["number"]: image["xref"]
+        for image in page.get_image_info(xrefs=True)
+    }
     for b in page.get_text("dict")["blocks"]:
-        if b["type"] != 1:
+        if b["type"] != 1 or image_xrefs.get(b["number"]) != 0:
             continue
         ext = b.get("ext") or "png"
         with open(f"img-p{page_number}-inline-{b['number']}.{ext}", "wb") as fh:

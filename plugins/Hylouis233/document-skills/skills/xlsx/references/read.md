@@ -35,11 +35,12 @@ def discover_dimension(worksheet):
             max_row = row_index if max_row is None else max(max_row, row_index)
             max_column = column_index if max_column is None else max(max_column, column_index)
     if max_row is None:
-        return "A1:A1"
-    return (
+        return "A1:A1", None
+    extent = (
         f"{get_column_letter(min_column)}{min_row}:"
         f"{get_column_letter(max_column)}{max_row}"
     )
+    return extent, min_row
 
 # Profile EVERY sheet by default; only narrow when the task names a specific sheet.
 for sheet_name in value_wb.sheetnames:
@@ -50,18 +51,23 @@ for sheet_name in value_wb.sheetnames:
     # example A1:B2 while data continues below it), so treat that metadata as
     # untrusted: reset both streams and discover the real bounds before reading.
     declared = value_ws.calculate_dimension()
-    discovered = discover_dimension(value_ws)
-    formula_discovered = discover_dimension(formula_ws)
-    if formula_discovered != discovered:
+    discovered, first_populated_row = discover_dimension(value_ws)
+    formula_discovered, formula_first_row = discover_dimension(formula_ws)
+    if (formula_discovered, formula_first_row) != (discovered, first_populated_row):
         raise ValueError(
-            f"formula/value stream dimensions disagree: {formula_discovered} != {discovered}"
+            "formula/value stream bounds disagree: "
+            f"{(formula_discovered, formula_first_row)} != "
+            f"{(discovered, first_populated_row)}"
         )
     if discovered != declared:
         print(f"--- {sheet_name} --- declared {declared!r}; discovered real extent:")
     print(f"--- {sheet_name} --- dims:", discovered)
 
-    rows = value_ws.iter_rows(values_only=True)
-    header = next(rows, None)
+    if first_populated_row is None:
+        rows, header = iter(()), None
+    else:
+        rows = value_ws.iter_rows(min_row=first_populated_row, values_only=True)
+        header = next(rows, None)
     print("header:", header)
     for i, row in enumerate(rows):
         if i >= 5: break
@@ -84,7 +90,8 @@ value_wb.close()
 
 - First pass always: sheet names, per-sheet dimensions, header row, 5 sample rows. Report
   those before any analysis. Multi-sheet workbooks report every sheet - a profile that
-  silently covers only `sheetnames[0]` is incomplete.
+  silently covers only `sheetnames[0]` is incomplete. Begin the header/sample iterator at the
+  discovered first populated row; leading blank rows are not a header.
 - `read_only=True` streams large files; you lose random access (`ws["B2"]` works but is slow
   in read_only mode - iterate instead).
 - `data_only=True` gives cached values. A file saved by a library (never opened in Excel)

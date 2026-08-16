@@ -64,6 +64,9 @@ def cached_numeric_points(source):
 def series_content(series):
     x_source = getattr(series._element, "xVal", None)
     if x_source is None:                    # category/value chart
+        value_source = getattr(series._element, "val", None)
+        if cached_numeric_points(value_source) is None:
+            return {"name": series.name, "values": None, "cache_status": "unavailable"}
         return {"name": series.name, "values": list(series.values)}
     x_points = cached_numeric_points(x_source)
     y_points = cached_numeric_points(getattr(series._element, "yVal", None))

@@ -56,6 +56,23 @@ check(
     page_sizes,
 )
 
+
+def verify_page_count(reader, expected_page_count):
+    page_count = len(reader.pages)
+    if page_count != expected_page_count:
+        raise ValueError(f"expected {expected_page_count} pages, got {page_count}")
+    return page_count
+
+
+check("postcheck accepts the requested page count", verify_page_count(r, 2) == 2)
+try:
+    verify_page_count(r, 1)
+    page_count_mismatch = ""
+except ValueError as exc:
+    page_count_mismatch = str(exc)
+check("postcheck rejects a page-count mismatch even under python -O",
+      page_count_mismatch == "expected 1 pages, got 2", page_count_mismatch)
+
 # ---- inspect.md distinguishes referenced-only and embedded fonts ---------------
 pdfmetrics.registerFont(TTFont("FixtureVera", os.path.join(
     os.path.dirname(reportlab.__file__), "fonts", "Vera.ttf",
@@ -479,6 +496,33 @@ form_only_is_blank = inspected_page_is_blank(form_only_page)
 check("form-only page exposes a widget", len(form_only_widgets) == 1)
 check("form-only page is not classified as blank", not form_only_is_blank)
 
+# Identical media/crop geometry remains consistent when one page has /Rotate 90.
+mixed_rotation_writer = PdfWriter()
+mixed_rotation_writer.append(PdfReader("form.pdf"))
+mixed_rotation_writer.pages[1].rotate(90)
+with open("inspect-mixed-rotation.pdf", "wb") as f:
+    mixed_rotation_writer.write(f)
+mixed_rotation_doc = fitz.open("inspect-mixed-rotation.pdf")
+mixed_media_sizes = {
+    (round(page.mediabox.width, 2), round(page.mediabox.height, 2))
+    for page in mixed_rotation_doc
+}
+mixed_crop_sizes = {
+    (round(page.cropbox.width, 2), round(page.cropbox.height, 2))
+    for page in mixed_rotation_doc
+}
+mixed_display_sizes = {
+    (round(page.rect.width, 2), round(page.rect.height, 2))
+    for page in mixed_rotation_doc
+}
+check("page.rect falsely reports mixed sizes for identical rotated media (negative control)",
+      len(mixed_display_sizes) == 2, mixed_display_sizes)
+check("unrotated media and crop sizes stay consistent across mixed rotation",
+      len(mixed_media_sizes) == 1 and len(mixed_crop_sizes) == 1,
+      (mixed_media_sizes, mixed_crop_sizes))
+check("inspection reports mixed rotation separately from paper size",
+      [page.rotation for page in mixed_rotation_doc] == [0, 90])
+
 # ReportLab's drawInlineImage emits BI/ID/EI content rather than an image XObject.
 inline_source = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 12, 12))
 inline_source.clear_with(96)
@@ -499,6 +543,55 @@ check("inline-only image appears as a type-1 text-dictionary block",
       len(inline_blocks) == 1, inline_blocks)
 check("inline-only image page is not classified as blank",
       not inspected_page_is_blank(inline_page))
+
+# The extraction XObject pass and inline pass are disjoint: type-1 blocks with
+# positive xrefs belong to the first pass, while true inline blocks have xref 0.
+xobject_canvas = canvas.Canvas("xobject-image.pdf", pagesize=A4)
+xobject_canvas.drawImage("inline-only-source.png", 72, 700, width=80, height=80)
+xobject_canvas.showPage()
+xobject_canvas.save()
+
+
+def extract_images_without_duplicates(document, page, prefix):
+    outputs = []
+    for i, info in enumerate(page.get_images(full=True), start=1):
+        pix = fitz.Pixmap(document, info[0])
+        output = f"{prefix}-{i}.png"
+        pix.save(output)
+        outputs.append(output)
+    image_xrefs = {
+        image["number"]: image["xref"]
+        for image in page.get_image_info(xrefs=True)
+    }
+    for block in page.get_text("dict")["blocks"]:
+        if block["type"] != 1 or image_xrefs.get(block["number"]) != 0:
+            continue
+        ext = block.get("ext") or "png"
+        output = f"{prefix}-inline-{block['number']}.{ext}"
+        with open(output, "wb") as fh:
+            fh.write(block["image"])
+        outputs.append(output)
+    return outputs
+
+
+xobject_doc = fitz.open("xobject-image.pdf")
+xobject_blocks = [
+    block for block in xobject_doc[0].get_text("dict")["blocks"]
+    if block["type"] == 1
+]
+xobject_info = xobject_doc[0].get_image_info(xrefs=True)
+xobject_outputs = extract_images_without_duplicates(xobject_doc, xobject_doc[0], "xobject-export")
+check("ordinary XObject image info exposes a positive xref",
+      len(xobject_blocks) == 1 and len(xobject_info) == 1
+      and xobject_info[0]["xref"] > 0,
+      xobject_info)
+check("ordinary XObject is exported once, not duplicated by the inline pass",
+      len(xobject_outputs) == 1 and "-inline-" not in xobject_outputs[0], xobject_outputs)
+inline_outputs = extract_images_without_duplicates(inline_doc, inline_page, "inline-export")
+check("true inline image is exported by the xref-zero second pass",
+      len(inline_outputs) == 1 and "-inline-" in inline_outputs[0]
+      and os.path.getsize(inline_outputs[0]) > 0,
+      inline_outputs)
 
 # ---- extract.md CMYK conversion snippet ---------------------------------------
 pix = fitz.Pixmap(fitz.csCMYK, fitz.IRect(0, 0, 24, 24))  # CMYK pixmap like a CMYK PDF image
@@ -829,8 +922,13 @@ def drawing_bounds(drawing):
     )
 
 
-def overflow_pages(path):
+def overflow_pages(path, password=None):
     doc = fitz.open(path)
+    if doc.needs_pass and doc.authenticate("") <= 0:
+        if not password:
+            raise RuntimeError(f"valid password required to overflow-check {path}")
+        if doc.authenticate(password) <= 0:
+            raise RuntimeError(f"password could not decrypt {path} for overflow checking")
     pages = []
     for page in doc:
         # Plain block extraction drops fully off-page text; enlarge the clip.
@@ -857,6 +955,8 @@ def overflow_pages(path):
     return pages
 
 check("in-bounds PDF reports no overflow pages", overflow_pages("overflow.pdf") == [])
+check("blank-user-password encrypted PDF passes the independent overflow check",
+      overflow_pages("blank-user-password.pdf") == [])
 check("off-page text is detected by the overflow check (negative control)",
       overflow_pages("overflow-bad.pdf") == [1])
 check("in-bounds image and vector drawing pass the overflow check",

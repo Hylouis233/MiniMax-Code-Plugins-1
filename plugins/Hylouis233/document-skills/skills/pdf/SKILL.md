@@ -55,6 +55,7 @@ import os
 import pypdf
 
 output_path = "output.pdf"
+expected_page_count = 1  # set this from the task; do not derive it from the output
 password = os.environ.get("PDF_PASSWORD")
 r = pypdf.PdfReader(output_path)
 if r.is_encrypted:
@@ -71,6 +72,10 @@ def require(condition, message):
         raise ValueError(message)
 
 page_count = len(r.pages)
+require(
+    page_count == expected_page_count,
+    f"expected {expected_page_count} pages, got {page_count}",
+)
 page_texts = {
     number: (page.extract_text() or "").strip()
     for number, page in enumerate(r.pages, start=1)
@@ -121,10 +126,11 @@ require(not size_mismatches, f"unexpected page sizes: {size_mismatches}")
 import fitz
 
 overflow_doc = fitz.open(output_path)
-if overflow_doc.needs_pass:
+if overflow_doc.needs_pass and overflow_doc.authenticate("") <= 0:
     if not password:
         raise RuntimeError("set PDF_PASSWORD so the encrypted output can be overflow-checked")
-    overflow_doc.authenticate(password)
+    if overflow_doc.authenticate(password) <= 0:
+        raise RuntimeError("PDF_PASSWORD could not decrypt the output for overflow checking")
 overflow_pages = []
 for page in overflow_doc:
     # These APIs report unrotated coordinates even when /Rotate is 90/270;

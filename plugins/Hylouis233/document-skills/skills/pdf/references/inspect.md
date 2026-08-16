@@ -37,7 +37,16 @@ def font_inventory(document, page):
 print("pages:", doc.page_count)
 print("password_protected:", doc.needs_pass,
       "| still_encrypted:", doc.is_encrypted, "| pdf:", doc.is_pdf)
+page_geometry = []
 for page in doc:
+    media_size = (round(page.mediabox.width, 2), round(page.mediabox.height, 2))
+    crop_size = (round(page.cropbox.width, 2), round(page.cropbox.height, 2))
+    page_geometry.append({
+        "page": page.number + 1,
+        "media_size": media_size,
+        "crop_size": crop_size,
+        "rotation": page.rotation,
+    })
     blocks = page.get_text("dict")["blocks"]
     image_blocks = [block for block in blocks if block["type"] == 1]
     drawings = page.get_drawings()
@@ -48,12 +57,15 @@ for page in doc:
         page.get_text().strip() or page.get_images() or image_blocks or drawings
         or widgets or annotations or links
     )
-    print(page.number, page.rect, "text_len:", len(page.get_text()),
+    print(page.number + 1, "media_size:", media_size, "crop_size:", crop_size,
+          "rotation:", page.rotation, "text_len:", len(page.get_text()),
           "resource_images:", len(page.get_images()),
           "image_blocks:", len(image_blocks), "drawings:", len(drawings),
           "widgets:", len(widgets), "annotations:", len(annotations),
           "links:", len(links), "blank:", is_blank)
     print("  fonts:", font_inventory(doc, page))
+print("media_size_consistent:", len({row["media_size"] for row in page_geometry}) <= 1)
+print("crop_size_consistent:", len({row["crop_size"] for row in page_geometry}) <= 1)
 ```
 
 ## Checks worth automating
@@ -67,10 +79,13 @@ for page in doc:
 - **Font inventory**: `page.get_fonts()` lists referenced fonts, including non-embedded base
   fonts. Use `doc.extract_font(xref)` as above and report `embedded` separately; a referenced
   face with no extractable program may be substituted on another machine.
-- **Page size consistency**: mixed `page.rect` sizes in one file break duplex printing; report
-  it rather than silently normalizing.
+- **Page size consistency**: compare unrotated `(width, height)` pairs from `page.mediabox` and
+  `page.cropbox`, and report `page.rotation` separately. Do not compare `page.rect`: it applies
+  `/Rotate`, so otherwise identical paper appears to swap width and height at 90 or 270 degrees.
+  Report genuinely mixed media or crop sizes rather than silently normalizing them.
 - **Damage**: `fitz.open` on a corrupt file raises or yields garbage - pair with
   `pypdf.PdfReader` cross-check when provenance is unknown.
 
-Report findings as a table (page, size, text chars, resource images, image blocks, drawings,
-widgets, annotations, links, blank) - it is what every downstream decision hangs off.
+Report findings as a table (page, media size, crop size, rotation, text chars, resource images,
+image blocks, drawings, widgets, annotations, links, blank) - it is what every downstream
+decision hangs off.
