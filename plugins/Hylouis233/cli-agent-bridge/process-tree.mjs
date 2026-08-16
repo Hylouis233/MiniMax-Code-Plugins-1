@@ -295,14 +295,17 @@ export async function signalProcessTree(child, signal, treeState, {
   const byPid = processes === null ? new Map() : new Map(processes.map((item) => [item.pid, item]));
   // Signal the process group only while it is still provably ours: the leader
   // must be alive, still lead the group, and match its recorded start identity.
-  // Otherwise the PGID may have been recycled onto an unrelated group.
+  // Otherwise the PGID may have been recycled onto an unrelated group. When
+  // enumeration itself is unavailable (restricted /proc, failing ps) identity
+  // cannot be verified either way, so containment wins: signal the group rather
+  // than leave a possibly-live worker running through both grace periods.
   const leader = byPid.get(child.pid);
   const leaderStart = treeState.knownStarts?.get(child.pid);
   const groupIsOriginal = Boolean(leader) &&
     leader.processGroupId === child.pid &&
     isLiveState(leader.state) &&
     (!leaderStart || !leader.startIdentity || leader.startIdentity === leaderStart);
-  if (groupIsOriginal) {
+  if (groupIsOriginal || processes === null) {
     try {
       killGroup(child.pid, signal);
     } catch (error) {

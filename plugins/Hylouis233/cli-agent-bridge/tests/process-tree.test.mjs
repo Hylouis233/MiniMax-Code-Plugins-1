@@ -148,3 +148,21 @@ test("windows tree inspection drops known PIDs whose creation identity changed",
   assert.ok(!treeState.knownPids.has(500), "the reused PID leaves the tracked set");
   assert.equal(treeState.knownStarts.get(500), "ticks-1", "the original identity is retained for comparison");
 });
+
+test("the group is still signaled when process enumeration is unavailable", async () => {
+  const child = { pid: 9200 };
+  const treeState = { knownPids: new Set([9200]), knownStarts: new Map() };
+  await refreshProcessTree(child, treeState, {
+    platform: "linux",
+    posixProcessSnapshot: async () => [{ pid: 9200, parentPid: 1, processGroupId: 9200, state: "S", startIdentity: "start-z" }],
+  });
+  const groupSignals = [];
+  await signalProcessTree(child, "SIGTERM", treeState, {
+    platform: "linux",
+    posixProcessSnapshot: async () => null,
+    killGroup: (pgid) => { groupSignals.push(pgid); },
+    killOne: () => {},
+  });
+  assert.deepEqual(groupSignals, [9200],
+    "containment wins when identity cannot be verified: the group is signaled");
+});

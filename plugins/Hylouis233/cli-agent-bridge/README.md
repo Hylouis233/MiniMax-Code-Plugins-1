@@ -182,11 +182,13 @@ node --test plugins/Hylouis233/cli-agent-bridge/tests/workspace-lock.test.mjs
 They cover the full MCP flow plus in-process and cross-process canonical worktree locking, stale
 owner compare-and-swap, live-owner non-steal, quarantined-lease recovery after the operator
 removes the marker, interruptible lease state updates, shared quarantine markers, queued and
-discovery-phase cancellation, overall deadlines, cancel/timeout process-tree termination, escaped
-POSIX descendants and zombie-only Linux groups, PID-reuse identity checks before signaling,
-unusual Git pathnames, JSON-RPC id typing, unborn HEAD and non-HEAD ref changes, checkout-only
-HEAD moves, non-commit refs, repository-concurrency disclosure between linked worktrees, capture
-truncation, and Codex prompt delimiters on Windows and POSIX.
+discovery-phase cancellation (including list_backends probes), overall deadlines, cancel/timeout
+process-tree termination, escaped POSIX descendants and zombie-only Linux groups, PID-reuse
+identity checks before signaling, unusual Git pathnames (including a trailing-space worktree
+root), JSON-RPC id typing, unborn HEAD and non-HEAD ref changes, checkout-only HEAD moves,
+single-count attribution for commits on the checked-out branch, fork-point diff baselines for
+new branches, non-commit refs, repository-concurrency disclosure between linked worktrees,
+capture truncation, and Codex prompt delimiters on Windows and POSIX.
 
 ## License
 

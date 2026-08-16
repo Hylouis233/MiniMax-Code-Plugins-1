@@ -821,6 +821,76 @@ test("parallel worktree delegations disclose repository concurrency", async (con
     "the slow delegation observed the overlapping worker in its after snapshot");
 });
 
+
+test("a commit on the checked-out branch is reported exactly once", async (context) => {
+  const { workspace, client } = await makeHarness(context);
+  const response = await client.request("tools/call", taskArguments(workspace, {
+    name: "current-commit", commitCurrent: true,
+    writeFile: "current.txt", commitMessage: "single worker commit",
+  }));
+  const out = response.result.structuredContent;
+  assert.equal(out.ok, true, JSON.stringify(out.error));
+  assert.ok(out.commits, "HEAD and its branch both moved; a commits block must exist");
+  assert.equal(out.commits.newCommitCount, 1,
+    "HEAD and refs/heads/main move across the same pair; count must not double");
+  assert.equal(out.commits.log.split("single worker commit").length - 1, 1,
+    out.commits.log);
+  assert.match(out.commits.log, /HEAD, refs\/heads\/main/u,
+    "the deduplicated target carries both labels");
+});
+
+test("a new branch forked from a divergent branch diffs only its own commits", async (context) => {
+  const { workspace, client } = await makeHarness(context);
+  await execFileAsync("git", ["checkout", "-b", "divergent"], { cwd: workspace });
+  await writeFile(path.join(workspace, "divergent.txt"), "pre-existing divergent file\n");
+  await execFileAsync("git", ["add", "divergent.txt"], { cwd: workspace });
+  await execFileAsync("git", ["commit", "-m", "divergent baseline commit"], { cwd: workspace });
+  await execFileAsync("git", ["checkout", "main"], { cwd: workspace });
+
+  const response = await client.request("tools/call", taskArguments(workspace, {
+    name: "fork-worker", newBranchFromExisting: true,
+    fromBranch: "divergent", branchName: "forked-work",
+    writeFile: "fork.txt", commitMessage: "forked worker commit",
+  }));
+  const out = response.result.structuredContent;
+  assert.equal(out.ok, true, JSON.stringify(out.error));
+  assert.match(out.commits.log, /forked worker commit/u);
+  assert.doesNotMatch(out.commits.log, /divergent baseline commit/u);
+  assert.doesNotMatch(out.commits.diffStat, /divergent\.txt/u,
+    "the diff base is the fork point, not the original HEAD");
+  assert.match(out.commits.diffStat, /fork\.txt/u);
+});
+
+test("list_backends can be cancelled while a version probe hangs", async (context) => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), "cli-agent-bridge-test-"));
+  context.after(async () => { await rm(tempRoot, { recursive: true, force: true }); });
+  const hangScript = path.join(tempRoot, "hang-version.mjs");
+  await writeFile(hangScript, "setTimeout(() => {}, 60_000);\n");
+  const configPath = path.join(tempRoot, "backends.json");
+  await writeFile(configPath, JSON.stringify({
+    backends: {
+      hang: {
+        label: "Hanging backend",
+        command: process.execPath,
+        buildArgs: [hangScript, "<task>"],
+        resumeArgs: null,
+        experimental: false,
+      },
+    },
+  }));
+  const client = new McpClient(configPath);
+  await client.initialize();
+  context.after(async () => { await client.close(); });
+  const started = Date.now();
+  const responsePromise = client.request("tools/call", { name: "list_backends", arguments: {} }, 4242);
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  client.notify("notifications/cancelled", { requestId: 4242 });
+  const response = await responsePromise;
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed < 12_000, "cancellation must terminate the probe well before the 15s timeout");
+  assert.ok(Array.isArray(response.result.structuredContent.backends));
+});
+
 test("PowerShell shim runner fails closed for a missing backend", {
   skip: process.platform !== "win32",
 }, async () => {
@@ -836,4 +906,25 @@ test("PowerShell shim runner fails closed for a missing backend", {
   }
   assert.ok(failure, "missing backend must return a non-zero exit code");
   assert.notEqual(failure.code, 0);
+});
+
+test("a worktree root ending in whitespace is canonicalized without trimming it", async (context) => {
+  if (process.platform === "win32") return; // NTFS forbids trailing spaces in names
+  const { tempRoot, client } = await makeHarness(context);
+  const spaced = path.join(tempRoot, "workspace ");
+  await mkdir(spaced);
+  await execFileAsync("git", ["init", "-b", "main"], { cwd: spaced });
+  await execFileAsync("git", ["config", "user.name", "Bridge Test"], { cwd: spaced });
+  await execFileAsync("git", ["config", "user.email", "bridge-test@example.invalid"], { cwd: spaced });
+  await writeFile(path.join(spaced, "baseline.txt"), "baseline\n");
+  await execFileAsync("git", ["add", "baseline.txt"], { cwd: spaced });
+  await execFileAsync("git", ["commit", "-m", "baseline"], { cwd: spaced });
+  const response = await client.request("tools/call", {
+    name: "workspace_status",
+    arguments: { workspacePath: spaced },
+  });
+  const out = response.result.structuredContent;
+  assert.equal(out.ok, true, JSON.stringify(out.error ?? out));
+  assert.ok(out.worktreeRoot.endsWith(" "),
+    "the trailing space is part of the canonical root: " + JSON.stringify(out.worktreeRoot));
 });

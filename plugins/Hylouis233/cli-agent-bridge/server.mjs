@@ -452,11 +452,14 @@ async function gitWorktreeRoot(workspacePath, options = {}) {
     cwd: workspacePath, ...options,
   });
   const failure = snapshotFailure("git rev-parse --show-toplevel", result);
-  if (failure || !result.stdout.trim()) {
+  // Strip only Git's trailing line terminator: a legitimate directory name can
+  // end in whitespace, which .trim() would silently delete.
+  const output = result.stdout.replace(/\r?\n$/u, "");
+  if (failure || !output) {
     throw new Error("cannot identify Git worktree root: " + (failure || "empty output"));
   }
   try {
-    return await realpath(result.stdout.trim());
+    return await realpath(output);
   } catch (error) {
     throw new Error("cannot canonicalize Git worktree root: " + error.message);
   }
@@ -677,16 +680,32 @@ async function committedDelta(worktreeRoot, before, after, options = {}) {
     await addBaseline(oid);
   }
 
-  const targets = [{ label: "HEAD", beforeOid: before.head, afterOid: after.head }];
+  // A worker committing on the checked-out branch moves HEAD and its branch ref
+  // across the same object pair; deduplicate by that pair so the log, diff, and
+  // commit count are emitted once with both labels.
+  const targets = [];
+  const targetIndex = new Map();
+  function addTarget(label, beforeOid, afterOid) {
+    const key = (beforeOid || "") + "\0" + (afterOid || "");
+    const existing = targetIndex.get(key);
+    if (existing !== undefined) {
+      targets[existing].labels.push(label);
+      return;
+    }
+    targetIndex.set(key, targets.length);
+    targets.push({ labels: [label], beforeOid, afterOid });
+  }
+  addTarget("HEAD", before.head, after.head);
   for (const change of refsChanged) {
-    targets.push({ label: change.ref, beforeOid: change.before, afterOid: change.after });
+    addTarget(change.ref, change.before, change.after);
   }
 
   const logs = [];
   const stats = [];
   let newCommitCount = 0;
-  for (const { label, beforeOid, afterOid } of targets) {
+  for (const { labels, beforeOid, afterOid } of targets) {
     if (!afterOid || beforeOid === afterOid) continue;
+    const label = labels.join(", ");
     const target = await peelCommitish(worktreeRoot, afterOid, cache, options);
     if (!target) {
       // Legal non-commit ref (for example a tag pointing at a blob): report the
@@ -714,7 +733,7 @@ async function committedDelta(worktreeRoot, before, after, options = {}) {
     if (revListFailure) throw new Error("committed delta unreliable: " + revListFailure);
     const newCommits = String(revList.stdout ?? "").trim();
     if (!newCommits) {
-      const note = label === "HEAD" && beforeOid
+      const note = labels.includes("HEAD") && beforeOid
         ? "HEAD moved from " + beforeOid.slice(0, 12) + " to " + afterOid.slice(0, 12) +
           " without creating commits (branch checkout or reset); the target history predates the delegation"
         : label + " now points to pre-existing history; no new commits";
@@ -723,7 +742,24 @@ async function committedDelta(worktreeRoot, before, after, options = {}) {
       continue;
     }
     newCommitCount += newCommits.split("\n").length;
-    const base = beforeOid || before.head || await emptyTree();
+    // For a ref that did not exist before, diff from its best common ancestor
+    // with the pre-delegation state, not from the original HEAD: a new branch
+    // created from another divergent branch would otherwise attribute every
+    // pre-existing difference between those branches to the worker.
+    let base;
+    if (beforeOid) {
+      base = beforeOid;
+    } else if (baselineCommits.length > 0) {
+      const mergeBase = await runGitCommand(
+        ["merge-base", target, ...baselineCommits.slice(0, 256)],
+        { cwd: worktreeRoot, ...options },
+      );
+      base = mergeBase.exitCode === 0 && mergeBase.stdout.trim()
+        ? mergeBase.stdout.trim()
+        : await emptyTree();
+    } else {
+      base = before.head || await emptyTree();
+    }
     const range = base + ".." + target;
     const diff = await runGitCommand(["diff", "--stat", range], {
       cwd: worktreeRoot, ...options,
@@ -742,12 +778,22 @@ async function committedDelta(worktreeRoot, before, after, options = {}) {
   };
 }
 
-async function listBackends() {
+async function listBackends(cancel = null) {
   const backends = await loadBackends();
   const entries = [];
   for (const [name, spec] of Object.entries(backends)) {
+    // A hung `--version` probe must not pin the request: the client can cancel
+    // the discovery call, terminating the current probe and skipping the rest.
+    if (cancel?.cancelled) break;
     if (!spec || typeof spec.command !== "string") continue;
-    const check = await runCommand(spec.command, ["--version"], { timeoutMs: VERSION_CHECK_TIMEOUT_MS });
+    const check = await runCommand(spec.command, ["--version"], {
+      timeoutMs: VERSION_CHECK_TIMEOUT_MS,
+      shouldCancel: () => Boolean(cancel?.cancelled),
+      onChild: (controller) => {
+        if (cancel) cancel.controller = controller;
+      },
+    });
+    if (cancel?.controller) cancel.controller = null;
     entries.push({
       name,
       label: typeof spec.label === "string" ? spec.label : name,
@@ -1513,18 +1559,24 @@ async function handleMessage(message) {
         if (typeof params.name !== "string") return jsonRpcError(message.id, -32602, "tools/call requires params.name");
         const args = params.arguments ?? {};
         if (params.name === "list_backends") {
-          const entries = await listBackends();
-          const lines = ["# Delegation Backends", ""];
-          for (const e of entries) {
-            lines.push("- " + e.name + " (" + e.label + "): " + (e.available ? "available" : "unavailable") + (e.experimental ? " [experimental]" : ""));
-            if (e.version) lines.push("  version: " + e.version);
-            if (e.error) lines.push("  error: " + e.error);
-            if (e.notes) lines.push("  note: " + e.notes);
+          const cancel = createCancellation();
+          const finishRequest = trackActiveRequest(message.id, cancel);
+          try {
+            const entries = await listBackends(cancel);
+            const lines = ["# Delegation Backends", ""];
+            for (const e of entries) {
+              lines.push("- " + e.name + " (" + e.label + "): " + (e.available ? "available" : "unavailable") + (e.experimental ? " [experimental]" : ""));
+              if (e.version) lines.push("  version: " + e.version);
+              if (e.error) lines.push("  error: " + e.error);
+              if (e.notes) lines.push("  note: " + e.notes);
+            }
+            return jsonRpcResult(message.id, {
+              content: [{ type: "text", text: lines.join("\n") }],
+              structuredContent: { backends: entries },
+            });
+          } finally {
+            finishRequest();
           }
-          return jsonRpcResult(message.id, {
-            content: [{ type: "text", text: lines.join("\n") }],
-            structuredContent: { backends: entries },
-          });
         }
         if (params.name === "workspace_status") {
           const cancel = createCancellation();

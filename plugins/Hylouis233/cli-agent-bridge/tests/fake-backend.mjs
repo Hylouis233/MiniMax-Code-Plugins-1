@@ -31,6 +31,24 @@ if (spec.branchRoundTrip) {
   event("start");
   execFileSync("git", ["checkout", spec.branchName]);
   event("end");
+} else if (spec.commitCurrent) {
+  // Commit on the currently checked-out branch: HEAD and its branch ref move together.
+  event("start");
+  writeFileSync(path.resolve(process.cwd(), spec.writeFile ?? "current.txt"), spec.contents ?? "current\n");
+  execFileSync("git", ["add", spec.writeFile ?? "current.txt"]);
+  execFileSync("git", ["commit", "-m", spec.commitMessage ?? "worker commit on current branch"]);
+  event("end");
+} else if (spec.newBranchFromExisting) {
+  // Fork a new branch from a pre-existing divergent branch, commit, and return.
+  event("start");
+  const original = execFileSync("git", ["branch", "--show-current"], { encoding: "utf8" }).trim();
+  execFileSync("git", ["checkout", spec.fromBranch]);
+  execFileSync("git", ["checkout", "-b", spec.branchName ?? "forked-work"]);
+  writeFileSync(path.resolve(process.cwd(), spec.writeFile ?? "fork.txt"), spec.contents ?? "fork\n");
+  execFileSync("git", ["add", spec.writeFile ?? "fork.txt"]);
+  execFileSync("git", ["commit", "-m", spec.commitMessage ?? "worker fork commit"]);
+  execFileSync("git", ["checkout", original]);
+  event("end");
 } else if (spec.blobTag) {
   // Create a legal ref that points at a blob, not a commit.
   event("start");
