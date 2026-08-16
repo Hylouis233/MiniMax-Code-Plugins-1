@@ -39,6 +39,63 @@ Watermark / stamp by merging a stamp page onto each page:
 
 ```python
 from pypdf import Transformation
+from pypdf.generic import RectangleObject
+
+def rotation_transfer(page):
+    """Map default user space to the visible coordinates used after /Rotate."""
+    media = RectangleObject(page.mediabox)
+    transform = (
+        Transformation()
+        .translate(
+            -float(media.left + media.width / 2),
+            -float(media.bottom + media.height / 2),
+        )
+        .rotate(-page.rotation)
+    )
+    corners = [
+        transform.apply_on(point)
+        for point in (media.lower_left, media.lower_right, media.upper_left, media.upper_right)
+    ]
+    return transform.translate(
+        -min(point[0] for point in corners),
+        -min(point[1] for point in corners),
+    )
+
+def inverse_transformation(transform):
+    a, b, c, d, e, f = map(float, transform.ctm)
+    determinant = a * d - b * c
+    return Transformation((
+        d / determinant, -b / determinant,
+        -c / determinant, a / determinant,
+        (c * f - d * e) / determinant,
+        (b * e - a * f) / determinant,
+    ))
+
+def transformed_rectangle(rectangle, transform):
+    rectangle = RectangleObject(rectangle)
+    corners = [
+        transform.apply_on(point)
+        for point in (
+            rectangle.lower_left, rectangle.lower_right,
+            rectangle.upper_left, rectangle.upper_right,
+        )
+    ]
+    return RectangleObject((
+        min(point[0] for point in corners), min(point[1] for point in corners),
+        max(point[0] for point in corners), max(point[1] for point in corners),
+    ))
+
+def stamp_placement(page, stamp_box):
+    """Fit in visible space, then map the stamp back without changing the destination page."""
+    to_visual = rotation_transfer(page)
+    destination = transformed_rectangle(page.cropbox, to_visual)
+    sw, sh = float(stamp_box.width), float(stamp_box.height)
+    dw, dh = float(destination.width), float(destination.height)
+    scale = min(dw / sw, dh / sh)
+    tx = float(destination.left) + (dw - sw * scale) / 2 - float(stamp_box.left) * scale
+    ty = float(destination.bottom) + (dh - sh * scale) / 2 - float(stamp_box.bottom) * scale
+    visible_placement = Transformation().scale(scale).translate(tx, ty)
+    return visible_placement.transform(inverse_transformation(to_visual))
 
 def require(condition, message):
     if not condition:
@@ -54,20 +111,13 @@ writer.append(reader)                 # clone pages plus catalog entries such as
 
 # A plain merge_page() overlays the stamp in its own coordinates, so on a page
 # with different dimensions, origin, or rotation the stamp can be clipped or
-# land entirely off-page. Normalize only the stamp, then scale each copy to the
-# destination crop box and include both boxes' non-zero origins. Keep the
-# destination page's /Rotate value intact: transfer_rotation_to_content() does
-# not transform annotation rectangles, so normalizing a page that has widgets,
-# links, or other annotations can displace its interactive geometry.
+# land entirely off-page. Normalize only the stamp, fit each copy in the visible
+# (rotation-aware) crop box, then map that placement back into default user space.
+# This keeps the destination /Rotate, boxes, annotation /Rect values, and widget
+# appearance streams intact while keeping the watermark horizontal to the viewer.
 stamp_box = stamp.cropbox
-sw, sh = float(stamp_box.width), float(stamp_box.height)
 for page in writer.pages:
-    destination = page.cropbox
-    dw, dh = float(destination.width), float(destination.height)
-    scale = min(dw / sw, dh / sh)
-    tx = float(destination.left) + (dw - sw * scale) / 2 - float(stamp_box.left) * scale
-    ty = float(destination.bottom) + (dh - sh * scale) / 2 - float(stamp_box.bottom) * scale
-    page.merge_transformed_page(stamp, Transformation().scale(scale).translate(tx, ty))
+    page.merge_transformed_page(stamp, stamp_placement(page, stamp_box))
 
 expected_sizes = [tuple(float(value) for value in page.mediabox) for page in writer.pages]
 

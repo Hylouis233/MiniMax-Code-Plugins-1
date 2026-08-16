@@ -278,6 +278,65 @@ check(
 
 # ---- transform.md watermark snippet -------------------------------------------
 from pypdf import PdfReader as R2, Transformation
+from pypdf.generic import RectangleObject
+
+
+def rotation_transfer(page):
+    media = RectangleObject(page.mediabox)
+    transform = (
+        Transformation()
+        .translate(
+            -float(media.left + media.width / 2),
+            -float(media.bottom + media.height / 2),
+        )
+        .rotate(-page.rotation)
+    )
+    corners = [
+        transform.apply_on(point)
+        for point in (media.lower_left, media.lower_right, media.upper_left, media.upper_right)
+    ]
+    return transform.translate(
+        -min(point[0] for point in corners),
+        -min(point[1] for point in corners),
+    )
+
+
+def inverse_transformation(transform):
+    a, b, c, d, e, f = map(float, transform.ctm)
+    determinant = a * d - b * c
+    return Transformation((
+        d / determinant, -b / determinant,
+        -c / determinant, a / determinant,
+        (c * f - d * e) / determinant,
+        (b * e - a * f) / determinant,
+    ))
+
+
+def transformed_rectangle(rectangle, transform):
+    rectangle = RectangleObject(rectangle)
+    corners = [
+        transform.apply_on(point)
+        for point in (
+            rectangle.lower_left, rectangle.lower_right,
+            rectangle.upper_left, rectangle.upper_right,
+        )
+    ]
+    return RectangleObject((
+        min(point[0] for point in corners), min(point[1] for point in corners),
+        max(point[0] for point in corners), max(point[1] for point in corners),
+    ))
+
+
+def stamp_placement(page, stamp_box):
+    to_visual = rotation_transfer(page)
+    destination = transformed_rectangle(page.cropbox, to_visual)
+    sw, sh = float(stamp_box.width), float(stamp_box.height)
+    dw, dh = float(destination.width), float(destination.height)
+    scale = min(dw / sw, dh / sh)
+    tx = float(destination.left) + (dw - sw * scale) / 2 - float(stamp_box.left) * scale
+    ty = float(destination.bottom) + (dh - sh * scale) / 2 - float(stamp_box.bottom) * scale
+    visible_placement = Transformation().scale(scale).translate(tx, ty)
+    return visible_placement.transform(inverse_transformation(to_visual))
 
 stamp_src = canvas.Canvas("stamp.pdf", pagesize=A4)
 stamp_src.setFont("Helvetica", 40)
@@ -294,16 +353,7 @@ writer = PdfWriter()
 writer.append(reader)
 stamp_box = stamp.cropbox
 for page in writer.pages:
-    destination = page.cropbox
-    scale = min(float(destination.width) / float(stamp_box.width),
-                float(destination.height) / float(stamp_box.height))
-    tx = (float(destination.left)
-          + (float(destination.width) - float(stamp_box.width) * scale) / 2
-          - float(stamp_box.left) * scale)
-    ty = (float(destination.bottom)
-          + (float(destination.height) - float(stamp_box.height) * scale) / 2
-          - float(stamp_box.bottom) * scale)
-    page.merge_transformed_page(stamp, Transformation().scale(scale).translate(tx, ty))
+    page.merge_transformed_page(stamp, stamp_placement(page, stamp_box))
 expected_sizes = [(round(float(p.mediabox.width), 2), round(float(p.mediabox.height), 2))
                   for p in writer.pages]
 with open("watermarked.pdf", "wb") as f:
@@ -448,12 +498,16 @@ offset_page.cropbox.lower_left = (100, 200)
 offset_page.cropbox.upper_right = (300, 500)
 rotated_page = small_source.add_blank_page(width=240, height=160)
 rotated_page.rotate(90)
-from pypdf.generic import ArrayObject, DictionaryObject, FloatObject, NameObject
+from pypdf.generic import ArrayObject, DictionaryObject, FloatObject, NameObject, TextStringObject
 rotated_link = DictionaryObject({
     NameObject("/Type"): NameObject("/Annot"),
     NameObject("/Subtype"): NameObject("/Link"),
     NameObject("/Rect"): ArrayObject([FloatObject(value) for value in (20, 30, 100, 60)]),
     NameObject("/Border"): ArrayObject([FloatObject(0), FloatObject(0), FloatObject(0)]),
+    NameObject("/A"): DictionaryObject({
+        NameObject("/S"): NameObject("/URI"),
+        NameObject("/URI"): TextStringObject("https://example.invalid/rotated-link"),
+    }),
 })
 rotated_page[NameObject("/Annots")] = ArrayObject([small_source._add_object(rotated_link)])
 cropped_page = small_source.add_blank_page(width=400, height=500)
@@ -487,6 +541,15 @@ def stamp_bboxes(path, page_number):
                 if "DRAFT" in span["text"]:
                     spans.append(span["bbox"])
     return spans
+
+def stamp_line_directions(path, page_number):
+    doc = fitz.open(path)
+    return [
+        line["dir"]
+        for block in doc[page_number].get_text("dict")["blocks"]
+        for line in block.get("lines", [])
+        if any("DRAFT" in span["text"] for span in line["spans"])
+    ]
 
 # The plain merge keeps the A4 stamp's coordinates, so on the 200x300 page the
 # stamp is far outside the box: PyMuPDF's positioned extraction sees no span at
@@ -526,12 +589,7 @@ stamp_page.transfer_rotation_to_content()
 stamp_box2 = stamp_page.cropbox
 sw2, sh2 = float(stamp_box2.width), float(stamp_box2.height)
 for page in scaled_writer.pages:
-    destination = page.cropbox
-    dw, dh = float(destination.width), float(destination.height)
-    scale = min(dw / sw2, dh / sh2)
-    tx = float(destination.left) + (dw - sw2 * scale) / 2 - float(stamp_box2.left) * scale
-    ty = float(destination.bottom) + (dh - sh2 * scale) / 2 - float(stamp_box2.bottom) * scale
-    page.merge_transformed_page(stamp_page, Transformation().scale(scale).translate(tx, ty))
+    page.merge_transformed_page(stamp_page, stamp_placement(page, stamp_box2))
 with open("scaled-stamped.pdf", "wb") as f:
     scaled_writer.write(f)
 scaled_check = R2("scaled-stamped.pdf")
@@ -545,7 +603,24 @@ offset_spans = stamp_bboxes("scaled-stamped.pdf", 3)
 rotated_spans = stamp_bboxes("scaled-stamped.pdf", 4)
 cropped_spans = stamp_bboxes("scaled-stamped.pdf", 5)
 check("scaled stamp lands inside the non-zero-origin page", bool(offset_spans), offset_spans)
-check("scaled stamp lands inside the rotated page without normalizing it", bool(rotated_spans), rotated_spans)
+rotated_fitz_page = fitz.open("scaled-stamped.pdf")[4]
+rotated_visible_spans = [
+    fitz.Rect(bbox) * rotated_fitz_page.rotation_matrix for bbox in rotated_spans
+]
+rotated_visible_directions = [
+    (
+        direction[0] * rotated_fitz_page.rotation_matrix.a
+        + direction[1] * rotated_fitz_page.rotation_matrix.c,
+        direction[0] * rotated_fitz_page.rotation_matrix.b
+        + direction[1] * rotated_fitz_page.rotation_matrix.d,
+    )
+    for direction in stamp_line_directions("scaled-stamped.pdf", 4)
+]
+check("scaled stamp stays horizontal in the rotated page's visible space",
+      bool(rotated_spans)
+      and all(rect.width > rect.height for rect in rotated_visible_spans)
+      and all(dx > 0.9 and abs(dy) < 0.1 for dx, dy in rotated_visible_directions),
+      (rotated_visible_spans, rotated_visible_directions))
 cropped_rect = fitz.open("scaled-stamped.pdf")[5].rect
 check("scaled stamp lands inside the offset visible crop box",
       bool(cropped_spans)
@@ -565,6 +640,16 @@ check("watermarking preserves rotated-page annotation geometry",
       == rotated_geometry_before,
       ((scaled_rotated_page.rotation, first_annotation_rect(scaled_rotated_page)),
        rotated_geometry_before))
+mixed_link_before = tuple(
+    round(float(value), 4)
+    for value in fitz.open("mixed.pdf")[4].get_links()[0]["from"]
+)
+mixed_link_after = tuple(
+    round(float(value), 4)
+    for value in fitz.open("scaled-stamped.pdf")[4].get_links()[0]["from"]
+)
+check("watermarking preserves the rotated link's visible hit rectangle",
+      mixed_link_after == mixed_link_before, (mixed_link_before, mixed_link_after))
 
 
 # ---- SKILL.md overflow check: off-page text is a defect -------------------------

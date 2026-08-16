@@ -324,7 +324,9 @@ def formula_may_intersect_rows(owner_sheet, formula, shifted_sheet, start_row):
     unmodeled_reference_functions = {"indirect", "offset", "address"}
     if any(
         token.type == "FUNC" and token.subtype == "OPEN"
-        and token.value.rstrip("(").casefold() in unmodeled_reference_functions
+        and token.value.rstrip("(").rsplit(":", 1)[-1]
+        .lstrip("@").rsplit(".", 1)[-1].casefold()
+        in unmodeled_reference_functions
         for token in tokens
     ):
         return True
@@ -421,6 +423,14 @@ check("INDIRECT string references require a manual structural rewrite plan",
       formula_may_intersect_rows("Data", '=SUM(INDIRECT("A5:A6"))', "Data", 5))
 check("OFFSET numeric row references require a manual structural rewrite plan",
       formula_may_intersect_rows("Data", "=SUM(OFFSET(A1,4,0,2,1))", "Data", 5))
+check("implicit-intersection INDIRECT references require a manual rewrite plan",
+      formula_may_intersect_rows("Data", '=@INDIRECT("A5:A6")', "Data", 5))
+check("OFFSET used by the range operator requires a manual rewrite plan",
+      formula_may_intersect_rows("Data", "=SUM(A1:OFFSET(A1,5,0))", "Data", 5))
+check("INDIRECT text inside a string does not create a dynamic reference",
+      not formula_may_intersect_rows(
+          "Data", '=IF(A1="INDIRECT(A5:A6)",1,0)', "Data", 5
+      ))
 
 stale_wb = openpyxl.Workbook()
 stale_ws = stale_wb.active

@@ -112,7 +112,9 @@ def formula_may_intersect_rows(owner_sheet, formula, shifted_sheet, start_row):
     unmodeled_reference_functions = {"indirect", "offset", "address"}
     if any(
         token.type == "FUNC" and token.subtype == "OPEN"
-        and token.value.rstrip("(").casefold() in unmodeled_reference_functions
+        and token.value.rstrip("(").rsplit(":", 1)[-1]
+        .lstrip("@").rsplit(".", 1)[-1].casefold()
+        in unmodeled_reference_functions
         for token in tokens
     ):
         return True

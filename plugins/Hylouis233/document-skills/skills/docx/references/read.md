@@ -94,14 +94,18 @@ def table_content(table):
             vertical = None if cell_properties is None else cell_properties.find(qn("w:vMerge"))
             vertical_merge = None if vertical is None else vertical.get(qn("w:val"), "continue")
             nested_tables = []
+            unreadable = []
             for kind, block in iter_part_blocks(cell_element, table):
                 if kind == "table":
                     nested_tables.append(table_content(block))
+                elif kind == "unreadable":
+                    unreadable.append(block)
             rendered_cells.append({
                 "column": column, "colspan": colspan,
                 "vMerge": vertical_merge,
                 "text": tc_text(cell_element, table),
                 "tables": nested_tables,
+                "unreadable": unreadable,
             })
             column += colspan
         rows.append({
@@ -137,7 +141,8 @@ Notes:
   Imported `w:altChunk` HTML/RTF/document parts are not modeled by python-docx; the traversal
   reports their relationship target and content type as `unreadable` instead of silently
   presenting an incomplete extraction. Convert them with a trusted office renderer before
-  claiming their content was read.
+  claiming their content was read. Each table-cell record carries its own `unreadable` list so
+  an import nested in a cell is not lost from the report.
   Text boxes, headers, footers, and footnotes still require their own collections
   (`section.header/.footer`) or raw XML.
 - For revision/comment metadata, inspect the XML parts directly: `word/comments.xml`,

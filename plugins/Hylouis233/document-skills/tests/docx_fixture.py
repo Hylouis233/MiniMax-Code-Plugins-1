@@ -14,6 +14,8 @@ import fitz
 from docx import Document
 from docx.enum.style import WD_STYLE_TYPE
 from docx.opc.constants import RELATIONSHIP_TYPE as RT
+from docx.opc.packuri import PackURI
+from docx.opc.part import Part
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.table import Table
@@ -213,14 +215,19 @@ inline_paragraph = sdt_doc.add_paragraph("before-")
 inline_run = inline_paragraph.add_run("inline한")
 inline_paragraph.add_run("-after")
 wrap_in_sdt(inline_run._r)
-chunk_relationship = sdt_doc.part.relate_to(
-    "https://example.invalid/imported.html",
-    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/aFChunk",
-    is_external=True,
+chunk_part = Part(
+    PackURI("/word/altChunk1.html"), "text/html",
+    b"<html><body>IMPORTED ALTCHUNK TEXT</body></html>", sdt_doc.part.package,
 )
+chunk_relationship = sdt_doc.part.relate_to(chunk_part, RT.A_F_CHUNK)
 alt_chunk = OxmlElement("w:altChunk")
 alt_chunk.set(qn("r:id"), chunk_relationship)
 sdt_doc.element.body.insert(len(sdt_doc.element.body) - 1, alt_chunk)
+cell_alt_chunk = OxmlElement("w:altChunk")
+cell_alt_chunk.set(qn("r:id"), chunk_relationship)
+controlled_table.cell(0, 0)._tc.insert(
+    len(controlled_table.cell(0, 0)._tc) - 1, cell_alt_chunk
+)
 sdt_doc.save("content-control.docx")
 sdt_reopened = Document("content-control.docx")
 check("doc.paragraphs omits block content-control text (negative control)",
@@ -251,13 +258,22 @@ check("nonuniform table rows preserve leading/trailing grid omissions",
       and rendered_tables[0][0]["grid_after"] == 2,
       rendered_tables[0])
 unreadable_parts = [block for kind, block in walked_blocks if kind == "unreadable"]
+expected_alt_chunk = {
+    "kind": "altChunk",
+    "relationship_id": chunk_relationship,
+    "target": "altChunk1.html",
+    "content_type": "text/html",
+}
 check("altChunk content is reported instead of silently omitted",
-      unreadable_parts == [{
-          "kind": "altChunk",
-          "relationship_id": chunk_relationship,
-          "target": "https://example.invalid/imported.html",
-          "content_type": None,
-      }], unreadable_parts)
+      unreadable_parts == [expected_alt_chunk], unreadable_parts)
+cell_unreadable = [
+    item for item in rendered_tables[0][0]["cells"][0]["items"]
+    if isinstance(item, dict) and item.get("kind") == "altChunk"
+]
+check("altChunk content inside a table cell is also reported",
+      cell_unreadable == [expected_alt_chunk], rendered_tables)
+check("altChunk payload is not misrepresented as extracted paragraph text",
+      all("IMPORTED ALTCHUNK TEXT" not in text for text in walked_text), walked_text)
 
 # Per-run glyph validation must not let a different referenced font hide a missing glyph.
 fixture_cmaps = {"CJK Face": {ord("漢")}, "Latin Face": {ord("A")}}
