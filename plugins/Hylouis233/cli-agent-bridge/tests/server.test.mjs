@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { access, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -121,7 +122,7 @@ async function makeHarness(context, { unborn = false } = {}) {
     await client.close();
     await rm(tempRoot, { recursive: true, force: true });
   });
-  return { tempRoot, workspace, client };
+  return { tempRoot, workspace, configPath, client };
 }
 
 function taskArguments(workspacePath, spec, extra = {}) {
@@ -183,6 +184,56 @@ test("canonical Git worktree locking serializes root and symlink paths", async (
     "start:first", "end:first", "start:second", "end:second",
   ]);
   assert.equal(firstResponse.result.structuredContent.worktreeRoot, secondResponse.result.structuredContent.worktreeRoot);
+});
+
+test("canonical worktree locking serializes independent server processes", async (context) => {
+  const { tempRoot, workspace, configPath, client } = await makeHarness(context);
+  const secondClient = new McpClient(configPath);
+  try {
+    await secondClient.initialize();
+    const eventFile = path.join(tempRoot, "cross-process-events.jsonl");
+    const first = client.request("tools/call", taskArguments(workspace, {
+      name: "first-server", eventFile, delayMs: 800, writeFile: "first-server.txt",
+    }));
+    await waitFor(async () => (await events(eventFile)).some(
+      (item) => item.name === "first-server" && item.event === "start",
+    ));
+    const second = secondClient.request("tools/call", taskArguments(workspace, {
+      name: "second-server", eventFile, delayMs: 10, writeFile: "second-server.txt",
+    }, { allowDirty: true }));
+
+    const [firstResponse, secondResponse] = await Promise.all([first, second]);
+    assert.equal(firstResponse.result.structuredContent.ok, true);
+    assert.equal(secondResponse.result.structuredContent.ok, true);
+    assert.deepEqual((await events(eventFile)).map((item) => item.event + ":" + item.name), [
+      "start:first-server", "end:first-server", "start:second-server", "end:second-server",
+    ]);
+  } finally {
+    await secondClient.close();
+  }
+});
+
+test("a workspace lock left by a dead server process is reclaimed", async (context) => {
+  const { workspace, client } = await makeHarness(context);
+  const canonicalRoot = await realpath(workspace);
+  const normalized = path.normalize(canonicalRoot);
+  const key = "git-worktree:" + (process.platform === "win32" ? normalized.toLowerCase() : normalized);
+  const digest = createHash("sha256").update(key).digest("hex");
+  const lockRoot = path.join(os.tmpdir(), "minimax-cli-agent-bridge-locks");
+  const lockPath = path.join(lockRoot, digest + ".lock");
+  await mkdir(lockRoot, { recursive: true });
+  context.after(() => rm(lockPath, { force: true }));
+  await writeFile(lockPath, JSON.stringify({
+    pid: 99_999_999,
+    token: "dead-server-fixture",
+    createdAt: Date.now() - 60_000,
+  }));
+
+  const response = await client.request("tools/call", taskArguments(workspace, {
+    name: "after-stale-lock", writeFile: "reclaimed.txt",
+  }));
+  assert.equal(response.result.structuredContent.ok, true);
+  await assert.rejects(access(lockPath), /ENOENT/u);
 });
 
 test("a request cancelled while queued never starts its backend", async (context) => {
@@ -360,6 +411,29 @@ test("workspace_status waits for an active delegation on the same worktree", asy
   const [delegatedResponse, statusResponse] = await Promise.all([delegated, status]);
   assert.equal(delegatedResponse.result.structuredContent.ok, true);
   assert.ok(statusResponse.result.structuredContent.git.changedFiles.includes("finished.txt"));
+});
+
+test("workspace_status can be cancelled while queued for the workspace lock", async (context) => {
+  const { tempRoot, workspace, client } = await makeHarness(context);
+  const eventFile = path.join(tempRoot, "status-cancel-events.jsonl");
+  const delegated = client.request("tools/call", taskArguments(workspace, {
+    name: "holder", eventFile, delayMs: 2_000,
+  }), 501);
+  await waitFor(async () => (await events(eventFile)).some((item) => item.event === "start"));
+  const status = client.request("tools/call", {
+    name: "workspace_status",
+    arguments: { workspacePath: workspace },
+  }, 502);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const cancelledAt = Date.now();
+  client.notify("notifications/cancelled", { requestId: 502 });
+
+  const statusResponse = await status;
+  assert.ok(Date.now() - cancelledAt < 1_500, "queued status cancellation should settle promptly");
+  assert.equal(statusResponse.result.isError, true);
+  assert.equal(statusResponse.result.structuredContent.cancelled, true);
+  assert.equal(statusResponse.result.structuredContent.git, null);
+  assert.equal((await delegated).result.structuredContent.ok, true);
 });
 
 test("closing MCP stdin terminates active worker descendants", async (context) => {

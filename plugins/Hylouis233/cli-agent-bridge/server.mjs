@@ -7,7 +7,9 @@
 // License: MIT. See NOTICE for upstream credits.
 
 import { spawn } from "node:child_process";
-import { readFile, realpath, stat } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { link, mkdir, readFile, realpath, stat, unlink, writeFile } from "node:fs/promises";
+import os from "node:os";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
@@ -24,6 +26,8 @@ const GIT_TIMEOUT_MS = 30_000;
 const KILL_GRACE_MS = 10_000;
 const MAX_CAPTURE_CHARS = 5_000_000;
 const RAW_TAIL_CHARS = 60_000;
+const WORKSPACE_LOCK_RETRY_MS = 50;
+const WORKSPACE_LOCK_ROOT = path.join(os.tmpdir(), "minimax-cli-agent-bridge-locks");
 
 // Built-in defaults. The sibling backends.json (or the CLI_AGENT_BRIDGE_BACKENDS
 // environment variable) overrides these; a missing or invalid file falls back
@@ -100,7 +104,7 @@ const TOOLS = [
     name: "delegate_task",
     title: "Delegate Task To A Coding CLI",
     description:
-      "Run a coding task with a locally installed coding CLI (backend: claude, codex, kimi, zcode, or dsh) inside the given workspace, headless. Returns the CLI exit code, readable output tail, stderr tail, and the git snapshot (staged, unstaged, untracked, and committed deltas) produced by the run. Refuses to run when the working tree is dirty unless allowDirty=true. Paths that resolve to the same canonical Git worktree are serialized.",
+      "Run a coding task with a locally installed coding CLI (backend: claude, codex, kimi, zcode, or dsh) inside the given workspace, headless. Returns the CLI exit code, readable output tail, stderr tail, and the git snapshot (staged, unstaged, untracked, and committed deltas) produced by the run. Refuses to run when the working tree is dirty unless allowDirty=true. Paths that resolve to the same canonical Git worktree are serialized across bridge processes.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -526,8 +530,107 @@ async function listBackends() {
   return entries;
 }
 
-// Per-workspace mutex: concurrent delegations to the same checkout are
-// serialized so workers cannot interleave edits or snapshot each other.
+function workspaceFileLockPath(key) {
+  const digest = createHash("sha256").update(key).digest("hex");
+  return path.join(WORKSPACE_LOCK_ROOT, digest + ".lock");
+}
+
+async function processIsAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  if (process.platform === "linux") {
+    try {
+      const raw = await readFile("/proc/" + String(pid) + "/stat", "utf8");
+      const close = raw.lastIndexOf(")");
+      const state = close < 0 ? "" : raw.slice(close + 1).trim().split(/\s+/u)[0];
+      if (state === "Z" || state === "X" || state === "x") return false;
+    } catch (error) {
+      if (error.code === "ENOENT") return false;
+      // Fall through to kill(0) when procfs is unavailable or restricted.
+    }
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
+  }
+}
+
+async function reclaimDeadWorkspaceFileLock(lockPath) {
+  let observed;
+  try {
+    observed = await readFile(lockPath, "utf8");
+  } catch (error) {
+    if (error.code === "ENOENT") return true;
+    throw error;
+  }
+  let owner;
+  try {
+    owner = JSON.parse(observed);
+  } catch {
+    // Lock records are linked into place only after a complete metadata file
+    // has been written, so malformed content is not safe to reclaim blindly.
+    return false;
+  }
+  if (await processIsAlive(Number(owner.pid))) return false;
+  try {
+    // Re-read before removal so a lock that changed owners is never deleted.
+    if (await readFile(lockPath, "utf8") !== observed) return false;
+    await unlink(lockPath);
+    return true;
+  } catch (error) {
+    if (error.code === "ENOENT") return true;
+    throw error;
+  }
+}
+
+async function waitForWorkspaceLockRetry(cancel) {
+  const retry = new Promise((resolve) => setTimeout(() => resolve(true), WORKSPACE_LOCK_RETRY_MS));
+  return cancel
+    ? await Promise.race([retry, cancel.promise.then(() => false)])
+    : await retry;
+}
+
+async function acquireWorkspaceFileLock(key, cancel = null) {
+  await mkdir(WORKSPACE_LOCK_ROOT, { recursive: true, mode: 0o700 });
+  const lockPath = workspaceFileLockPath(key);
+  const token = process.pid + "-" + randomUUID();
+  const ownerPath = lockPath + ".owner-" + token;
+  const ownerText = JSON.stringify({ pid: process.pid, token, createdAt: Date.now() });
+  await writeFile(ownerPath, ownerText, { flag: "wx", mode: 0o600 });
+  try {
+    while (true) {
+      if (cancel?.cancelled) return null;
+      try {
+        // Hard-link creation is an atomic create-if-absent operation on both
+        // NTFS and POSIX filesystems. The linked metadata is already complete.
+        await link(ownerPath, lockPath);
+        let released = false;
+        return {
+          async release() {
+            if (released) return;
+            released = true;
+            try {
+              if (await readFile(lockPath, "utf8") === ownerText) await unlink(lockPath);
+            } catch (error) {
+              if (error.code !== "ENOENT") throw error;
+            }
+          },
+        };
+      } catch (error) {
+        if (error.code !== "EEXIST") throw error;
+      }
+      if (await reclaimDeadWorkspaceFileLock(lockPath)) continue;
+      if (!await waitForWorkspaceLockRetry(cancel)) return null;
+    }
+  } finally {
+    try { await unlink(ownerPath); } catch (error) { if (error.code !== "ENOENT") throw error; }
+  }
+}
+
+// The in-memory queue preserves FIFO order within this server. The atomic
+// filesystem lock extends the same canonical-worktree mutex across independent
+// stdio server processes, so two MCP clients cannot interleave workers.
 const workspaceLocks = new Map();
 const quarantinedWorkspaces = new Set();
 async function withWorkspaceLock(key, fn, { cancel = null, onCancelled = null } = {}) {
@@ -550,9 +653,17 @@ async function withWorkspaceLock(key, fn, { cancel = null, onCancelled = null } 
     });
     return typeof onCancelled === "function" ? onCancelled() : undefined;
   }
+  let fileLock = null;
   try {
+    fileLock = await acquireWorkspaceFileLock(key, cancel);
+    if (!fileLock || cancel?.cancelled) {
+      if (fileLock) await fileLock.release();
+      fileLock = null;
+      return typeof onCancelled === "function" ? onCancelled() : undefined;
+    }
     return await fn();
   } finally {
+    if (fileLock) await fileLock.release();
     release();
     if (workspaceLocks.get(key) === next) workspaceLocks.delete(key);
   }
@@ -593,6 +704,22 @@ function cancelledDelegation({ backend, workspacePath, worktreeRoot, spec, befor
     commits: null,
     experimental: Boolean(spec.experimental),
   };
+}
+
+function cancelledWorkspaceStatus(id, { workspacePath = "", worktreeRoot = "" } = {}) {
+  const out = {
+    ok: false,
+    error: "workspace status cancelled by client",
+    cancelled: true,
+    workspacePath,
+    worktreeRoot,
+    git: null,
+  };
+  return jsonRpcResult(id, {
+    content: [{ type: "text", text: textResult("Workspace Status", out) }],
+    structuredContent: out,
+    isError: true,
+  });
 }
 
 async function delegateTask(rawArgs, cancel) {
@@ -702,6 +829,11 @@ async function delegateTask(rawArgs, cancel) {
         experimental: Boolean(spec.experimental),
       };
     }
+    // Keep this check immediately adjacent to the backend launch. The request
+    // may have been cancelled during preflight or argument preparation.
+    if (cancel?.cancelled) {
+      return cancelledDelegation({ backend, workspacePath, worktreeRoot, spec, before });
+    }
     let workerController = null;
     const result = await runCommand(spec.command, args, {
       cwd: workspacePath,
@@ -802,18 +934,32 @@ function textResult(header, obj) {
 function jsonRpcResult(id, result) { return { jsonrpc: "2.0", id, result }; }
 function jsonRpcError(id, code, message) { return { jsonrpc: "2.0", id, error: { code, message } }; }
 
-// In-flight delegate_task requests, keyed by JSON-RPC request id, so a
-// notifications/cancelled can terminate the worker process.
+// In-flight cancellable tool requests, keyed by the original JSON-RPC id type,
+// so notifications/cancelled can interrupt workers, lock waits, and snapshots.
 const activeRequests = new Map();
 
+function trackActiveRequest(id, cancel) {
+  let resolveDone;
+  const entry = { cancel, done: new Promise((resolve) => { resolveDone = resolve; }) };
+  activeRequests.set(id, entry);
+  return () => {
+    if (activeRequests.get(id) === entry) activeRequests.delete(id);
+    resolveDone();
+  };
+}
+
 async function terminateActiveRequests(reason = "shutdown") {
+  const entries = [...activeRequests.values()];
   const waits = [];
-  for (const { cancel } of activeRequests.values()) {
+  for (const { cancel } of entries) {
     const controller = cancel.controller;
     cancel.cancel();
     if (controller) waits.push(controller.terminate(reason));
   }
   await Promise.allSettled(waits);
+  // Let each request unwind its lock/snapshot finally blocks before the server
+  // exits, avoiding an unnecessary stale cross-process lock after clean shutdown.
+  await Promise.allSettled(entries.map((entry) => entry.done));
 }
 
 function installShutdownHandlers(stdin) {
@@ -884,21 +1030,45 @@ async function handleMessage(message) {
           });
         }
         if (params.name === "workspace_status") {
-          const workspacePath = await validateWorkspace(args.workspacePath);
-          await requireGitRepo(workspacePath);
-          const worktreeRoot = await gitWorktreeRoot(workspacePath);
-          const lockKey = workspaceLockKey(worktreeRoot);
-          return await withWorkspaceLock(lockKey, async () => {
-            const git = await gitSnapshot(worktreeRoot);
-            return jsonRpcResult(message.id, {
-              content: [{ type: "text", text: textResult("Workspace Status", { workspacePath, worktreeRoot, git }) }],
-              structuredContent: { ok: true, workspacePath, worktreeRoot, git },
+          const cancel = createCancellation();
+          const finishRequest = trackActiveRequest(message.id, cancel);
+          let workspacePath = "";
+          let worktreeRoot = "";
+          try {
+            workspacePath = await validateWorkspace(args.workspacePath);
+            if (cancel.cancelled) return cancelledWorkspaceStatus(message.id, { workspacePath });
+            await requireGitRepo(workspacePath);
+            if (cancel.cancelled) return cancelledWorkspaceStatus(message.id, { workspacePath });
+            worktreeRoot = await gitWorktreeRoot(workspacePath);
+            if (cancel.cancelled) return cancelledWorkspaceStatus(message.id, { workspacePath, worktreeRoot });
+            const lockKey = workspaceLockKey(worktreeRoot);
+            return await withWorkspaceLock(lockKey, async () => {
+              try {
+                const git = await gitSnapshot(worktreeRoot, { cancel });
+                if (cancel.cancelled) {
+                  return cancelledWorkspaceStatus(message.id, { workspacePath, worktreeRoot });
+                }
+                return jsonRpcResult(message.id, {
+                  content: [{ type: "text", text: textResult("Workspace Status", { workspacePath, worktreeRoot, git }) }],
+                  structuredContent: { ok: true, workspacePath, worktreeRoot, git },
+                });
+              } catch (error) {
+                if (error instanceof OperationCancelledError) {
+                  return cancelledWorkspaceStatus(message.id, { workspacePath, worktreeRoot });
+                }
+                throw error;
+              }
+            }, {
+              cancel,
+              onCancelled: () => cancelledWorkspaceStatus(message.id, { workspacePath, worktreeRoot }),
             });
-          });
+          } finally {
+            finishRequest();
+          }
         }
         if (params.name === "delegate_task") {
           const cancel = createCancellation();
-          activeRequests.set(message.id, { cancel });
+          const finishRequest = trackActiveRequest(message.id, cancel);
           try {
             const out = await delegateTask(args, cancel);
             return jsonRpcResult(message.id, {
@@ -907,7 +1077,7 @@ async function handleMessage(message) {
               isError: !out.ok,
             });
           } finally {
-            activeRequests.delete(message.id);
+            finishRequest();
           }
         }
         return jsonRpcError(message.id, -32602, "Unknown tool: " + params.name);

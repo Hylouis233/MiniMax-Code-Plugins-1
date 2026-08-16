@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { readdir, readFile } from "node:fs/promises";
 
 const UTILITY_CAPTURE_CHARS = 1_000_000;
 
@@ -73,10 +74,47 @@ async function windowsProcessTreePids(rootPid, knownPids = new Set()) {
   return [...descendants];
 }
 
+async function linuxProcessGroupHasLiveMembers(processGroupId) {
+  let entries;
+  try {
+    entries = await readdir("/proc", { withFileTypes: true });
+  } catch {
+    return null;
+  }
+  let incomplete = false;
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !/^\d+$/u.test(entry.name)) continue;
+    let raw;
+    try {
+      raw = await readFile("/proc/" + entry.name + "/stat", "utf8");
+    } catch (error) {
+      if (error.code === "ENOENT") continue; // process exited during the scan
+      incomplete = true;
+      continue;
+    }
+    // /proc/PID/stat starts with `pid (comm) state ppid pgrp ...`; comm can
+    // contain spaces and parentheses, so split only after its final `)`.
+    const close = raw.lastIndexOf(")");
+    if (close < 0) { incomplete = true; continue; }
+    const fields = raw.slice(close + 1).trim().split(/\s+/u);
+    const state = fields[0];
+    const pgrp = Number(fields[2]);
+    if (pgrp === processGroupId && state !== "Z" && state !== "X" && state !== "x") {
+      return true;
+    }
+  }
+  // When procfs is partially hidden, fall back to kill(0) and fail safe.
+  return incomplete ? null : false;
+}
+
 export async function isProcessTreeAlive(child, treeState) {
   if (!Number.isInteger(child.pid)) return false;
   if (process.platform === "win32") {
     return (await windowsProcessTreePids(child.pid, treeState.knownPids)).length > 0;
+  }
+  if (process.platform === "linux") {
+    const live = await linuxProcessGroupHasLiveMembers(child.pid);
+    if (live !== null) return live;
   }
   try {
     process.kill(-child.pid, 0);

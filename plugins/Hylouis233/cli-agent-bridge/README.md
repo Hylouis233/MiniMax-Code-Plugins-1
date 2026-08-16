@@ -18,8 +18,8 @@ repository:
 - delegate_task: run a self-contained task with a chosen backend CLI and return its exit
   code, output tail, stderr tail, and the before/after git snapshots (staged, unstaged,
   untracked, and committed deltas) the worker produced. Runs against the same workspace are
-  serialized; dirty trees are refused unless allowDirty=true; cancellation and timeout
-  terminate the complete worker process tree before the workspace lock is released.
+  serialized across independent bridge processes; dirty trees are refused unless allowDirty=true;
+  cancellation and timeout terminate the complete worker process tree before the lock is released.
 
 The Skill teaches MiniMax Code when and how to delegate, and to review the returned diff before
 reporting completion.
@@ -114,13 +114,18 @@ you already obtained a valid ID from that backend outside this Plugin.
   plays that role instead.
 - The bridge delegates tasks; it does not merge code, commit, or push. The user reviews every
   diff.
-- Delegations targeting the same canonical Git worktree are serialized even when callers name a
-  subdirectory, different path casing, or symlink. Independent comparison runs still require
-  separate clean worktrees.
+- Delegations and status snapshots targeting the same canonical Git worktree are serialized even
+  when callers name a subdirectory, different path casing, or symlink, and even when separate MCP
+  clients launched separate bridge server processes. Independent comparison runs still require
+  separate clean worktrees. The cross-process lock lives under the OS temporary directory; a lock
+  whose owner process exited is reclaimed before the next request starts.
 - Cancellation and timeout confirm that the delegated process tree has exited before releasing
   the workspace mutex. If termination cannot be confirmed, the bridge quarantines that worktree
   and refuses further delegations until the server is restarted and leftover processes are
-  checked.
+  checked. On Linux, zombie-only process groups count as terminated; zombies cannot edit the
+  workspace and may otherwise persist when container PID 1 does not reap them.
+- Cancelling a workspace_status request interrupts its queued lock wait or Git snapshot and returns
+  a cancelled tool result instead of performing a stale snapshot later.
 - timeoutMs is an overall deadline that starts after the workspace lock is acquired and covers
   preflight Git checks, the worker, and post-run snapshots. Safe process-tree termination can
   extend beyond that deadline by the documented kill grace period.
@@ -138,8 +143,9 @@ node --test plugins/Hylouis233/cli-agent-bridge/test/server.test.mjs
 node --test plugins/Hylouis233/cli-agent-bridge/tests/server.test.mjs
 ```
 
-They cover the full MCP flow plus canonical worktree locking, queued cancellation, cancel/timeout
-process-tree termination, unborn HEAD snapshots, and Codex prompt delimiters on Windows and POSIX.
+They cover the full MCP flow plus in-process and cross-process canonical worktree locking, queued
+delegation/status cancellation, cancel/timeout process-tree termination, unborn HEAD snapshots,
+and Codex prompt delimiters on Windows and POSIX.
 
 ## License
 

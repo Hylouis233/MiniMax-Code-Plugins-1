@@ -21,8 +21,8 @@ inside the target git repository, and their results come back as a git diff for 
 1. Run workspace_status with the workspace path and confirm the working tree is clean.
 2. Pick a backend from list_backends and confirm it is available on this machine.
 3. Run delegate_task with a self-contained task, the workspace path, and the backend name.
-   Delegations to the same workspace are serialized by the server, so parallel runs on one
-   checkout queue instead of interleaving edits.
+   Delegations to the same workspace are serialized across bridge server processes, so parallel
+   runs from separate MCP clients still queue instead of interleaving edits.
 4. Review the returned result: the before and after git snapshots (status, diff stat, changed
    files including staged and new files), the commits block when the worker committed, the
    output and stderr tails, and the exit code. A failed, timed-out, or cancelled run reports
@@ -58,6 +58,8 @@ inside the target git repository, and their results come back as a git diff for 
   tree and the result reports cancelled=true. If tree termination cannot be confirmed, the bridge
   quarantines the worktree and blocks another worker until restart. The workspace may still contain
   edits made before cancellation, so still review the returned snapshot.
+- Cancelling workspace_status while it is queued or snapshotting returns promptly with
+  cancelled=true; it does not run a delayed status snapshot after the active delegation finishes.
 
 ## Notes
 
