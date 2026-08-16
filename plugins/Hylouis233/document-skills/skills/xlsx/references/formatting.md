@@ -11,7 +11,13 @@ from openpyxl.styles import Font, PatternFill
 
 red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
 red_font = Font(color="9C0006")
-last = ws.max_row                                  # real data boundary, not the column
+# Derive the boundary from values in the rule/table source columns. max_row can
+# include a styled or formerly cleared cell near Excel's row limit.
+last = next(
+    (row for row in range(ws.max_row, 1, -1)
+     if any(ws.cell(row, column).value is not None for column in range(1, 7))),
+    1,
+)
 
 # With only a header row (max_row == 1) every range below would be inverted
 # ("D2:D1"); openpyxl rejects those ranges, so guard before building rules.
@@ -50,7 +56,14 @@ A real Table gives filter UI, banded styling, and structured references:
 ```python
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
-tbl = Table(displayName="TData", ref=f"A1:F{ws.max_row}")   # name has no spaces
+last = next(
+    (row for row in range(ws.max_row, 1, -1)
+     if any(ws.cell(row, column).value is not None for column in range(1, 7))),
+    1,
+)
+if last < 2:
+    raise ValueError("cannot create a data table without populated rows")
+tbl = Table(displayName="TData", ref=f"A1:F{last}")   # name has no spaces
 tbl.tableStyleInfo = TableStyleInfo(name="TableStyleMedium9", showRowStripes=True)
 ws.add_table(tbl)
 ```

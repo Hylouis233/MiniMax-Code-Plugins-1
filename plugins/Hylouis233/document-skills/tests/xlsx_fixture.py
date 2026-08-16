@@ -563,6 +563,15 @@ check("data-table formulas have stable diagnostic text",
       and "0x" not in data_table_entry[2], data_table_entry)
 
 # csv.md: value export uses the cached-value workbook and reports every missing cache.
+formula_wb["First"].reset_dimensions()
+value_wb["First"].reset_dimensions()
+
+def spreadsheet_safe_csv_value(value):
+    if isinstance(value, str) and value.startswith(("=", "+", "-", "@")):
+        return "'" + value
+    return value
+
+
 missing_caches = []
 with open("formula-values.csv", "w", newline="", encoding="utf-8") as output:
     writer = csv.writer(output)
@@ -570,12 +579,24 @@ with open("formula-values.csv", "w", newline="", encoding="utf-8") as output:
         for formula_cell, value_cell in zip(formula_row, value_row):
             if formula_cell.data_type == "f" and value_cell.value is None:
                 missing_caches.append(formula_cell.coordinate)
-        writer.writerow([cell.value for cell in value_row])
+        writer.writerow([spreadsheet_safe_csv_value(cell.value) for cell in value_row])
 with open("formula-values.csv", newline="", encoding="utf-8") as exported:
     exported_values = [value for row in csv.reader(exported) for value in row]
 check("XLSX-to-CSV reports formulas with no cached value", set(missing_caches) >= {"A1", "A2"}, missing_caches)
 check("XLSX-to-CSV does not leak formula strings into value output",
       not any(value.startswith("=") for value in exported_values), exported_values)
+
+formula_like_literals = ["=1+1", "+cmd", "-2+3", "@SUM(A1:A2)", -5]
+with open("formula-like-literals.csv", "w", newline="", encoding="utf-8") as output:
+    csv.writer(output).writerow([
+        spreadsheet_safe_csv_value(value) for value in formula_like_literals
+    ])
+with open("formula-like-literals.csv", newline="", encoding="utf-8") as exported:
+    safe_literals = next(csv.reader(exported))
+check("spreadsheet-targeted CSV neutralizes every formula-like text prefix",
+      safe_literals[:4] == ["'=1+1", "'+cmd", "'-2+3", "'@SUM(A1:A2)"], safe_literals)
+check("CSV neutralization leaves numeric negative values numeric",
+      safe_literals[4] == "-5", safe_literals)
 formula_wb.close()
 value_wb.close()
 
@@ -634,7 +655,11 @@ check("prefix markers are provably blind to custom prefixes (negative control)",
 
 # ---- formatting.md guard: header-only sheets skip conditional formatting ---------
 def add_demo_formatting(sheet):
-    last = sheet.max_row
+    last = next(
+        (row for row in range(sheet.max_row, 1, -1)
+         if any(sheet.cell(row, column).value is not None for column in range(1, 7))),
+        1,
+    )
     if last < 2:
         return 0
     sheet.conditional_formatting.add(
@@ -675,7 +700,12 @@ data_wb = openpyxl.Workbook()
 data_ws = data_wb.active
 data_ws.append(["A", "B", "C", "D", "E", "F"])
 data_ws.append([1, 2, 3, -1, 5, 6])
+data_ws["F10000"].number_format = "0.00"  # inflate max_row without adding data
 check("data rows receive all four formatting rules", add_demo_formatting(data_ws) == 4)
+formatting_ranges = [str(item.sqref) for item in data_ws.conditional_formatting]
+check("conditional formatting ignores a styled ghost row",
+      all("10000" not in item and item.endswith("2") for item in formatting_ranges),
+      formatting_ranges)
 data_wb.save("data-formatting.xlsx")
 data_reopened = openpyxl.load_workbook("data-formatting.xlsx")
 check("all four formatting rules survive save/reopen",

@@ -9,6 +9,7 @@ import copy
 import subprocess
 import sys
 import zipfile
+from pathlib import Path
 
 import fitz
 from docx import Document
@@ -52,6 +53,8 @@ MAX_XML_PART = 20 * 1024 * 1024
 MAX_ENTRY = 100 * 1024 * 1024
 MAX_TOTAL_UNCOMPRESSED = 500 * 1024 * 1024
 MAX_COMPRESSION_RATIO = 200
+MAX_COMPRESSED_FILE = 200 * 1024 * 1024
+MAX_MEMBERS = 10_000
 
 
 def require(condition, message):
@@ -60,8 +63,11 @@ def require(condition, message):
 
 
 def validate_docx_package(path):
+    require(Path(path).stat().st_size <= MAX_COMPRESSED_FILE,
+            "compressed DOCX file size above limit")
     with zipfile.ZipFile(path) as archive:
         infos = archive.infolist()
+        require(len(infos) <= MAX_MEMBERS, "too many archive members")
         names = {info.filename for info in infos}
         require(len(names) == len(infos), "duplicate archive member names are unsafe")
         require(
@@ -123,6 +129,19 @@ check(
     "archive safety checks remain active under optimized Python",
     __debug__ or archive_bomb_rejected,
 )
+
+with zipfile.ZipFile("too-many-members.docx", "w", zipfile.ZIP_STORED) as archive:
+    archive.writestr("[Content_Types].xml", "<Types/>")
+    archive.writestr("word/document.xml", "<document/>")
+    for index in range(MAX_MEMBERS - 1):
+        archive.writestr(f"custom/empty-{index}", b"")
+try:
+    validate_docx_package("too-many-members.docx")
+    excessive_member_count_rejected = False
+except ValueError:
+    excessive_member_count_rejected = True
+check("bounded package health check rejects excessive member counts",
+      excessive_member_count_rejected)
 
 # ---- read.md includes block/inline content controls and controlled tables -------
 def iter_part_blocks(root, parent):

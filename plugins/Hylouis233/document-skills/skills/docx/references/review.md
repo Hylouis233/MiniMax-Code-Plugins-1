@@ -14,6 +14,7 @@ Fonts render differently on another machine | non-embedded fonts | expected; rep
 
 ```python
 import zipfile
+from pathlib import Path
 from lxml import etree
 
 path = "input.docx"
@@ -21,6 +22,8 @@ MAX_XML_PART = 20 * 1024 * 1024
 MAX_ENTRY = 100 * 1024 * 1024
 MAX_TOTAL_UNCOMPRESSED = 500 * 1024 * 1024
 MAX_COMPRESSION_RATIO = 200
+MAX_COMPRESSED_FILE = 200 * 1024 * 1024
+MAX_MEMBERS = 10_000
 
 # Security limits must survive `python -O` (which strips assert statements),
 # so every check raises explicitly instead of asserting.
@@ -35,8 +38,11 @@ safe_xml_parser = etree.XMLParser(
     huge_tree=False,
     recover=False,
 )
+require(Path(path).stat().st_size <= MAX_COMPRESSED_FILE,
+        "compressed DOCX file size above limit")
 with zipfile.ZipFile(path) as z:
     infos = z.infolist()
+    require(len(infos) <= MAX_MEMBERS, "too many archive members")
     names = {info.filename for info in infos}
     require(len(names) == len(infos), "duplicate archive member names are unsafe")
     require("[Content_Types].xml" in names and "word/document.xml" in names,

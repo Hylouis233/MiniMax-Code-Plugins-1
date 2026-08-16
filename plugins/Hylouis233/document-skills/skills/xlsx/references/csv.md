@@ -67,6 +67,18 @@ with open("output.csv", "w", newline="", encoding="utf-8") as f:
   formula_wb = openpyxl.load_workbook("input.xlsx", read_only=True, data_only=False)
   value_wb = openpyxl.load_workbook("input.xlsx", read_only=True, data_only=True)
   formula_ws, value_ws = formula_wb["Data"], value_wb["Data"]
+  # Do not trust a producer's cached <dimension> declaration. In read-only mode a
+  # plausible-but-truncated dimension otherwise hides populated cells from iter_rows().
+  formula_ws.reset_dimensions()
+  value_ws.reset_dimensions()
+
+  def spreadsheet_safe_csv_value(value):
+      # Spreadsheet-targeted CSV is the safe default. A leading apostrophe prevents
+      # Excel/LibreOffice from evaluating literal text as a formula when opened.
+      if isinstance(value, str) and value.startswith(("=", "+", "-", "@")):
+          return "'" + value
+      return value
+
   missing_caches = []
   output_path = Path("output.csv")
   temporary_path = output_path.with_suffix(output_path.suffix + ".tmp")
@@ -76,7 +88,7 @@ with open("output.csv", "w", newline="", encoding="utf-8") as f:
           for formula_cell, value_cell in zip(formula_row, value_row):
               if formula_cell.data_type == "f" and value_cell.value is None:
                   missing_caches.append(formula_cell.coordinate)
-          writer.writerow([cell.value for cell in value_row])
+          writer.writerow([spreadsheet_safe_csv_value(cell.value) for cell in value_row])
   formula_wb.close()
   value_wb.close()
   if missing_caches:
@@ -86,8 +98,11 @@ with open("output.csv", "w", newline="", encoding="utf-8") as f:
   ```
 
   Format numbers yourself only if the user needs a fixed display format; otherwise write raw
-  cached values and say so. Export formula text from the `data_only=False` workbook only when
-  the user explicitly requests formulas rather than displayed values.
+  cached values and say so. The snippet neutralizes formula-like literal text because its CSV is
+  intended for spreadsheet applications. Preserve such prefixes unchanged only in an explicitly
+  requested raw-data export, and warn that opening that raw CSV in a spreadsheet is unsafe.
+  Export formula text from the `data_only=False` workbook only when the user explicitly requests
+  formulas rather than displayed values.
 - Large CSV -> keep it CSV or move to SQLite/Parquet; loading it all into one sheet to
   "preserve" it usually exceeds limits and helps nobody.
 

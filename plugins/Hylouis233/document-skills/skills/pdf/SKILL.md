@@ -58,9 +58,13 @@ output_path = "output.pdf"
 password = os.environ.get("PDF_PASSWORD")
 r = pypdf.PdfReader(output_path)
 if r.is_encrypted:
-    if not password:
-        raise RuntimeError("set PDF_PASSWORD so the encrypted output can be postchecked")
-    r = pypdf.PdfReader(output_path, password=password)  # wrong passwords fail here
+    # Permission-encrypted PDFs commonly use an empty user password and open normally.
+    # Authenticate that case before requiring an operator-supplied password.
+    if r.decrypt("") == 0:
+        if not password:
+            raise RuntimeError("set PDF_PASSWORD so the encrypted output can be postchecked")
+        if r.decrypt(password) == 0:
+            raise RuntimeError("PDF_PASSWORD could not decrypt the output")
 
 def require(condition, message):
     # Mandatory verification must remain active under python -O.

@@ -100,6 +100,19 @@ probe = pypdf.PdfReader("encrypted.pdf")
 check("encrypted fixture is detected before page access", probe.is_encrypted)
 encrypted_r = pypdf.PdfReader("encrypted.pdf", password="fixture-password")
 check("password-authenticated postcheck can access every page", len(encrypted_r.pages) == 2)
+
+blank_password_writer = pypdf.PdfWriter()
+blank_password_writer.append(r)
+blank_password_writer.encrypt("", owner_password="fixture-owner-password")
+with open("blank-password-encrypted.pdf", "wb") as f:
+    blank_password_writer.write(f)
+blank_password_reader = pypdf.PdfReader("blank-password-encrypted.pdf")
+if blank_password_reader.is_encrypted and blank_password_reader.decrypt("") == 0:
+    blank_password_opened = False
+else:
+    blank_password_opened = len(blank_password_reader.pages) == 2
+check("postcheck accepts permission encryption with an empty user password",
+      blank_password_opened)
 try:
     open_pdf("encrypted.pdf")
     transform_rejected_missing_password = False
@@ -223,12 +236,35 @@ check("hard-coded first-page form fill misses a page-2 widget (negative control)
 
 
 def widget_field_name(widget):
+    parts = []
+    seen = set()
     while widget is not None:
+        object_id = id(widget)
+        if object_id in seen:
+            raise ValueError("cycle in AcroForm field parent chain")
+        seen.add(object_id)
         if widget.get("/T") is not None:
-            return str(widget["/T"])
+            parts.append(str(widget["/T"]))
         parent = widget.get("/Parent")
         widget = None if parent is None else parent.get_object()
-    return None
+    return ".".join(reversed(parts)) or None
+
+
+class DirectObjectReference:
+    def __init__(self, value):
+        self.value = value
+
+    def get_object(self):
+        return self.value
+
+
+field_parent = {"/T": "application"}
+hierarchical_widget = {
+    "/T": "applicant_name",
+    "/Parent": DirectObjectReference(field_parent),
+}
+check("widget lookup resolves a fully qualified hierarchical field name",
+      widget_field_name(hierarchical_widget) == "application.applicant_name")
 
 
 page2_writer = PdfWriter()

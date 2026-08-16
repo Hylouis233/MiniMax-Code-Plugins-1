@@ -163,15 +163,21 @@ Encryption and forms:
   writer.append(reader)   # clones every page AND the catalog /AcroForm into the writer
 
   def widget_field_name(widget):
-      """Resolve /T on a widget or its parent field dictionary."""
+      """Resolve the fully qualified /T name from every field ancestor."""
+      parts = []
+      seen = set()
       while widget is not None:
+          object_id = id(widget)
+          if object_id in seen:
+              raise ValueError("cycle in AcroForm field parent chain")
+          seen.add(object_id)
           if widget.get("/T") is not None:
-              return str(widget["/T"])
+              parts.append(str(widget["/T"]))
           parent = widget.get("/Parent")
           widget = None if parent is None else parent.get_object()
-      return None
+      return ".".join(reversed(parts)) or None
 
-  field_name = "applicant_name"
+  field_name = "application.applicant_name"  # use the key exposed by get_fields()
   target_pages = [
       page for page in writer.pages
       if any(
@@ -189,7 +195,7 @@ Encryption and forms:
       writer.write(f)
 
   check = PdfReader("filled.pdf")
-  value = str((check.get_fields() or {}).get("applicant_name", {}).get("/V", ""))
+  value = str((check.get_fields() or {}).get(field_name, {}).get("/V", ""))
   if value.strip("/") != "Ada Byron":
       raise ValueError(f"filled field did not round-trip: {value!r}")
   ```
