@@ -304,6 +304,102 @@ async function linuxMarkedProcesses(marker, procRoot, fsOps) {
   return matches;
 }
 
+async function linuxFallbackTrackedProcessSnapshot(
+  rootPid,
+  treeState,
+  procRoot,
+  fsOps,
+  allowRootIdentityCapture = false,
+) {
+  const snapshot = await linuxProcessSnapshot(procRoot, fsOps);
+  if (snapshot === null) {
+    treeState.processIdentityUncertain = true;
+    return null;
+  }
+  treeState.knownStarts ??= new Map();
+  const byPid = new Map(snapshot.map((item) => [item.pid, item]));
+  const accepted = new Map();
+  const root = byPid.get(rootPid);
+  let expectedRoot = treeState.knownStarts.get(rootPid);
+  if (allowRootIdentityCapture && !expectedRoot && root?.startIdentity) {
+    const rootAfter = await readLinuxStat(rootPid, procRoot, fsOps);
+    if (!rootAfter || rootAfter.startIdentity !== root.startIdentity) {
+      treeState.processIdentityUncertain = true;
+      return null;
+    }
+    expectedRoot = root.startIdentity;
+    treeState.knownStarts.set(rootPid, expectedRoot);
+  }
+  if (root && expectedRoot && root.startIdentity === expectedRoot) {
+    accepted.set(rootPid, root);
+    treeState.knownPids.add(rootPid);
+  }
+  for (const [pid, expected] of treeState.knownStarts) {
+    const item = byPid.get(pid);
+    if (item?.startIdentity && item.startIdentity === expected) accepted.set(pid, item);
+  }
+
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const item of snapshot) {
+      if (accepted.has(item.pid) || !/^\d+$/u.test(item.startIdentity)) continue;
+      const parent = accepted.get(item.parentPid);
+      const rootGroupMember = accepted.has(rootPid) && item.processGroupId === rootPid;
+      if (!parent && !rootGroupMember) continue;
+      const relationshipAnchor = parent ?? accepted.get(rootPid);
+      if (!/^\d+$/u.test(relationshipAnchor.startIdentity) ||
+          BigInt(item.startIdentity) < BigInt(relationshipAnchor.startIdentity)) {
+        treeState.processIdentityUncertain = true;
+        continue;
+      }
+      const current = await readLinuxStat(item.pid, procRoot, fsOps);
+      if (current === null) return null;
+      if (current === undefined) continue;
+      if (current.startIdentity !== item.startIdentity ||
+          (parent && current.parentPid !== parent.pid) ||
+          (rootGroupMember && current.processGroupId !== rootPid)) {
+        treeState.processIdentityUncertain = true;
+        continue;
+      }
+      const anchorNow = await readLinuxStat(relationshipAnchor.pid, procRoot, fsOps);
+      if (anchorNow === null) return null;
+      if (!anchorNow || anchorNow.startIdentity !== relationshipAnchor.startIdentity) {
+        treeState.processIdentityUncertain = true;
+        continue;
+      }
+      accepted.set(item.pid, current);
+      treeState.knownPids.add(item.pid);
+      treeState.knownStarts.set(item.pid, current.startIdentity);
+      changed = true;
+    }
+  }
+
+  if (treeState.runMarker) {
+    const marked = await linuxMarkedProcesses(treeState.runMarker, procRoot, fsOps);
+    if (marked === null || marked.identityConflict === true) {
+      treeState.processIdentityUncertain = true;
+      return null;
+    }
+    for (const item of marked) {
+      if (item.pid === rootPid) continue;
+      const expected = treeState.knownStarts.get(item.pid);
+      if (expected && expected !== item.startIdentity) {
+        treeState.processIdentityUncertain = true;
+        continue;
+      }
+      treeState.knownPids.add(item.pid);
+      if (!expected) treeState.knownStarts.set(item.pid, item.startIdentity);
+      accepted.set(item.pid, item);
+    }
+  }
+  const processes = [...accepted.values()];
+  // Discovery used a complete host snapshot, but the accepted ownership subset
+  // is intentionally narrower. Keep group probing enabled for final liveness.
+  processes.incomplete = true;
+  return processes;
+}
+
 // Follow only PIDs already owned by this worker and the kernel-maintained child
 // lists for their tasks. This keeps the short escape-detection interval without
 // rescanning every process on the host for the lifetime of a delegation.
@@ -315,6 +411,11 @@ async function linuxTrackedProcessSnapshot(
   allowRootIdentityCapture = false,
 ) {
   treeState.knownStarts ??= new Map();
+  if (treeState.linuxTaskChildrenUnavailable === true) {
+    return await linuxFallbackTrackedProcessSnapshot(
+      rootPid, treeState, procRoot, fsOps, allowRootIdentityCapture,
+    );
+  }
   const queue = [];
   const queued = new Set();
   const enqueue = (pid, parentPid = null, parentStartIdentity = null) => {
@@ -450,6 +551,29 @@ async function linuxTrackedProcessSnapshot(
             `${procRoot}/${pid}/task/${taskEntry.name}/children`, "utf8",
           );
         } catch (error) {
+          if (allowRootIdentityCapture && pid === rootPid && taskEntry.name === String(rootPid) &&
+              error?.code === "ENOENT") {
+            let taskEntriesAfter;
+            try {
+              taskEntriesAfter = await fsOps.readdir(`${procRoot}/${pid}/task`, {
+                withFileTypes: true,
+              });
+            } catch (confirmError) {
+              if (!isLinuxProcessGone(confirmError)) return null;
+              taskEntriesAfter = [];
+            }
+            const mainTaskStillPresent = taskEntriesAfter.some((entry) =>
+              entry.isDirectory() && entry.name === String(rootPid));
+            const rootAfter = mainTaskStillPresent
+              ? await readLinuxStat(pid, procRoot, fsOps)
+              : undefined;
+            if (rootAfter && rootAfter.startIdentity === item.startIdentity) {
+              treeState.linuxTaskChildrenUnavailable = true;
+              return await linuxFallbackTrackedProcessSnapshot(
+                rootPid, treeState, procRoot, fsOps, allowRootIdentityCapture,
+              );
+            }
+          }
           if (isLinuxProcessGone(error)) {
             taskChangedWhileReading = true;
             continue;

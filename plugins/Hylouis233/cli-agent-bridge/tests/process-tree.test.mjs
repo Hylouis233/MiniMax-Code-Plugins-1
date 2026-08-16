@@ -77,6 +77,100 @@ test("Linux ancestry refresh follows task children without scanning all of procf
   assert.equal(treeState.knownStarts.get(602), "11");
 });
 
+test("Linux falls back safely when the live main task has no children file", async () => {
+  let childrenReads = 0;
+  const directory = (name) => ({ name: String(name), isDirectory: () => true });
+  const fsOps = {
+    readdir: async (target) => {
+      if (target === "/fixture-proc/100/task") return [directory(100)];
+      if (target === "/fixture-proc") return [directory(100), directory(200)];
+      return [];
+    },
+    readFile: async (target) => {
+      if (target.endsWith("/100/task/100/children")) {
+        childrenReads += 1;
+        throw missingProcessError("ENOENT");
+      }
+      if (target.endsWith("/100/stat")) {
+        return procStatLine(100, { parent: 1, group: 100, startIdentity: 10 });
+      }
+      if (target.endsWith("/200/stat")) {
+        return procStatLine(200, { parent: 100, group: 200, startIdentity: 20 });
+      }
+      throw missingProcessError();
+    },
+  };
+  const child = { pid: 100, exitCode: null, signalCode: null };
+  const treeState = { knownPids: new Set([100]), knownStarts: new Map() };
+  await initializeProcessTree(child, treeState, {
+    platform: "linux", procRoot: "/fixture-proc", fsOps,
+  });
+  assert.equal(treeState.linuxTaskChildrenUnavailable, true);
+  assert.equal(treeState.knownStarts.get(100), "10");
+  assert.equal(treeState.knownStarts.get(200), "20");
+  assert.equal(treeState.processIdentityUncertain, undefined);
+  await refreshProcessTree(child, treeState, {
+    platform: "linux", procRoot: "/fixture-proc", fsOps,
+  });
+  assert.equal(childrenReads, 1, "capability detection is cached after the verified fallback");
+});
+
+test("Linux children-file fallback recovers a reparented marked descendant", async () => {
+  const directory = (name) => ({ name: String(name), isDirectory: () => true });
+  const fsOps = {
+    readdir: async (target) => target === "/fixture-proc" ? [directory(300)] : [],
+    readFile: async (target) => {
+      if (target.endsWith("/100/stat")) throw missingProcessError();
+      if (target.endsWith("/300/stat")) {
+        return procStatLine(300, { parent: 1, group: 300, startIdentity: 30 });
+      }
+      if (target.endsWith("/300/environ")) {
+        return Buffer.from("PATH=/fixture\0CLI_AGENT_BRIDGE_RUN_ID=fallback-run\0");
+      }
+      throw missingProcessError();
+    },
+  };
+  const treeState = {
+    knownPids: new Set([100]),
+    knownStarts: new Map([[100, "10"]]),
+    linuxTaskChildrenUnavailable: true,
+    runMarker: "fallback-run",
+  };
+  const snapshot = await refreshProcessTree({ pid: 100 }, treeState, {
+    platform: "linux", procRoot: "/fixture-proc", fsOps,
+  });
+  assert.deepEqual(snapshot.map((item) => item.pid), [300]);
+  assert.equal(treeState.knownStarts.get(300), "30");
+  assert.equal(treeState.processIdentityUncertain, undefined);
+});
+
+test("Linux children-file fallback rejects an unavailable full snapshot", async () => {
+  const directory = (name) => ({ name: String(name), isDirectory: () => true });
+  const fsOps = {
+    readdir: async (target) => {
+      if (target === "/fixture-proc/100/task") return [directory(100)];
+      if (target === "/fixture-proc") {
+        throw Object.assign(new Error("procfs denied"), { code: "EACCES" });
+      }
+      return [];
+    },
+    readFile: async (target) => {
+      if (target.endsWith("/100/task/100/children")) throw missingProcessError("ENOENT");
+      if (target.endsWith("/100/stat")) {
+        return procStatLine(100, { parent: 1, group: 100, startIdentity: 10 });
+      }
+      throw missingProcessError();
+    },
+  };
+  const treeState = { knownPids: new Set([100]), knownStarts: new Map() };
+  await assert.rejects(initializeProcessTree(
+    { pid: 100, exitCode: null, signalCode: null }, treeState,
+    { platform: "linux", procRoot: "/fixture-proc", fsOps },
+  ), /identity was not captured/iu);
+  assert.equal(treeState.processIdentityUncertain, true);
+  assert.equal(treeState.knownStarts.size, 0);
+});
+
 test("Linux refresh recovers a marked detached child after its parent exits", async (context) => {
   const procRoot = await mkdtemp(path.join(os.tmpdir(), "cli-agent-bridge-proc-"));
   context.after(() => rm(procRoot, { recursive: true, force: true }));

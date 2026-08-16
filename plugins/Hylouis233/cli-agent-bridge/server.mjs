@@ -495,9 +495,19 @@ export async function runCommand(command, args, options = {}) {
         try { child.kill("SIGKILL"); } catch { /* already gone */ }
       });
       if (process.platform !== "win32" || options.refreshProcessTree) {
-        const refreshIntervalMs = process.platform === "linux" ? 25 : 250;
-        treeRefreshTimer = setInterval(() => { void refreshTree(); }, refreshIntervalMs);
-        treeRefreshTimer.unref?.();
+        // Initialization captures the immutable root identity and mutates the
+        // same tracking state as a periodic refresh. Do not let the timer race
+        // that startup barrier or revive polling after startup failed/cleanup
+        // already stopped the tree tracker.
+        void treeState.initialRefresh.then(() => {
+          if (treeRefreshStopped || terminationPromise || !treeTerminated ||
+              treeState.processInspectionUncertain === true ||
+              child.exitCode !== null || child.signalCode !== null) return;
+          const refreshIntervalMs = process.platform === "linux" &&
+            treeState.linuxTaskChildrenUnavailable !== true ? 25 : 250;
+          treeRefreshTimer = setInterval(() => { void refreshTree(); }, refreshIntervalMs);
+          treeRefreshTimer.unref?.();
+        });
       }
     }
     // Publish the controller only after the startup identity barrier exists.
@@ -794,18 +804,26 @@ async function openRepositoryAccess(gitCommonDir, options = {}) {
 
 const WORKSPACE_LOCK_STORE_NAME = "cli-agent-bridge-lock-store.git";
 const REPOSITORY_ID_FILE = "cli-agent-bridge-repository-id";
+const REPOSITORY_ID_REF = "refs/cli-agent-bridge/repository-id";
 const REPOSITORY_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 
-async function readRepositoryId(idPath, options = {}) {
+function validateRepositoryId(value, source) {
+  const normalized = String(value ?? "").trim();
+  if (!REPOSITORY_ID_PATTERN.test(normalized)) {
+    throw new Error("workspace lock store repository identity is malformed in " + source);
+  }
+  return normalized;
+}
+
+async function readLegacyRepositoryId(idPath, options = {}) {
   const metadata = await interruptibleFilesystemOperation(stat(idPath), options);
   if (!metadata.isFile() || metadata.size > 128) {
     throw new Error("workspace lock store repository identity is invalid");
   }
-  const value = (await interruptibleFilesystemOperation(readFile(idPath, "utf8"), options)).trim();
-  if (!REPOSITORY_ID_PATTERN.test(value)) {
-    throw new Error("workspace lock store repository identity is malformed");
-  }
-  return value;
+  return validateRepositoryId(
+    await interruptibleFilesystemOperation(readFile(idPath, "utf8"), options),
+    "legacy identity file",
+  );
 }
 
 async function repositoryIdMode(storeRoot, options = {}) {
@@ -822,38 +840,126 @@ async function repositoryIdMode(storeRoot, options = {}) {
   return 0o600;
 }
 
-async function ensureRepositoryId(storeRoot, options = {}) {
+async function readPublishedLegacyRepositoryId(idPath, options = {}) {
+  let lastError;
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    try {
+      return await readLegacyRepositoryId(idPath, options);
+    } catch (error) {
+      if (error instanceof OperationCancelledError || error instanceof DeadlineExceededError) throw error;
+      lastError = error;
+      if (attempt + 1 < 40) {
+        await interruptibleFilesystemOperation(
+          new Promise((resolve) => setTimeout(resolve, 10)), options,
+        );
+      }
+    }
+  }
+  throw lastError;
+}
+
+async function publishLegacyRepositoryId(storeRoot, repositoryId, options = {}) {
   const idPath = path.join(storeRoot, REPOSITORY_ID_FILE);
+  const mode = await repositoryIdMode(storeRoot, options);
+  const writing = writeFile(idPath, repositoryId + "\n", { flag: "wx", mode });
   try {
-    return await readRepositoryId(idPath, options);
+    await interruptibleFilesystemOperation(writing, options);
+    await interruptibleFilesystemOperation(chmod(idPath, mode), options);
+  } catch (error) {
+    if (error.code !== "EEXIST") {
+      // Cancellation cannot abort the small exclusive write. Leave a completed
+      // identity as a safe compatibility anchor for the next request; a partial
+      // write is malformed and therefore fails closed in both bridge versions.
+      void writing.then(() => chmod(idPath, mode)).catch(() => {});
+      throw error;
+    }
+  }
+  return await readPublishedLegacyRepositoryId(idPath, options);
+}
+
+async function readRepositoryIdRef(storeRoot, options = {}) {
+  const refResult = await runGitCommand(["rev-parse", "--verify", "--quiet", REPOSITORY_ID_REF], {
+    cwd: storeRoot, ...options,
+  });
+  if (refResult.exitCode === 1 && !refResult.stdout.trim() && !refResult.timedOut) return null;
+  const refFailure = snapshotFailure("git rev-parse repository identity ref", refResult);
+  if (refFailure) throw new Error("cannot read lock-store repository identity: " + refFailure);
+  const oid = refResult.stdout.trim();
+  if (!/^[0-9a-f]{40,64}$/u.test(oid)) {
+    throw new Error("workspace lock store repository identity ref is invalid");
+  }
+  const blobResult = await runGitCommand(["cat-file", "blob", oid], {
+    cwd: storeRoot, ...options,
+  });
+  const blobFailure = snapshotFailure("git cat-file repository identity", blobResult);
+  if (blobFailure) throw new Error("cannot read lock-store repository identity: " + blobFailure);
+  return validateRepositoryId(blobResult.stdout, "repository identity ref");
+}
+
+async function publishRepositoryIdRef(storeRoot, candidateId, options = {}) {
+  const existing = await readRepositoryIdRef(storeRoot, options);
+  if (existing) {
+    if (existing !== candidateId) {
+      throw new Error("workspace lock store repository identity ref conflicts with legacy identity");
+    }
+    return existing;
+  }
+  const blobResult = await runGitCommand(["hash-object", "-w", "--stdin"], {
+    cwd: storeRoot, ...options, stdinText: candidateId + "\n",
+  });
+  const blobFailure = snapshotFailure("git hash-object repository identity", blobResult);
+  const candidateOid = blobResult.stdout.trim();
+  if (blobFailure || !/^[0-9a-f]{40,64}$/u.test(candidateOid)) {
+    throw new Error("cannot write lock-store repository identity: " + (
+      blobFailure || "invalid object id"
+    ));
+  }
+  const updateResult = await runGitCommand([
+    "update-ref", "--no-deref", REPOSITORY_ID_REF, candidateOid, "0".repeat(candidateOid.length),
+  ], { cwd: storeRoot, ...options });
+  if (updateResult.exitCode === 0) return candidateId;
+  // A concurrent initializer may have won the create-only CAS. Read its value
+  // instead of treating the expected contention as an initialization failure.
+  const winner = await readRepositoryIdRef(storeRoot, options);
+  if (winner) {
+    if (winner !== candidateId) {
+      throw new Error("workspace lock store repository identity CAS selected a conflicting value");
+    }
+    return winner;
+  }
+  const updateFailure = snapshotFailure("git update-ref repository identity", updateResult);
+  throw new Error("cannot publish lock-store repository identity: " + (
+    updateFailure || "repository identity ref was not created"
+  ));
+}
+
+async function ensureRepositoryId(storeRoot, options = {}) {
+  const refIdentity = await readRepositoryIdRef(storeRoot, options);
+  const idPath = path.join(storeRoot, REPOSITORY_ID_FILE);
+  let legacyIdentity = null;
+  try {
+    legacyIdentity = await readLegacyRepositoryId(idPath, options);
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
   }
-  const candidateId = randomUUID();
-  const candidatePath = idPath + ".candidate-" + String(process.pid) + "-" + randomUUID();
-  const mode = await repositoryIdMode(storeRoot, options);
-  const writing = writeFile(candidatePath, candidateId + "\n", { flag: "wx", mode });
-  try {
-    await interruptibleFilesystemOperation(writing, options);
-  } catch (error) {
-    // A cancellation cannot abort the underlying write. Remove a candidate
-    // that arrives after the request has already stopped waiting for it.
-    void writing.then(() => unlink(candidatePath)).catch(() => {});
-    throw error;
+  if (refIdentity && legacyIdentity && refIdentity !== legacyIdentity) {
+    throw new Error("workspace lock store repository identity sources conflict");
   }
-  try {
-    await interruptibleFilesystemOperation(chmod(candidatePath, mode), options);
-    try {
-      await interruptibleFilesystemOperation(link(candidatePath, idPath), options);
-    } catch (error) {
-      if (error.code !== "EEXIST") throw error;
+  if (refIdentity) {
+    const publishedLegacy = legacyIdentity ??
+      await publishLegacyRepositoryId(storeRoot, refIdentity, options);
+    if (publishedLegacy !== refIdentity) {
+      throw new Error("workspace lock store legacy identity conflicts with repository identity ref");
     }
-  } finally {
-    await unlink(candidatePath).catch((error) => {
-      if (error.code !== "ENOENT") throw error;
-    });
+    return refIdentity;
   }
-  return await readRepositoryId(idPath, options);
+  // Publish the file-compatible anchor first so an older bridge running during
+  // a rolling upgrade can never create a second UUID/lock domain. `wx` is the
+  // only required filesystem primitive; partial/crashed writes are malformed
+  // and fail closed rather than allowing a different identity to be published.
+  const publishedLegacy = legacyIdentity ??
+    await publishLegacyRepositoryId(storeRoot, randomUUID(), options);
+  return await publishRepositoryIdRef(storeRoot, publishedLegacy, options);
 }
 
 async function ensureWorkspaceLockStore(gitCommonDir, options = {}) {
@@ -978,10 +1084,10 @@ export async function runGitCommand(args, {
   return result;
 }
 
-// A lease owner counts as concurrently active while its heartbeat is fresh
-// and its worker has not finished; linked worktrees share one ref store, so
-// another worktree's delegation is visible here and can interleave commits.
-const CONCURRENT_LEASE_STALE_MS = 30_000;
+// A starting/running lease ref is conservatively active until its exact owner
+// CAS removes or transitions it. Periodic ownership probes intentionally avoid
+// writing heartbeat blobs, and a stale timestamp cannot prove that an escaped
+// worker (or a worker on another host sharing the repository) has stopped.
 
 async function gitSnapshot(worktreeRoot, options = {}) {
   const ownLockRef = typeof options.ownLockRef === "string" ? options.ownLockRef : null;
@@ -1127,9 +1233,7 @@ async function gitSnapshot(worktreeRoot, options = {}) {
         continue;
       }
       const active = record &&
-        (record.workerState === "starting" || record.workerState === "running") &&
-        Number.isFinite(record.heartbeatAt) &&
-        Date.now() - record.heartbeatAt < CONCURRENT_LEASE_STALE_MS;
+        (record.workerState === "starting" || record.workerState === "running");
       if (active) concurrentDelegations += 1;
     } catch { /* malformed owner blob: ignore for disclosure */ }
   }

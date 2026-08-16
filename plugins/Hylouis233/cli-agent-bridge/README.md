@@ -123,8 +123,9 @@ you already obtained a valid ID from that backend outside this Plugin.
   Git-ref compare-and-swap in a private bare repository at
   `<git-common-dir>/cli-agent-bridge-lock-store.git`. Keeping coordination refs out of the target
   repository prevents `git push --mirror` from publishing host/process/token metadata.
-  On Linux, the private store carries an atomically initialized persistent repository identity,
-  and the bridge keeps a common-directory handle open through release. Renaming the repository
+  On Linux, the private store publishes its persistent UUID through an exclusive ordinary-file
+  compatibility anchor and the same-value UUID blob behind a create-only Git-ref CAS, without
+  requiring hard-link support. The bridge keeps a common-directory handle open through release. Renaming the repository
   therefore cannot create a second lock domain or strand the original holder on its obsolete
   pathname, while deleting and recreating a repository cannot inherit the old lock identity. A stale
   idle lock is reclaimed only when its same-host owner is positively
@@ -142,7 +143,9 @@ you already obtained a valid ID from that backend outside this Plugin.
   metadata in the private bare lock store. Its initialization inherits the enclosing repository's
   `core.sharedRepository` mode for group/multi-user repositories. Each acquisition writes an owner
   blob and temporarily updates a coordination ref there. Periodic ownership checks read that ref
-  without manufacturing new heartbeat blobs, and each normal release schedules Git's safe automatic
+  without manufacturing new heartbeat blobs; any extant `starting`/`running` ref remains a
+  conservative attribution-overlap signal regardless of its last state-transition timestamp.
+  Each normal release schedules Git's safe automatic
   maintenance for superseded state. A failed release first leaves an exact-owner recovery record in
   the shared store, so another bridge process can finish cleanup after the transient failure clears.
   For these reasons workspace_status is not marked
@@ -155,7 +158,9 @@ you already obtained a valid ID from that backend outside this Plugin.
   leader identity still matches. On Linux, descendants also inherit a per-run environment marker;
   if the parent exits before ancestry polling, the close path uses a bounded observation grace and
   marker scans recover children that become visible just after the leader exits, using stable
-  identities from `/proc`. Under extreme Linux process churn, if an identity-stable ancestry
+  identities from `/proc`. If the kernel exposes tasks but not their `children` files, a verified
+  startup capability check switches to a full PID/PPID snapshot while preserving the same marker
+  and immutable-identity checks. Under extreme Linux process churn, if an identity-stable ancestry
   sample cannot be completed, the bridge conservatively quarantines the workspace for the same
   operator-verified manual recovery described below. Repository discovery and read-only snapshots
   resolve Git before entering the workspace and explicitly disable repository hooks, fsmonitor,

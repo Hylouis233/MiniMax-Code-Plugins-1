@@ -74,7 +74,19 @@ async function resolvePathCommandUncached(command) {
 export function resolvePathCommand(command) {
   if (typeof command !== "string" || !command) return Promise.resolve(null);
   if (!pathCommandPromises.has(command)) {
-    pathCommandPromises.set(command, resolvePathCommandUncached(command));
+    const resolution = resolvePathCommandUncached(command);
+    pathCommandPromises.set(command, resolution);
+    // Share an in-flight lookup and retain positive results, but do not make a
+    // missing/not-yet-installed CLI permanent for the lifetime of the server.
+    // The identity guard prevents an older completion from deleting a newer
+    // retry that has already occupied the same cache slot.
+    void resolution.then((resolved) => {
+      if (resolved === null && pathCommandPromises.get(command) === resolution) {
+        pathCommandPromises.delete(command);
+      }
+    }, () => {
+      if (pathCommandPromises.get(command) === resolution) pathCommandPromises.delete(command);
+    });
   }
   return pathCommandPromises.get(command);
 }

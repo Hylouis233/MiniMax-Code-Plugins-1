@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 import {
   localHostIdentity, WORKSPACE_LOCK_REF_PREFIX, workspaceLockRef,
 } from "../workspace-lock.mjs";
+import { resolvePathCommand } from "../git-executable.mjs";
 import {
   closestExistingBase, populateCommitishCache, runCommand, runGitCommand,
 } from "../server.mjs";
@@ -22,6 +23,24 @@ const pluginRoot = path.resolve(testsRoot, "..");
 const serverPath = path.join(pluginRoot, "server.mjs");
 const fakeBackendPath = path.join(testsRoot, "fake-backend.mjs");
 const requestKey = (id) => typeof id + ":" + String(id);
+
+test("failed backend command resolutions are retried after installation", async (context) => {
+  const binRoot = await mkdtemp(path.join(os.tmpdir(), "cli-agent-resolution-retry-test-"));
+  context.after(() => rm(binRoot, { recursive: true, force: true }));
+  const originalPath = process.env.PATH;
+  process.env.PATH = binRoot + path.delimiter + (originalPath ?? "");
+  context.after(() => { process.env.PATH = originalPath; });
+  const command = "late-installed-backend-" + String(process.pid) + "-" + String(Date.now());
+  const first = resolvePathCommand(command);
+  const concurrent = resolvePathCommand(command);
+  assert.equal(first, concurrent, "concurrent callers should share one filesystem lookup");
+  assert.deepEqual(await Promise.all([first, concurrent]), [null, null]);
+
+  const executable = path.join(binRoot, command + (process.platform === "win32" ? ".exe" : ""));
+  await copyFile(process.execPath, executable);
+  if (process.platform !== "win32") await chmod(executable, 0o755);
+  assert.equal(await resolvePathCommand(command), await realpath(executable));
+});
 
 function unconfirmedGitResult(overrides = {}) {
   return {
@@ -145,6 +164,40 @@ test("post-exit inspection waits for an in-flight ancestry refresh", async () =>
   const result = await pending;
   assert.equal(result.treeTerminated, true);
   assert.equal(inspectedAfterRefresh, true);
+});
+
+test("periodic process-tree polling starts only after initialization", async () => {
+  let releaseInitialization;
+  const initializationGate = new Promise((resolve) => { releaseInitialization = resolve; });
+  let initializing = true;
+  let refreshCalls = 0;
+  let refreshRaced = false;
+  const pending = runCommand(process.execPath, ["-e", "setTimeout(()=>{},1200)"], {
+    manageProcessTree: true,
+    processTreeTestMode: true,
+    timeoutMs: 5_000,
+    initializeProcessTree: async (_child, state) => {
+      await initializationGate;
+      state.fixtureRootIdentity = true;
+      initializing = false;
+    },
+    refreshProcessTree: async (_child, state) => {
+      refreshCalls += 1;
+      if (initializing || state.fixtureRootIdentity !== true) refreshRaced = true;
+    },
+    inspectProcessTree: async () => false,
+  });
+
+  // Windows test-mode polling uses the production 250 ms interval; hold the
+  // initializer beyond that boundary so this deterministically fails if the
+  // timer is ever installed before the startup barrier completes.
+  await new Promise((resolve) => setTimeout(resolve, 350));
+  assert.equal(refreshCalls, 0, "the timer must not inspect a partially initialized tree");
+  releaseInitialization();
+  await waitFor(() => refreshCalls > 0);
+  const result = await pending;
+  assert.equal(refreshRaced, false);
+  assert.equal(result.treeTerminated, true, JSON.stringify(result));
 });
 
 test("runner exit starts tree cleanup before escaped descendants close inherited streams", {
@@ -658,11 +711,21 @@ async function coordinationLockStore(workspace) {
   return path.join(await canonicalGitCommonDirectory(workspace), "cli-agent-bridge-lock-store.git");
 }
 
+async function repositoryIdFromStore(store) {
+  const { stdout: oid } = await execFileAsync(
+    "git", ["rev-parse", "--verify", "refs/cli-agent-bridge/repository-id"], { cwd: store },
+  );
+  const { stdout: repositoryId } = await execFileAsync(
+    "git", ["cat-file", "blob", oid.trim()], { cwd: store },
+  );
+  return repositoryId.trim();
+}
+
 async function repositoryKey(canonicalGitCommonDir) {
   if (process.platform === "linux") {
-    const repositoryId = (await readFile(path.join(
-      canonicalGitCommonDir, "cli-agent-bridge-lock-store.git", "cli-agent-bridge-repository-id",
-    ), "utf8")).trim();
+    const repositoryId = await repositoryIdFromStore(path.join(
+      canonicalGitCommonDir, "cli-agent-bridge-lock-store.git",
+    ));
     return "git-common-dir-id:" + repositoryId;
   }
   return "git-common-dir:" + path.normalize(canonicalGitCommonDir);
@@ -958,11 +1021,60 @@ test("the private lock store inherits the repository sharing mode", async (conte
   if (process.platform !== "win32") {
     const storeMode = (await stat(lockStore)).mode & 0o777;
     assert.equal(storeMode & 0o070, 0o070, "the repository group must be able to traverse its lock store");
-    const identityMode = (await stat(
-      path.join(lockStore, "cli-agent-bridge-repository-id"),
-    )).mode & 0o777;
-    assert.equal(identityMode & 0o060, 0o060, "the repository group must be able to read/write its identity");
+    const identityRefMode = (await stat(path.join(
+      lockStore, "refs", "cli-agent-bridge", "repository-id",
+    ))).mode & 0o777;
+    assert.equal(identityRefMode & 0o060, 0o060,
+      "the repository group must be able to read/write its identity ref");
+    const legacyIdentityMode = (await stat(path.join(
+      lockStore, "cli-agent-bridge-repository-id",
+    ))).mode & 0o777;
+    assert.equal(legacyIdentityMode & 0o060, 0o060,
+      "rolling-upgrade readers in the repository group must be able to read the identity anchor");
   }
+});
+
+test("stale starting and running lease refs remain visible to attribution", async (context) => {
+  const { tempRoot, workspace, client } = await makeHarness(context);
+  const initialized = await client.request("tools/call", {
+    name: "workspace_status", arguments: { workspacePath: workspace },
+  });
+  assert.equal(initialized.result.structuredContent.ok, true, JSON.stringify(initialized));
+  const store = await coordinationLockStore(workspace);
+  const otherRef = workspaceLockRef("fixture-stale-active-lease");
+  const writeOwner = async (workerState) => {
+    const ownerPath = path.join(tempRoot, "stale-" + workerState + "-owner.json");
+    await writeFile(ownerPath, JSON.stringify({
+      version: 1,
+      token: "fixture-stale-" + workerState,
+      hostIdentity: "fixture:other-bridge",
+      ownerPid: 4242,
+      ownerIdentity: "fixture-start",
+      workerState,
+      workerPid: workerState === "idle" ? null : 4343,
+      acquiredAt: Date.now() - 180_000,
+      heartbeatAt: Date.now() - 120_000,
+    }));
+    const { stdout } = await execFileAsync("git", ["hash-object", "-w", ownerPath], { cwd: store });
+    await execFileAsync("git", ["update-ref", otherRef, stdout.trim()], { cwd: store });
+  };
+  context.after(async () => {
+    try { await execFileAsync("git", ["update-ref", "-d", otherRef], { cwd: store }); } catch { /* already gone */ }
+  });
+
+  await writeOwner("running");
+  const active = await client.request("tools/call", {
+    name: "workspace_status", arguments: { workspacePath: workspace },
+  });
+  assert.equal(active.result.structuredContent.git.concurrentDelegations, 1,
+    "a current running ref remains active even when its write timestamp is old");
+
+  await writeOwner("idle");
+  const idle = await client.request("tools/call", {
+    name: "workspace_status", arguments: { workspacePath: workspace },
+  });
+  assert.equal(idle.result.structuredContent.git.concurrentDelegations, 0,
+    "a stale idle owner is not an active delegation");
 });
 
 test("concurrent first requests publish one valid repository identity", async (context) => {
@@ -981,10 +1093,13 @@ test("concurrent first requests publish one valid repository identity", async (c
     assert.equal(second.result.structuredContent.ok, true, JSON.stringify(second));
     const commonDir = await canonicalGitCommonDirectory(workspace);
     const store = await coordinationLockStore(workspace);
-    const repositoryId = (await readFile(
-      path.join(store, "cli-agent-bridge-repository-id"), "utf8",
-    )).trim();
+    const repositoryId = await repositoryIdFromStore(store);
     assert.match(repositoryId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u);
+    assert.equal(
+      (await readFile(path.join(store, "cli-agent-bridge-repository-id"), "utf8")).trim(),
+      repositoryId,
+      "a file-only older bridge must derive the same repository lock key",
+    );
     assert.deepEqual(
       (await readdir(commonDir)).filter((name) => name.startsWith(".cli-agent-bridge-lock-store-")),
       [],
@@ -993,6 +1108,48 @@ test("concurrent first requests publish one valid repository identity", async (c
   } finally {
     await secondClient.close();
   }
+});
+
+test("repository identity sources disagree only by failing closed", async (context) => {
+  const { workspace, client } = await makeHarness(context);
+  const initialized = await client.request("tools/call", {
+    name: "workspace_status", arguments: { workspacePath: workspace },
+  });
+  assert.equal(initialized.result.structuredContent.ok, true, JSON.stringify(initialized));
+  const store = await coordinationLockStore(workspace);
+  const refIdentity = await repositoryIdFromStore(store);
+  assert.equal(
+    (await readFile(path.join(store, "cli-agent-bridge-repository-id"), "utf8")).trim(),
+    refIdentity,
+  );
+  await writeFile(
+    path.join(store, "cli-agent-bridge-repository-id"),
+    "22222222-2222-4222-8222-222222222222\n",
+  );
+  const conflicted = await client.request("tools/call", {
+    name: "workspace_status", arguments: { workspacePath: workspace },
+  });
+  assert.match(conflicted.error?.message ?? "", /repository identity sources conflict/iu);
+});
+
+test("a legacy repository identity file is migrated into the CAS ref", async (context) => {
+  const { workspace, client } = await makeHarness(context);
+  const initialized = await client.request("tools/call", {
+    name: "workspace_status", arguments: { workspacePath: workspace },
+  });
+  assert.equal(initialized.result.structuredContent.ok, true, JSON.stringify(initialized));
+  const store = await coordinationLockStore(workspace);
+  await execFileAsync("git", ["update-ref", "-d", "refs/cli-agent-bridge/repository-id"], {
+    cwd: store,
+  });
+  const legacyId = "11111111-1111-4111-8111-111111111111";
+  await writeFile(path.join(store, "cli-agent-bridge-repository-id"), legacyId + "\n");
+
+  const migrated = await client.request("tools/call", {
+    name: "workspace_status", arguments: { workspacePath: workspace },
+  });
+  assert.equal(migrated.result.structuredContent.ok, true, JSON.stringify(migrated));
+  assert.equal(await repositoryIdFromStore(store), legacyId);
 });
 
 test("a repository recreated at the same path gets a new logical lock identity", {
@@ -1004,9 +1161,9 @@ test("a repository recreated at the same path gets a new logical lock identity",
   });
   assert.equal(initial.result.structuredContent.ok, true, JSON.stringify(initial));
   const firstCommonDir = await canonicalGitCommonDirectory(workspace);
-  const firstId = (await readFile(path.join(
-    firstCommonDir, "cli-agent-bridge-lock-store.git", "cli-agent-bridge-repository-id",
-  ), "utf8")).trim();
+  const firstId = await repositoryIdFromStore(path.join(
+    firstCommonDir, "cli-agent-bridge-lock-store.git",
+  ));
   const firstState = await repositoryStatePaths(firstCommonDir);
   await mkdir(firstState.root, { recursive: true });
   await writeFile(firstState.quarantinePath, JSON.stringify({ terminationError: "old repository" }));
@@ -1020,9 +1177,9 @@ test("a repository recreated at the same path gets a new logical lock identity",
   });
   assert.equal(recreated.result.structuredContent.ok, true, JSON.stringify(recreated));
   const secondCommonDir = await canonicalGitCommonDirectory(workspace);
-  const secondId = (await readFile(path.join(
-    secondCommonDir, "cli-agent-bridge-lock-store.git", "cli-agent-bridge-repository-id",
-  ), "utf8")).trim();
+  const secondId = await repositoryIdFromStore(path.join(
+    secondCommonDir, "cli-agent-bridge-lock-store.git",
+  ));
   assert.notEqual(secondId, firstId);
 });
 
