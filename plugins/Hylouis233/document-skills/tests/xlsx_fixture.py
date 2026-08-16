@@ -368,5 +368,31 @@ check("XLSX-to-CSV does not leak formula strings into value output",
 formula_wb.close()
 value_wb.close()
 
+# SKILL.md contract: fullCalcOnLoad makes viewers recalculate even in manual calc mode.
+calc_wb = openpyxl.Workbook()
+calc_ws = calc_wb.active
+calc_ws["A1"] = 1
+calc_ws["A2"] = 2
+calc_ws["A3"] = "=SUM(A1:A2)"
+calc_wb.calculation.calcMode = "manual"
+calc_wb.calculation.fullCalcOnLoad = False  # simulate a source that does not recalc on load
+calc_wb.save("stale-calc.xlsx")
+stale_reopened = openpyxl.load_workbook("stale-calc.xlsx")
+check("workbook without fullCalcOnLoad round-trips the stale flag (negative control)",
+      not bool(getattr(stale_reopened.calculation, "fullCalcOnLoad", False)),
+      stale_reopened.calculation)
+stale_reopened.calculation.fullCalcOnLoad = True
+stale_reopened.save("manual-calc.xlsx")
+calc_reopened = openpyxl.load_workbook("manual-calc.xlsx")
+check("fullCalcOnLoad survives save/reload",
+      bool(getattr(calc_reopened.calculation, "fullCalcOnLoad", False)),
+      calc_reopened.calculation)
+check("manual calc mode survives save/reload",
+      getattr(calc_reopened.calculation, "calcMode", None) == "manual",
+      calc_reopened.calculation)
+check("reloaded formula cell still holds the formula string",
+      calc_reopened.active["A3"].value == "=SUM(A1:A2)", calc_reopened.active["A3"].value)
+calc_reopened.close()
+
 print("\n" + ("ALL XLSX FIXTURES PASSED" if not failures else f"{len(failures)} FAILURES: {failures}"))
 sys.exit(0 if not failures else 1)

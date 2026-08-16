@@ -98,6 +98,29 @@ blank = (
 check("widget-only form page exposes a widget", len(widgets) == 1, len(widgets))
 check("widget-aware blank-page predicate keeps form page", not blank)
 
+# ---- SKILL.md postcheck: interactive-only pages are exempt from the text gate ---
+def widget_count(page):
+    count = 0
+    for ref in page.get("/Annots") or []:
+        if ref.get_object().get("/Subtype") == "/Widget":
+            count += 1
+    return count
+
+widget_postcheck = pypdf.PdfReader("widget-only.pdf")
+widget_text = (widget_postcheck.pages[0].extract_text() or "").strip()
+check("widget-only page extracts no text", widget_text == "", repr(widget_text))
+check("postcheck counts the widget annotation", widget_count(widget_postcheck.pages[0]) == 1)
+check("widget-only page passes the text postcheck via the widget exemption",
+      bool(widget_text) or widget_count(widget_postcheck.pages[0]) > 0)
+
+blank_writer = pypdf.PdfWriter()
+blank_writer.add_blank_page(width=200, height=300)
+with open("blank.pdf", "wb") as f:
+    blank_writer.write(f)
+blank_r = pypdf.PdfReader("blank.pdf")
+check("a truly blank page still fails the text postcheck",
+      not (bool((blank_r.pages[0].extract_text() or "").strip()) or widget_count(blank_r.pages[0]) > 0))
+
 # ---- transform.md AcroForm snippet: clone into writer, fill on writer pages ----
 from pypdf import PdfReader, PdfWriter
 
@@ -243,6 +266,24 @@ else:
         "<budget>" not in raw_text or "R&D;" in raw_text,
         raw_text[:120],
     )
+
+# ---- extract.md table route: find_tables instead of raw span soup ---------------
+from reportlab.lib import colors
+from reportlab.platypus import Table as RlTable, TableStyle
+
+rl_table = RlTable(
+    [["Region", "Sales"], ["North", "120"], ["South", "340"]],
+    style=TableStyle([("GRID", (0, 0), (-1, -1), 0.5, colors.black)]),
+)
+SimpleDocTemplate("table.pdf", pagesize=A4_SIZE).build([rl_table])
+
+table_doc = fitz.open("table.pdf")
+detected = table_doc[0].find_tables()
+check("find_tables detects the drawn table", len(detected.tables) == 1, len(detected.tables))
+if detected.tables:
+    extracted_rows = detected.tables[0].extract()
+    check("find_tables extracts the header row", extracted_rows[0] == ["Region", "Sales"], extracted_rows)
+    check("find_tables extracts data rows", extracted_rows[2] == ["South", "340"], extracted_rows)
 
 print("\n" + ("ALL PDF FIXTURES PASSED" if not failures else f"{len(failures)} FAILURES: {failures}"))
 sys.exit(0 if not failures else 1)

@@ -54,8 +54,8 @@ Per format:
   page geometry) and scene patterns (academic paper, resume, official document, contract).
 - **xlsx** — openpyxl for reading, editing, styling, and native charts; formulas as formulas,
   never as pasted results; `data_only=True` only for reading cached values; date/number formats
-  applied explicitly; recalculation contract documented (openpyxl writes formulas, the viewer
-  calculates). Depth references: conditional formatting rules, structured tables, and honest
+  applied explicitly; recalculation contract documented (openpyxl writes formulas, the Skills
+  set `fullCalcOnLoad` so even manual-calc workbooks recalculate when a viewer opens them). Depth references: conditional formatting rules, structured tables, and honest
   pivot-style aggregation (openpyxl cannot create pivot tables; the reference gives the
   formula-sheet, frozen-values, and user-template routes).
 - **pptx** — python-pptx to build decks (7 common slide patterns: title, agenda, bullet, two
@@ -63,10 +63,13 @@ Per format:
   rewriting of the whole XML; text measured against shape width with font-size reduction rules;
   presentation-level verification via `python-pptx` re-open plus a rendered PDF smoke test when
   LibreOffice is available.
-- **pdf** — creation prefers ReportLab (structured, accessible text) over HTML-to-print paths;
-  extraction (text, coordinates, tables, images) and rasterization use PyMuPDF, while pypdf is
-  reserved for page-level transforms such as split, merge, rotate, watermark, encryption, and
-  forms; an explicit one-tool-per-job table prevents accidental API mixing.
+- **pdf** — creation prefers ReportLab (real, selectable text with flowable structure) over
+  HTML-to-print paths; extraction (text, coordinates, tables, images) and rasterization use
+  PyMuPDF, while pypdf is reserved for page-level transforms such as split, merge, rotate,
+  watermark, encryption, and forms; an explicit one-tool-per-job table prevents accidental API
+  mixing. Note: ReportLab output is not tagged PDF/UA — when the user needs an accessible
+  (screen-reader-ready) PDF, the pdf Skill says to report that limitation honestly instead of
+  claiming accessibility.
 
 ## Verification-first output
 

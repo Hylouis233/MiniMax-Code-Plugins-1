@@ -39,9 +39,13 @@ python -c "import openpyxl; print(openpyxl.__version__)"
 3. **Types**: write `int`/`float`/`datetime`/`bool`, never formatted strings. Dates go in as
    `datetime` with `number_format='yyyy-mm-dd'`; currency as float plus
    `number_format='#,##0.00'` (or the locale-appropriate currency format string).
-4. **Formulas are not recalculated by openpyxl.** After writing formulas you cannot read their
-   results back without opening the file in a real spreadsheet app; verify formula strings and
-   ranges structurally instead (see postcheck).
+4. **Formulas are not recalculated by openpyxl.** After writing formulas, set
+   `wb.calculation.fullCalcOnLoad = True` before saving so Excel/WPS/LibreOffice recalculate
+   on open even when the workbook (typically one you loaded, which can carry
+   `fullCalcOnLoad=False`) uses calculation mode `manual` - check
+   `wb.calculation.calcMode`. You still cannot read results back without opening the file in
+   a real spreadsheet app; verify formula strings and ranges structurally instead (see
+   postcheck).
 5. **Dimensions**: `ws.max_row`/`ws.max_column` reflect used range - trust them over guesses;
    but scan for trailing blank-but-formatted rows when a file "looks" bigger than its data.
 6. Save to a new path first; overwrite only on explicit request.
@@ -66,6 +70,9 @@ wb = openpyxl.load_workbook(output_path)
 print("sheets:", wb.sheetnames)
 missing = set(expected_sheets) - set(wb.sheetnames)
 assert not missing, f"missing expected sheets: {sorted(missing)}"
+calc = wb.calculation
+print("calcMode:", getattr(calc, "calcMode", None),
+      "fullCalcOnLoad:", getattr(calc, "fullCalcOnLoad", None))
 for ws in wb.worksheets:
     print(f"{ws.title} dims:", ws.dimensions)
     formulas = [
@@ -82,6 +89,7 @@ wb.close()
 ```
 
 Confirm: expected sheet names exist; used range matches expectations; intended formula cells
-contain formula strings; every task-specific formatted cell is listed in
-`expected_number_formats` and matches. Report what was verified and note that final
-rendered values require opening in a spreadsheet application.
+contain formula strings; when the task wrote formulas, the printout shows `fullCalcOnLoad: True`
+(or `calcMode: auto`) so viewers will recalculate — otherwise set it and re-save; every
+task-specific formatted cell is listed in `expected_number_formats` and matches. Report what
+was verified and note that final rendered values require opening in a spreadsheet application.

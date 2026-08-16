@@ -66,10 +66,21 @@ page_texts = {
     number: (page.extract_text() or "").strip()
     for number, page in enumerate(r.pages, start=1)
 }
+
+def widget_count(page):
+    # Interactive-only pages (pure AcroForm screens) extract no text yet are valid output.
+    count = 0
+    for ref in page.get("/Annots") or []:
+        if ref.get_object().get("/Subtype") == "/Widget":
+            count += 1
+    return count
+
 intentionally_raster_only_pages = set()
 missing_text_pages = [
     number for number, text in page_texts.items()
-    if number not in intentionally_raster_only_pages and not text
+    if number not in intentionally_raster_only_pages
+    and not text
+    and widget_count(r.pages[number - 1]) == 0
 ]
 assert not missing_text_pages, f"pages without extractable text: {missing_text_pages}"
 # Add task-specific checks when exact copy matters, for example
@@ -96,8 +107,8 @@ assert not size_mismatches, f"unexpected page sizes: {size_mismatches}"
 ```
 
 Confirm: page count matches the request; every page except those explicitly listed in
-`intentionally_raster_only_pages` has extractable text; each requested key string is listed in
-`expected_strings_by_page` and extracts on the correct page; every value in `page_sizes` is the
-declared size within `page_size_tolerance`. Report all four. For pixel-sensitive work, render
-every applicable page with PyMuPDF at 100 dpi and check that each render is non-blank (mean pixel
-value).
+`intentionally_raster_only_pages` has extractable text or at least one form widget (a pure
+interactive page); each requested key string is listed in `expected_strings_by_page` and
+extracts on the correct page; every value in `page_sizes` is the declared size within
+`page_size_tolerance`. Report all four. For pixel-sensitive work, render every applicable page
+with PyMuPDF at 100 dpi and check that each render is non-blank (mean pixel value).

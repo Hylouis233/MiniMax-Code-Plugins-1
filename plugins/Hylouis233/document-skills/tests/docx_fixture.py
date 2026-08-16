@@ -15,6 +15,7 @@ from docx import Document
 from docx.opc.constants import RELATIONSHIP_TYPE as RT
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
+from docx.table import Table
 from docx.text.paragraph import Paragraph
 from lxml import etree
 
@@ -109,6 +110,18 @@ def iter_body_paragraphs(parent, document):
                 yield from iter_body_paragraphs(content, document)
 
 
+def iter_body_blocks(parent, document):
+    for child in parent.iterchildren():
+        if child.tag == qn("w:p"):
+            yield ("p", Paragraph(child, document))
+        elif child.tag == qn("w:tbl"):
+            yield ("table", Table(child, document))
+        elif child.tag == qn("w:sdt"):
+            content = child.find(qn("w:sdtContent"))
+            if content is not None:
+                yield from iter_body_blocks(content, document)
+
+
 sdt_doc = Document()
 sdt_doc.add_paragraph("direct paragraph")
 sdt_paragraph = sdt_doc.add_paragraph("inside content control")
@@ -117,12 +130,39 @@ sdt_content = OxmlElement("w:sdtContent")
 sdt_paragraph._p.getparent().replace(sdt_paragraph._p, sdt)
 sdt_content.append(sdt_paragraph._p)
 sdt.append(sdt_content)
+sdt_doc.add_paragraph("trailing paragraph")
 sdt_doc.save("content-control.docx")
 sdt_reopened = Document("content-control.docx")
 check("doc.paragraphs omits block content-control text (negative control)",
       "inside content control" not in [paragraph.text for paragraph in sdt_reopened.paragraphs])
 walked_text = [paragraph.text for paragraph in iter_body_paragraphs(sdt_reopened.element.body, sdt_reopened)]
 check("content-control traversal emits the nested paragraph", "inside content control" in walked_text, walked_text)
+
+# A table placed inside w:sdtContent is invisible to doc.tables; the block walker reaches it.
+table_doc = Document()
+table_doc.add_paragraph("before the control")
+sdt_table = table_doc.add_table(rows=2, cols=2)
+sdt_table.cell(0, 0).text = "ctrl-a1"
+sdt_table.cell(1, 1).text = "ctrl-b2"
+table_sdt = OxmlElement("w:sdt")
+table_sdt_content = OxmlElement("w:sdtContent")
+sdt_table._tbl.getparent().replace(sdt_table._tbl, table_sdt)
+table_sdt_content.append(sdt_table._tbl)
+table_sdt.append(table_sdt_content)
+table_doc.add_paragraph("after the control")
+table_doc.save("content-control-table.docx")
+table_reopened = Document("content-control-table.docx")
+check("doc.tables omits content-control tables (negative control)", len(table_reopened.tables) == 0)
+blocks = list(iter_body_blocks(table_reopened.element.body, table_reopened))
+kinds = [kind for kind, _ in blocks]
+nested_tables = [block for kind, block in blocks if kind == "table"]
+check("block walker keeps document order across the control",
+      kinds == ["p", "table", "p"], kinds)
+check("block walker surfaces the content-control table", len(nested_tables) == 1)
+if nested_tables:
+    check("content-control table cells are readable",
+          nested_tables[0].cell(0, 0).text == "ctrl-a1" and nested_tables[0].cell(1, 1).text == "ctrl-b2",
+          [[cell.text for cell in row.cells] for row in nested_tables[0].rows])
 
 # Per-run glyph validation must not let a different referenced font hide a missing glyph.
 fixture_cmaps = {"CJK Face": {ord("漢")}, "Latin Face": {ord("A")}}

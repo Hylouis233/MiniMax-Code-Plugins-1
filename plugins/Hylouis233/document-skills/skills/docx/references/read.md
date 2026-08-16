@@ -16,35 +16,40 @@ tables). Prefer this when the goal is content, not coordinates.
 ```python
 from docx import Document
 from docx.oxml.ns import qn
+from docx.table import Table
 from docx.text.paragraph import Paragraph
 
-def iter_body_paragraphs(parent, document):
-    """Yield direct body paragraphs plus paragraphs nested in block content controls."""
+def iter_body_blocks(parent, document):
+    """Yield ("p", paragraph) / ("table", table) blocks, recursing into block content controls."""
     for child in parent.iterchildren():
         if child.tag == qn("w:p"):
-            yield Paragraph(child, document)
+            yield ("p", Paragraph(child, document))
+        elif child.tag == qn("w:tbl"):
+            yield ("table", Table(child, document))
         elif child.tag == qn("w:sdt"):
             content = child.find(qn("w:sdtContent"))
             if content is not None:
-                yield from iter_body_paragraphs(content, document)
+                yield from iter_body_blocks(content, document)
 
 doc = Document("input.docx")
 content_controls = list(doc.element.body.iter(qn("w:sdt")))
 print("block content controls:", len(content_controls))
-for par in iter_body_paragraphs(doc.element.body, doc):
-    print(par.style.name, "|", par.text)
-for t, table in enumerate(doc.tables):
-    for r, row in enumerate(table.rows):
-        print(t, r, [c.text for c in row.cells])
+for kind, block in iter_body_blocks(doc.element.body, doc):
+    if kind == "p":
+        print("p", block.style.name, "|", block.text)
+    else:
+        print("table", len(block.rows), "x", len(block.columns),
+              [[cell.text for cell in row.cells] for row in block.rows])
 ```
 
 Notes:
 
-- `doc.paragraphs` includes only direct body paragraphs; it omits paragraphs nested in block
-  content controls (`w:sdt`). Use the traversal above and report the content-control count.
-  Text boxes, headers, footers, and footnotes still require their own collections
+- `doc.paragraphs` includes only direct body paragraphs and `doc.tables` only top-level
+  tables; both omit content nested in block content controls (`w:sdt`). The walker above
+  yields paragraphs and tables inside `w:sdtContent` too, and reports the content-control
+  count. Tables nested inside table cells still require walking `cell.tables`; text boxes,
+  headers, footers, and footnotes still require their own collections
   (`section.header/.footer`) or raw XML.
-- `doc.tables` is top-level only; nested tables require walking cells.
 - For revision/comment metadata, inspect the XML parts directly: `word/comments.xml`,
   `w:ins`/`w:del` elements in `word/document.xml`.
 
