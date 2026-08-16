@@ -1,9 +1,14 @@
 # Extract from a PDF (PyMuPDF)
 
 ```python
+import os
 import fitz  # pymupdf
 
 doc = fitz.open("input.pdf")
+if doc.needs_pass:
+    password = os.environ.get("PDF_PASSWORD")
+    if not password or not doc.authenticate(password):
+        raise RuntimeError("set PDF_PASSWORD to the correct password before extracting")
 print("pages:", doc.page_count, "metadata:", doc.metadata)
 
 # Extract each page; do not use `page` after this loop.

@@ -68,8 +68,10 @@ missing = set(expected_sheets) - set(wb.sheetnames)
 assert not missing, f"missing expected sheets: {sorted(missing)}"
 for ws in wb.worksheets:
     print(f"{ws.title} dims:", ws.dimensions)
-    formulas = [(c.coordinate, c.value) for row in ws.iter_rows() for c in row
-                if isinstance(c.value, str) and c.value.startswith("=")]
+    formulas = [
+        (c.coordinate, getattr(c.value, "text", None) or str(c.value))
+        for row in ws.iter_rows() for c in row if c.data_type == "f"
+    ]
     print(f"{ws.title} formula cells:", formulas[:10])
     for coordinate, expected_format in expected_number_formats.get(ws.title, {}).items():
         actual_format = ws[coordinate].number_format

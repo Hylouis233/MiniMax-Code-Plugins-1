@@ -8,12 +8,14 @@
 import copy
 import subprocess
 import sys
+import zipfile
 
 import fitz
 from docx import Document
 from docx.opc.constants import RELATIONSHIP_TYPE as RT
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
+from docx.text.paragraph import Paragraph
 from lxml import etree
 
 failures = []
@@ -39,6 +41,99 @@ hostile_xml = (
 )
 parsed = etree.fromstring(hostile_xml, parser=safe_xml_parser)
 check("DOCX XML parser leaves external entities unresolved", parsed.text is None and len(parsed) == 1)
+
+# ---- review.md health check rejects archive bombs before expanding parts -------
+MAX_XML_PART = 20 * 1024 * 1024
+MAX_ENTRY = 100 * 1024 * 1024
+MAX_TOTAL_UNCOMPRESSED = 500 * 1024 * 1024
+MAX_COMPRESSION_RATIO = 200
+
+
+def validate_docx_package(path):
+    with zipfile.ZipFile(path) as archive:
+        infos = archive.infolist()
+        names = {info.filename for info in infos}
+        assert len(names) == len(infos)
+        assert "[Content_Types].xml" in names and "word/document.xml" in names
+        assert sum(info.file_size for info in infos) <= MAX_TOTAL_UNCOMPRESSED
+        actual_total = 0
+        for info in infos:
+            assert info.file_size <= MAX_ENTRY
+            assert info.file_size / max(info.compress_size, 1) <= MAX_COMPRESSION_RATIO
+            is_xml = info.filename.endswith((".xml", ".rels"))
+            if is_xml:
+                assert info.file_size <= MAX_XML_PART
+            chunks = []
+            actual_size = 0
+            with archive.open(info) as stream:
+                while chunk := stream.read(64 * 1024):
+                    actual_size += len(chunk)
+                    actual_total += len(chunk)
+                    assert actual_size <= MAX_ENTRY
+                    assert actual_total <= MAX_TOTAL_UNCOMPRESSED
+                    if is_xml:
+                        chunks.append(chunk)
+            assert actual_size == info.file_size
+            if is_xml:
+                etree.fromstring(b"".join(chunks), parser=safe_xml_parser)
+
+
+health_doc = Document()
+health_doc.add_paragraph("bounded health check")
+health_doc.save("healthy.docx")
+try:
+    validate_docx_package("healthy.docx")
+    healthy_package_passed = True
+except Exception:
+    healthy_package_passed = False
+check("bounded package health check accepts an ordinary DOCX", healthy_package_passed)
+
+with zipfile.ZipFile("compressed-bomb.docx", "w", zipfile.ZIP_DEFLATED) as archive:
+    archive.writestr("[Content_Types].xml", "<Types/>")
+    archive.writestr("word/document.xml", "<document>" + (" " * 2_000_000) + "</document>")
+try:
+    validate_docx_package("compressed-bomb.docx")
+    archive_bomb_rejected = False
+except AssertionError:
+    archive_bomb_rejected = True
+check("suspicious compression ratio is rejected before XML expansion", archive_bomb_rejected)
+
+# ---- read.md includes block paragraphs nested in content controls --------------
+def iter_body_paragraphs(parent, document):
+    for child in parent.iterchildren():
+        if child.tag == qn("w:p"):
+            yield Paragraph(child, document)
+        elif child.tag == qn("w:sdt"):
+            content = child.find(qn("w:sdtContent"))
+            if content is not None:
+                yield from iter_body_paragraphs(content, document)
+
+
+sdt_doc = Document()
+sdt_doc.add_paragraph("direct paragraph")
+sdt_paragraph = sdt_doc.add_paragraph("inside content control")
+sdt = OxmlElement("w:sdt")
+sdt_content = OxmlElement("w:sdtContent")
+sdt_paragraph._p.getparent().replace(sdt_paragraph._p, sdt)
+sdt_content.append(sdt_paragraph._p)
+sdt.append(sdt_content)
+sdt_doc.save("content-control.docx")
+sdt_reopened = Document("content-control.docx")
+check("doc.paragraphs omits block content-control text (negative control)",
+      "inside content control" not in [paragraph.text for paragraph in sdt_reopened.paragraphs])
+walked_text = [paragraph.text for paragraph in iter_body_paragraphs(sdt_reopened.element.body, sdt_reopened)]
+check("content-control traversal emits the nested paragraph", "inside content control" in walked_text, walked_text)
+
+# Per-run glyph validation must not let a different referenced font hide a missing glyph.
+fixture_cmaps = {"CJK Face": {ord("漢")}, "Latin Face": {ord("A")}}
+assigned_runs = [("CJK Face", "漢"), ("Latin Face", "漢")]
+pooled_passes = all(any(ord(ch) in cmap for cmap in fixture_cmaps.values())
+                    for _, text in assigned_runs for ch in text)
+per_run_missing = [(face, ch) for face, text in assigned_runs for ch in text
+                   if ord(ch) not in fixture_cmaps[face]]
+check("pooled cmap is proven unsafe (negative control)", pooled_passes)
+check("per-run cmap check identifies the actual missing glyph",
+      per_run_missing == [("Latin Face", "漢")], per_run_missing)
 
 # ---- edit.md guarded cross-run replacement ------------------------------------
 SAFE_RUN_CHILDREN = {

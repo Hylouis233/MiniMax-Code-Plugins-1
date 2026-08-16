@@ -97,12 +97,78 @@ section.left_margin, section.right_margin = Cm(2.8), Cm(2.6)
    (`pip install fonttools`) when the referenced faces can be located:
 
    ```python
+   from docx import Document
    from fontTools.ttLib import TTFont
+   from docx.oxml.ns import qn
+   from docx.text.paragraph import Paragraph
 
-   cmaps = [TTFont(font_path).getBestCmap() for font_path in referenced_font_files]
-   emitted = {ch for ch in source_text if ord(ch) >= 0x2E80}     # CJK and beyond
-   missing = {ch for ch in emitted if not any(ord(ch) in cmap for cmap in cmaps)}
-   assert not missing, f"codepoints with no glyph in any referenced font: {sorted(missing)}"
+   doc = Document("output.docx")
+
+   def xml_runs(element, parent):
+       # Covers direct paragraphs, tables, nested tables, and block content controls.
+       for paragraph_element in element.iter(qn("w:p")):
+           yield from Paragraph(paragraph_element, parent).runs
+
+   emitted_runs = list(xml_runs(doc.element.body, doc))
+   for section in doc.sections:
+       emitted_runs.extend(xml_runs(section.header._element, section.header))
+       emitted_runs.extend(xml_runs(section.footer._element, section.footer))
+
+   def face_from_rpr(rpr, slot):
+       if rpr is None:
+           return None
+       rfonts = rpr.find(qn("w:rFonts"))
+       return None if rfonts is None else rfonts.get(qn("w:" + slot))
+
+   def style_faces(style, slot):
+       while style is not None:
+           face = face_from_rpr(style.element.find(qn("w:rPr")), slot)
+           if face:
+               yield face
+           style = style.base_style
+
+   def effective_face(run, slot):
+       direct = face_from_rpr(run._r.find(qn("w:rPr")), slot)
+       if direct:
+           return direct
+       for style in (run.style, run._parent.style, run.part.document.styles["Normal"]):
+           if face := next(style_faces(style, slot), None):
+               return face
+       raise LookupError(f"no resolved {slot} face for run {run.text!r}; resolve theme defaults")
+
+   def font_slot(character):
+       codepoint = ord(character)
+       return "eastAsia" if (
+           0x2E80 <= codepoint <= 0x9FFF or 0xF900 <= codepoint <= 0xFAFF
+           or 0x20000 <= codepoint <= 0x3134F
+       ) else ("ascii" if codepoint < 128 else "hAnsi")
+
+   # Resolve installed files by exact face name first; do not pool their cmaps.
+   # TTC collections need the face's fontNumber; ordinary TTF files use -1.
+   font_files_by_face = {
+       "宋体": ("path/to/simsun.ttc", 0),
+       "Times New Roman": ("path/to/times.ttf", -1),
+   }
+   cmaps = {}
+   missing = []
+   unresolved = []
+   for run_index, run in enumerate(emitted_runs):
+       for character in run.text:
+           if character.isspace():
+               continue
+           face = effective_face(run, font_slot(character))
+           font_spec = font_files_by_face.get(face)
+           if not font_spec:
+               unresolved.append((run_index, character, face))
+               continue
+           if font_spec not in cmaps:
+               font_path, font_number = font_spec
+               cmaps[font_spec] = TTFont(font_path, fontNumber=font_number).getBestCmap()
+           cmap = cmaps[font_spec]
+           if ord(character) not in cmap:
+               missing.append((run_index, character, face))
+   assert not unresolved, f"font files not resolved per run: {unresolved}"
+   assert not missing, f"glyph missing from the run's effective font: {missing}"
    ```
 
    When font files cannot be located, rasterize the rendered pages with PyMuPDF and inspect

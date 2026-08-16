@@ -45,9 +45,10 @@ Shared spine (all four Skills follow it):
 
 Per format:
 
-- **docx** — create with python-docx from a heading outline; edit existing files by direct
-  `word/document.xml` surgery (python-docx cannot open-and-save arbitrary files losslessly);
-  extract text with python-docx or `pandoc -t markdown`; postcheck with python-docx re-open and
+- **docx** — create with python-docx from a heading outline; use python-docx first for routine
+  structural edits (paragraphs, tables, images, styles, and text runs), and reserve direct OOXML
+  surgery for fields, tracked changes, or package features python-docx cannot express; extract
+  text with python-docx or `pandoc -t markdown`; postcheck with python-docx re-open and
   `soffice --headless --convert-to` PDF smoke test when LibreOffice is present. Depth
   references: CJK typography (east-asian font slots, 字号 table, char-based indents, GB/T 9704
   page geometry) and scene patterns (academic paper, resume, official document, contract).
@@ -63,8 +64,9 @@ Per format:
   presentation-level verification via `python-pptx` re-open plus a rendered PDF smoke test when
   LibreOffice is available.
 - **pdf** — creation prefers ReportLab (structured, accessible text) over HTML-to-print paths;
-  extraction and splitting/merging with pypdf; analysis and rasterization with PyMuPDF; explicit
-  one-tool-per-job table so the agent stops mixing libraries mid-task.
+  extraction (text, coordinates, tables, images) and rasterization use PyMuPDF, while pypdf is
+  reserved for page-level transforms such as split, merge, rotate, watermark, encryption, and
+  forms; an explicit one-tool-per-job table prevents accidental API mixing.
 
 ## Verification-first output
 
@@ -75,10 +77,11 @@ versus what was assumed.
 
 The [`tests/`](tests/) directory ships one runnable fixture script per format covering the
 snippets with the worst silent-failure modes (PDF AcroForm clone-and-fill, watermark write,
-CMYK conversion, soft-mask extraction; PPTX run-preserving edits, actual content extraction,
-grouped-shape walking, per-master themes; XLSX dialect sniffing, independent extension-marker
-loss, falsey aggregation categories; DOCX guarded cross-run replacement and numbering restart
-rendered through LibreOffice). Each script is self-contained and exits non-zero on failure.
+encrypted extraction, CMYK conversion, soft masks; PPTX run-preserving edits, table-cell locating,
+actual content extraction, grouped shapes, script-aware per-master themes; XLSX dialect sniffing,
+array formulas, streamed extension checks, structural-reference audits; DOCX bounded package review,
+content controls, per-run glyph checks, guarded replacement, and a LibreOffice-rendered numbering
+restart). Each script is self-contained and exits non-zero on failure.
 
 ## Requirements
 

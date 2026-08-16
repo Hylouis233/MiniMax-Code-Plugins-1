@@ -78,15 +78,26 @@ expected_strings_by_page = {}
 for page_number, expected_strings in expected_strings_by_page.items():
     missing = [value for value in expected_strings if value not in page_texts[page_number]]
     assert not missing, f"page {page_number} is missing {missing}"
-# mediabox is (left, bottom, right, top); reduce it to the width/height pair you declared
+# Compare width/height to the exact size used at creation with a small point tolerance.
+# ReportLab A4 is about (595.2756, 841.8898), not the rounded prose value (595.27, 841.89).
+expected_page_size = (595.2756, 841.8898)  # replace for Letter or a task-specific size
+page_size_tolerance = 0.5
 page_sizes = [
-    (round(float(page.mediabox.width), 2), round(float(page.mediabox.height), 2))
+    (float(page.mediabox.width), float(page.mediabox.height))
     for page in r.pages
 ]
+size_mismatches = [
+    (number, actual)
+    for number, actual in enumerate(page_sizes, start=1)
+    if any(abs(value - expected) > page_size_tolerance
+           for value, expected in zip(actual, expected_page_size))
+]
+assert not size_mismatches, f"unexpected page sizes: {size_mismatches}"
 ```
 
 Confirm: page count matches the request; every page except those explicitly listed in
 `intentionally_raster_only_pages` has extractable text; each requested key string is listed in
 `expected_strings_by_page` and extracts on the correct page; every value in `page_sizes` is the
-declared size. Report all four. For pixel-sensitive work, render every applicable page with
-PyMuPDF at 100 dpi and check that each render is non-blank (mean pixel value).
+declared size within `page_size_tolerance`. Report all four. For pixel-sensitive work, render
+every applicable page with PyMuPDF at 100 dpi and check that each render is non-blank (mean pixel
+value).

@@ -34,10 +34,11 @@ stamp = PdfReader("watermark.pdf").pages[0]
 stamp_text = (stamp.extract_text() or "").strip()
 reader = PdfReader("input.pdf")
 expected_sizes = [tuple(float(value) for value in page.mediabox) for page in reader.pages]
+expected_fields = reader.get_fields() or {}
 writer = PdfWriter()
-for page in reader.pages:
+writer.append(reader)                 # clone pages plus catalog entries such as /AcroForm
+for page in writer.pages:
     page.merge_page(stamp)          # stamp content on top; use merge_transformed_page to place
-    writer.add_page(page)
 
 with open("watermarked.pdf", "wb") as f:
     writer.write(f)
@@ -45,6 +46,8 @@ with open("watermarked.pdf", "wb") as f:
 check = PdfReader("watermarked.pdf")
 assert len(check.pages) == len(expected_sizes)
 assert [tuple(float(value) for value in page.mediabox) for page in check.pages] == expected_sizes
+if expected_fields:
+    assert set(expected_fields) <= set(check.get_fields() or {}), "watermarking dropped form fields"
 if stamp_text:
     assert all(stamp_text in (page.extract_text() or "") for page in check.pages)
 ```

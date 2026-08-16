@@ -6,9 +6,9 @@
 #   python xlsx_fixture.py  (deps: openpyxl)
 #   python docx_fixture.py  (deps: python-docx, pymupdf, soffice on PATH)
 import csv
-import io
 import sys
 import zipfile
+from tempfile import TemporaryFile
 
 import openpyxl
 
@@ -57,7 +57,6 @@ unsafe_wb.active["A1"] = formula_looking
 check("plain assignment is proven unsafe (negative control)", unsafe_wb.active["A1"].data_type == "f")
 
 # ---- edit.md snippet: round_trip_changes detects dropped parts AND stripped extensions ----
-from io import BytesIO
 
 wb = openpyxl.Workbook()
 ws = wb.active
@@ -71,6 +70,7 @@ with zipfile.ZipFile("plain.xlsx") as zin:
 
 # simulate an unsupported extension part (what a slicer/queries part looks like in the zip)
 payload["xl/slicers/slicer1.xml"] = b"<slicer xmlns='stub'/>"
+payload["xl/media/large.bin"] = b"x14:" * 32_768  # binary payload must never be marker-scanned
 
 # simulate an in-part x14 extension that openpyxl will strip while keeping the part name
 EXT = (b"<extLst><ext uri='{00000000-0000-0000-0000-000000000000}' "
@@ -90,25 +90,52 @@ EXTENSION_MARKERS = {
 }
 
 
-def stripped_extension_markers(before, after):
+def scan_extension_markers(archive, info):
+    found = set()
+    overlap = max(len(marker) for marker in EXTENSION_MARKERS.values()) - 1
+    tail = b""
+    with archive.open(info) as stream:
+        while chunk := stream.read(64 * 1024):
+            window = tail + chunk
+            found.update(label for label, marker in EXTENSION_MARKERS.items() if marker in window)
+            if len(found) == len(EXTENSION_MARKERS):
+                break
+            tail = window[-overlap:]
+    return found
+
+
+def archive_inventory(source):
+    with zipfile.ZipFile(source) as archive:
+        names = set(archive.namelist())
+        markers = {}
+        for info in archive.infolist():
+            if info.filename.endswith((".xml", ".rels")):
+                found = scan_extension_markers(archive, info)
+                if found:
+                    markers[info.filename] = found
+        return names, markers
+
+
+def stripped_extension_markers(before, after, common_names):
     return sorted(
         (name, label)
-        for name in set(before) & set(after)
-        for label, marker in EXTENSION_MARKERS.items()
-        if marker in before[name] and marker not in after[name]
+        for name in common_names
+        for label in before.get(name, set()) - after.get(name, set())
     )
 
 
 def round_trip_changes(path, **load_options):
-    with zipfile.ZipFile(path) as z:
-        before = {name: z.read(name) for name in z.namelist()}
+    before_names, before_markers = archive_inventory(path)
     wb = openpyxl.load_workbook(path, **load_options)  # same options as the real edit
-    buf = BytesIO()
-    wb.save(buf)
-    with zipfile.ZipFile(buf) as z:
-        after = {name: z.read(name) for name in z.namelist()}
-    dropped = sorted(set(before) - set(after))
-    stripped_extensions = stripped_extension_markers(before, after)
+    with TemporaryFile() as output:
+        wb.save(output)
+        output.seek(0)
+        after_names, after_markers = archive_inventory(output)
+    wb.close()
+    dropped = sorted(before_names - after_names)
+    stripped_extensions = stripped_extension_markers(
+        before_markers, after_markers, before_names & after_names
+    )
     return dropped, stripped_extensions
 
 
@@ -117,13 +144,16 @@ check("injected slicer-like part is detected as dropped", "xl/slicers/slicer1.xm
 check("in-part x14 extension strip is detected (same part name)",
       ("xl/worksheets/sheet1.xml", "x14") in stripped, stripped)
 check("clean workbook reports nothing", round_trip_changes("plain.xlsx") == ([], []))
-partial_before = {"xl/worksheets/sheet1.xml": b"<worksheet><extLst><x14:stub/></extLst></worksheet>"}
-partial_after = {"xl/worksheets/sheet1.xml": b"<worksheet><extLst/></worksheet>"}
+inventory_names, inventory_markers = archive_inventory("extended.xlsx")
+check("binary archive parts are named but never marker-scanned",
+      "xl/media/large.bin" in inventory_names and "xl/media/large.bin" not in inventory_markers)
+partial_before = {"xl/worksheets/sheet1.xml": {"extLst", "x14"}}
+partial_after = {"xl/worksheets/sheet1.xml": {"extLst"}}
 check(
     "marker comparison catches x14 loss while extLst survives",
-    stripped_extension_markers(partial_before, partial_after)
+    stripped_extension_markers(partial_before, partial_after, set(partial_before))
     == [("xl/worksheets/sheet1.xml", "x14")],
-    stripped_extension_markers(partial_before, partial_after),
+    stripped_extension_markers(partial_before, partial_after, set(partial_before)),
 )
 
 # ---- formatting.md snippet: sheet references built from the real sheet title -------
@@ -186,6 +216,80 @@ check(
     [(type(value).__name__, value) for value in regions],
 )
 
+# ---- edit.md structural audit includes non-cell dependencies ------------------
+from openpyxl.chart import BarChart, Reference
+from openpyxl.formatting.rule import FormulaRule
+from openpyxl.workbook.defined_name import DefinedName
+from openpyxl.worksheet.datavalidation import DataValidation
+from openpyxl.worksheet.table import Table
+
+
+def non_cell_references(workbook):
+    refs = []
+    for item in workbook.defined_names.values():
+        refs.append(("defined name", item.name, item.attr_text))
+    for sheet in workbook.worksheets:
+        owner = sheet.title
+        for table in sheet.tables.values():
+            refs.append(("table", owner + "!" + table.name, table.ref))
+        for merged_range in sheet.merged_cells.ranges:
+            refs.append(("merged range", owner, str(merged_range)))
+        if sheet.auto_filter.ref:
+            refs.append(("auto filter", owner, sheet.auto_filter.ref))
+        for label, value in (
+            ("print area", sheet.print_area),
+            ("print title rows", sheet.print_title_rows),
+            ("print title columns", sheet.print_title_cols),
+        ):
+            if value:
+                refs.append((label, owner, str(value)))
+        for validation in sheet.data_validations.dataValidation:
+            refs.append(("data validation range", owner, str(validation.sqref)))
+            for formula in (validation.formula1, validation.formula2):
+                if formula:
+                    refs.append(("data validation formula", owner, str(formula)))
+        for conditional_range in sheet.conditional_formatting:
+            refs.append(("conditional formatting range", owner, str(conditional_range.sqref)))
+            for rule in sheet.conditional_formatting[conditional_range]:
+                for formula in getattr(rule, "formula", ()):
+                    refs.append(("conditional formatting formula", owner, str(formula)))
+        for index, chart in enumerate(sheet._charts, start=1):
+            for element in chart._write().iter():
+                if element.tag.rsplit("}", 1)[-1] == "f" and element.text:
+                    refs.append(("chart series", f"{owner} chart {index}", element.text))
+    return refs
+
+
+audit_wb = openpyxl.Workbook()
+audit_ws = audit_wb.active
+audit_ws.title = "Audit"
+audit_ws.append(["Value"])
+audit_ws.append([1])
+audit_ws.append([2])
+audit_wb.defined_names.add(DefinedName("AuditRange", attr_text="'Audit'!$A$2:$A$3"))
+audit_ws.add_table(Table(displayName="AuditTable", ref="A1:A3"))
+audit_ws.merge_cells("B2:B3")
+audit_ws.auto_filter.ref = "A1:A3"
+audit_ws.print_area = "A1:B3"
+audit_ws.print_title_rows = "1:1"
+audit_ws.print_title_cols = "A:A"
+validation = DataValidation(type="whole", formula1="'Audit'!$A$2")
+validation.add("A2:A3")
+audit_ws.add_data_validation(validation)
+audit_ws.conditional_formatting.add("A2:A3", FormulaRule(formula=["A2>0"]))
+chart = BarChart()
+chart.add_data(Reference(audit_ws, min_col=1, min_row=1, max_row=3), titles_from_data=True)
+audit_ws.add_chart(chart, "C1")
+reference_kinds = {kind for kind, _, _ in non_cell_references(audit_wb)}
+check(
+    "structural audit covers names, tables, filters, validation, formatting, and charts",
+    {"defined name", "table", "merged range", "auto filter", "print area",
+     "print title rows", "print title columns", "data validation range",
+     "data validation formula", "conditional formatting range",
+     "conditional formatting formula", "chart series"} <= reference_kinds,
+    reference_kinds,
+)
+
 # and the edit itself still works after the warning path
 wb2 = openpyxl.load_workbook("plain.xlsx")
 wb2["Data"]["B2"] = "=B2*1"  # formula stays a formula
@@ -202,9 +306,12 @@ format_matches = all(
 check("task-specific number format mapping is verified", format_matches)
 
 # ---- read.md snippet: multi-sheet profiles cover every sheet ----------------------
+from openpyxl.worksheet.formula import ArrayFormula
+
 wb_h = openpyxl.Workbook()
 wb_h.active.title = "First"
 wb_h.active["A1"] = "=1+1"
+wb_h.active["A2"] = ArrayFormula("A2:A3", "=ROW(A2:A3)")
 second = wb_h.create_sheet("Second")
 second["A1"] = "plain"
 second["A2"] = "=2+2"
@@ -212,12 +319,29 @@ wb_h.save("multi.xlsx")
 formula_wb = openpyxl.load_workbook("multi.xlsx", read_only=True, data_only=False)
 value_wb = openpyxl.load_workbook("multi.xlsx", read_only=True, data_only=True)
 profiled = list(value_wb.sheetnames)
-uncached = {sn for sn in profiled
+uncached = {(sn, fc.coordinate, getattr(fc.value, "text", None) or str(fc.value))
+            for sn in profiled
             for frow, vrow in zip(formula_wb[sn].iter_rows(), value_wb[sn].iter_rows())
             for fc, vc in zip(frow, vrow)
-            if isinstance(fc.value, str) and fc.value.startswith("=") and vc.value is None}
+            if fc.data_type == "f" and vc.value is None}
 check("multi-sheet profile iterates every sheet", profiled == ["First", "Second"], profiled)
-check("uncached formulas found on both sheets", uncached == {"First", "Second"}, uncached)
+check("uncached formulas found on both sheets", {item[0] for item in uncached} == {"First", "Second"}, uncached)
+check("array-formula objects are detected by data_type", ("First", "A2", "=ROW(A2:A3)") in uncached, uncached)
+
+# csv.md: value export uses the cached-value workbook and reports every missing cache.
+missing_caches = []
+with open("formula-values.csv", "w", newline="", encoding="utf-8") as output:
+    writer = csv.writer(output)
+    for formula_row, value_row in zip(formula_wb["First"].iter_rows(), value_wb["First"].iter_rows()):
+        for formula_cell, value_cell in zip(formula_row, value_row):
+            if formula_cell.data_type == "f" and value_cell.value is None:
+                missing_caches.append(formula_cell.coordinate)
+        writer.writerow([cell.value for cell in value_row])
+with open("formula-values.csv", newline="", encoding="utf-8") as exported:
+    exported_values = [value for row in csv.reader(exported) for value in row]
+check("XLSX-to-CSV reports formulas with no cached value", set(missing_caches) >= {"A1", "A2"}, missing_caches)
+check("XLSX-to-CSV does not leak formula strings into value output",
+      not any(value.startswith("=") for value in exported_values), exported_values)
 formula_wb.close()
 value_wb.close()
 

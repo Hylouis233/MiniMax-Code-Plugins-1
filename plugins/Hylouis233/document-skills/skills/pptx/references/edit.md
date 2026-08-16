@@ -22,6 +22,14 @@ def iter_shapes(shapes, path=""):
         else:
             yield here, shape
 
+def iter_text_targets(path, shape):
+    if shape.has_text_frame:
+        yield path, shape.text_frame
+    if shape.has_table:
+        for row_index, row in enumerate(shape.table.rows):
+            for column_index, cell in enumerate(row.cells):
+                yield f"{path}/table[{row_index},{column_index}]", cell.text_frame
+
 candidates = []
 for i, slide in enumerate(prs.slides):
     if slide_index is not None and i != slide_index:
@@ -29,15 +37,15 @@ for i, slide in enumerate(prs.slides):
     for path, shape in iter_shapes(slide.shapes):
         if shape_name is not None and shape.name != shape_name:
             continue
-        if shape.has_text_frame and old in shape.text_frame.text:
-            candidates.append((i, path, shape))
+        for location, text_frame in iter_text_targets(path, shape):
+            if old in text_frame.text:
+                candidates.append((i, location, text_frame))
 
-locations = [(i, path) for i, path, _ in candidates]
-assert len(candidates) == 1, f"expected one matching shape, found {locations}"
-_, _, target_shape = candidates[0]
+locations = [(i, location) for i, location, _ in candidates]
+assert len(candidates) == 1, f"expected one matching text target, found {locations}"
+_, _, tf = candidates[0]
 
 # Replace inside one existing run so its formatting and hyperlink are retained.
-tf = target_shape.text_frame
 assert tf.text.count(old) == 1, "target occurs more than once in the selected shape"
 run_hits = [
     run
@@ -58,7 +66,8 @@ prs.save("input-edited.pptx")
 1. **Never rebuild the file to make a small change.** Rewriting slides from scratch loses the
    template, masters, notes, and animations. Edit in place, save to a new path.
 2. Address shapes by slide index + shape name or matched text, and **assert exactly one match**.
-   If copy repeats, set both selectors rather than silently choosing the last shape.
+   The locator must search both shape text frames and every table cell, retaining a stable
+   `/table[row,column]` suffix. If copy repeats, set both selectors rather than choosing one.
 3. For formatted text, change `run.text` only when the target is wholly inside one run. Assigning
    `paragraph.text` or `text_frame.text` rebuilds runs and can discard run formatting and links.
    If the target spans runs, stop and make an explicitly reviewed run/XML edit.

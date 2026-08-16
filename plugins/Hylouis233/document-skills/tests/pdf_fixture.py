@@ -34,10 +34,10 @@ c.save()
 # ---- SKILL.md postcheck snippet: width/height pairs from the 4-coordinate box --
 r = pypdf.PdfReader("form.pdf")
 page_sizes = [
-    (round(float(page.mediabox.width), 2), round(float(page.mediabox.height), 2))
+    (float(page.mediabox.width), float(page.mediabox.height))
     for page in r.pages
 ]
-A4_TOLERANCE = 0.5  # reportlab A4 is 595.28 x 841.89 after rounding; compare with tolerance
+A4_TOLERANCE = 0.5
 check(
     "mediabox width/height is A4 on every page",
     all(abs(w - 595.2755) < A4_TOLERANCE and abs(h - 841.8897) < A4_TOLERANCE for w, h in page_sizes),
@@ -54,6 +54,12 @@ probe = pypdf.PdfReader("encrypted.pdf")
 check("encrypted fixture is detected before page access", probe.is_encrypted)
 encrypted_r = pypdf.PdfReader("encrypted.pdf", password="fixture-password")
 check("password-authenticated postcheck can access every page", len(encrypted_r.pages) == 2)
+encrypted_extract = fitz.open("encrypted.pdf")
+check("PyMuPDF extraction detects that authentication is required", encrypted_extract.needs_pass)
+check("PyMuPDF rejects the wrong extraction password", encrypted_extract.authenticate("wrong") == 0)
+check("PyMuPDF authenticates before page extraction", encrypted_extract.authenticate("fixture-password") > 0)
+check("authenticated PyMuPDF extraction reaches page text",
+      "Application form" in encrypted_extract[0].get_text("text", sort=True))
 
 # ---- transform.md AcroForm snippet: clone into writer, fill on writer pages ----
 from pypdf import PdfReader, PdfWriter
@@ -89,10 +95,11 @@ stamp = R2("stamp.pdf").pages[0]
 stamp_text = (stamp.extract_text() or "").strip()
 reader = R2("form.pdf")
 expected_sizes = [(round(float(p.mediabox.width), 2), round(float(p.mediabox.height), 2)) for p in reader.pages]
+expected_fields = reader.get_fields() or {}
 writer = PdfWriter()
-for page in reader.pages:
+writer.append(reader)
+for page in writer.pages:
     page.merge_page(stamp)
-    writer.add_page(page)
 with open("watermarked.pdf", "wb") as f:
     writer.write(f)
 
@@ -102,6 +109,8 @@ check(
     "watermark page sizes unchanged",
     [(round(float(p.mediabox.width), 2), round(float(p.mediabox.height), 2)) for p in verify.pages] == expected_sizes,
 )
+check("watermarking preserves the AcroForm catalog and fields",
+      set(expected_fields) <= set(verify.get_fields() or {}), verify.get_fields())
 check("stamp text present on every page", all(stamp_text in (p.extract_text() or "") for p in verify.pages))
 
 # ---- extract.md CMYK conversion snippet ---------------------------------------

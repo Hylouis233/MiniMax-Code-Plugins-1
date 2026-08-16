@@ -7,6 +7,11 @@ formula_wb = openpyxl.load_workbook("input.xlsx", read_only=True, data_only=Fals
 value_wb = openpyxl.load_workbook("input.xlsx", read_only=True, data_only=True)
 print("sheets:", value_wb.sheetnames)
 
+def formula_text(cell):
+    value = cell.value
+    # ArrayFormula/DataTableFormula are objects in current openpyxl, not strings.
+    return getattr(value, "text", None) or str(value)
+
 # Profile EVERY sheet by default; only narrow when the task names a specific sheet.
 for sheet_name in value_wb.sheetnames:
     formula_ws = formula_wb[sheet_name]
@@ -23,13 +28,11 @@ for sheet_name in value_wb.sheetnames:
     missing_cache_count = 0
     for formula_row, value_row in zip(formula_ws.iter_rows(), value_ws.iter_rows()):
         for formula_cell, value_cell in zip(formula_row, value_row):
-            if (isinstance(formula_cell.value, str)
-                    and formula_cell.value.startswith("=")
-                    and value_cell.value is None):
+            if formula_cell.data_type == "f" and value_cell.value is None:
                 missing_cache_count += 1
                 if missing_cache_count <= 10:
                     print("formula without cached value:", formula_cell.coordinate,
-                          formula_cell.value)
+                          formula_text(formula_cell))
     print("formulas without cached values:", missing_cache_count)
 formula_wb.close()
 value_wb.close()
@@ -44,7 +47,8 @@ value_wb.close()
   in read_only mode - iterate instead).
 - `data_only=True` gives cached values. A file saved by a library (never opened in Excel)
   may return `None` for formulas with no cache. Compare each cell with the corresponding cell
-  from a `data_only=False` workbook, as above, before claiming it is empty.
+  from a `data_only=False` workbook and detect formulas with `cell.data_type == "f"`; array and
+  data-table formulas may not be strings beginning with `=`, so a string-prefix test is incomplete.
 - Mixed-type columns: profile them (`set(type(v).__name__ for v in col)`) before converting;
   a column that is mostly numbers with a few text cells is a data-quality finding, not noise.
 - Never load the full sheet into memory to "look at it" when `iter_rows` with a break would do.

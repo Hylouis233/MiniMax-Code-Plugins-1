@@ -79,7 +79,7 @@ Most template decks set no explicit `run.font.name`; the effective face is inher
 placeholder, layout, master, or theme. Resolve what you can and name the fallback explicitly:
 
 ```python
-import re
+import xml.etree.ElementTree as ET
 from pptx import Presentation
 from pptx.opc.constants import RELATIONSHIP_TYPE as RT
 
@@ -88,31 +88,72 @@ prs = Presentation("deck.pptx")
 # 1. Resolve the theme related to each slide's own layout/master. A package can contain
 # multiple masters with different themes, so the first /ppt/theme/* part is not a safe default.
 theme_cache = {}
+DRAWINGML = {"a": "http://schemas.openxmlformats.org/drawingml/2006/main"}
+
+def read_theme_role(root, role):
+    node = root.find(f".//a:{role}Font", DRAWINGML)
+    if node is None:
+        return {"latin": "", "eastAsia": "", "complexScript": "", "scripts": {}}
+    def typeface(tag):
+        child = node.find(f"a:{tag}", DRAWINGML)
+        return "" if child is None else child.get("typeface", "")
+    return {
+        "latin": typeface("latin"),
+        "eastAsia": typeface("ea"),
+        "complexScript": typeface("cs"),
+        "scripts": {
+            child.get("script"): child.get("typeface", "")
+            for child in node.findall("a:font", DRAWINGML) if child.get("script")
+        },
+    }
 
 def theme_faces_for_slide(slide):
     master_part = slide.slide_layout.slide_master.part
     cache_key = str(master_part.partname)
     if cache_key not in theme_cache:
         theme_part = master_part.part_related_by(RT.THEME)
-        theme_xml = theme_part.blob.decode("utf-8", "ignore")
-        matches = {
-            "major (headings)": re.search(
-                r'<a:majorFont>\s*<a:latin typeface="([^"]*)"', theme_xml
-            ),
-            "minor (body)": re.search(
-                r'<a:minorFont>\s*<a:latin typeface="([^"]*)"', theme_xml
-            ),
-        }
+        root = ET.fromstring(theme_part.blob)
         theme_cache[cache_key] = {
-            kind: match.group(1) if match else "(not set)"
-            for kind, match in matches.items()
+            "major": read_theme_role(root, "major"),
+            "minor": read_theme_role(root, "minor"),
         }
     return cache_key, theme_cache[cache_key]
 
+def script_tags(text):
+    tags = []
+    for character in text:
+        codepoint = ord(character)
+        if 0x3040 <= codepoint <= 0x30FF:
+            tags.append("Jpan")
+        elif 0xAC00 <= codepoint <= 0xD7AF:
+            tags.append("Hang")
+        elif 0x2E80 <= codepoint <= 0x9FFF:
+            tags.extend(("Hans", "Hant", "Jpan", "Hang"))  # locale disambiguates Han
+        elif 0x0400 <= codepoint <= 0x052F:
+            tags.append("Cyrl")
+        elif 0x0590 <= codepoint <= 0x05FF:
+            tags.append("Hebr")
+        elif 0x0600 <= codepoint <= 0x06FF:
+            tags.append("Arab")
+        elif 0x0900 <= codepoint <= 0x097F:
+            tags.append("Deva")
+    return list(dict.fromkeys(tags))
+
+def theme_candidates(role_fonts, text):
+    faces = [role_fonts["latin"]]
+    tags = script_tags(text)
+    if any(tag in ("Hans", "Hant", "Jpan", "Hang") for tag in tags):
+        faces.append(role_fonts["eastAsia"])
+    if any(tag in ("Arab", "Hebr", "Deva") for tag in tags):
+        faces.append(role_fonts["complexScript"])
+    faces.extend(role_fonts["scripts"].get(tag, "") for tag in tags)
+    return [face for face in dict.fromkeys(faces) if face]
+
 # 2. Per run: explicit value, else paragraph defaults, else report as inherited.
 for i, slide in enumerate(prs.slides):
-    master_name, theme_faces = theme_faces_for_slide(slide)
-    print(i, "master:", master_name, "theme:", theme_faces)
+    master_name, theme_fonts = theme_faces_for_slide(slide)
+    print(i, "master:", master_name, "theme:", ascii(theme_fonts))
+    title_shape = slide.shapes.title
     for shape in iter_shapes(slide.shapes):
         if not shape.has_text_frame:
             continue
@@ -123,14 +164,19 @@ for i, slide in enumerate(prs.slides):
                 elif paragraph.font.name:
                     face, source = paragraph.font.name, "paragraph defaults"
                 else:
-                    face = f"major={theme_faces['major (headings)']}; minor={theme_faces['minor (body)']}"
-                    source = "inherited candidate (verify placeholder/layout/master chain)"
-                print(i, shape.name, repr(run.text[:20]), "font:", face, "source:", source)
+                    role = "major" if (
+                        title_shape is not None and shape._element is title_shape._element
+                    ) else "minor"
+                    face = theme_candidates(theme_fonts[role], run.text)
+                    source = f"inherited {role} theme candidates (verify placeholder chain/locale)"
+                print(i, shape.name, repr(run.text[:20]), "font:", ascii(face), "source:", source)
 ```
 
 python-pptx does not evaluate the full placeholder -> layout -> master inheritance chain; when
-a run reports inherited, list the theme fallback above and, if the exact face matters, check
-the layout and master placeholder of the same index for an explicit `<a:latin typeface>`.
+a run reports inherited, list the script-aware theme candidates above and, if the exact face
+matters, check the layout and master placeholder of the same index for explicit `<a:latin>`,
+`<a:ea>`, `<a:cs>`, and script-specific `<a:font>` mappings. Han text also needs the deck locale
+to distinguish Hans, Hant, Japanese, and Korean theme mappings.
 
 ## Text-fit verification
 

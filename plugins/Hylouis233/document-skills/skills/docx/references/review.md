@@ -17,6 +17,10 @@ import zipfile
 from lxml import etree
 
 path = "input.docx"
+MAX_XML_PART = 20 * 1024 * 1024
+MAX_ENTRY = 100 * 1024 * 1024
+MAX_TOTAL_UNCOMPRESSED = 500 * 1024 * 1024
+MAX_COMPRESSION_RATIO = 200
 safe_xml_parser = etree.XMLParser(
     load_dtd=False,
     resolve_entities=False,
@@ -25,14 +29,38 @@ safe_xml_parser = etree.XMLParser(
     recover=False,
 )
 with zipfile.ZipFile(path) as z:
-    bad = z.testzip()
-    assert bad is None, f"corrupt entry: {bad}"
-    names = z.namelist()
+    infos = z.infolist()
+    names = {info.filename for info in infos}
+    assert len(names) == len(infos), "duplicate archive member names are unsafe"
     assert "[Content_Types].xml" in names and "word/document.xml" in names
-    for part in names:
-        if part.endswith(('.xml', '.rels')):
-            etree.fromstring(z.read(part), parser=safe_xml_parser)  # malformed XML still raises
+    assert sum(info.file_size for info in infos) <= MAX_TOTAL_UNCOMPRESSED
+    actual_total = 0
+    for info in infos:
+        assert info.file_size <= MAX_ENTRY, f"oversized part: {info.filename}"
+        ratio = info.file_size / max(info.compress_size, 1)
+        assert ratio <= MAX_COMPRESSION_RATIO, f"suspicious compression ratio: {info.filename}"
+        is_xml = info.filename.endswith((".xml", ".rels"))
+        if is_xml:
+            assert info.file_size <= MAX_XML_PART, f"oversized XML part: {info.filename}"
+        chunks = []
+        actual_size = 0
+        # Stream every bounded member to verify decompression and CRC. Do not call testzip()
+        # before the limits: it would expand every member regardless of declared risk.
+        with z.open(info) as stream:
+            while chunk := stream.read(64 * 1024):
+                actual_size += len(chunk)
+                actual_total += len(chunk)
+                assert actual_size <= MAX_ENTRY, f"part exceeded read limit: {info.filename}"
+                assert actual_total <= MAX_TOTAL_UNCOMPRESSED, "archive exceeded total read limit"
+                if is_xml:
+                    chunks.append(chunk)
+        assert actual_size == info.file_size, f"size mismatch: {info.filename}"
+        if is_xml:
+            etree.fromstring(b"".join(chunks), parser=safe_xml_parser)
 ```
+
+These limits are conservative review defaults, not a DOCX specification. Raise one only for an
+explicitly trusted, expected large input, and keep the streaming/per-part checks in place.
 
 Then the SKILL.md postcheck (python-docx re-open, optional soffice PDF smoke test).
 

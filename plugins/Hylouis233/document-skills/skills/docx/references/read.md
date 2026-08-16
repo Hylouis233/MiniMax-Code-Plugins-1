@@ -15,8 +15,23 @@ tables). Prefer this when the goal is content, not coordinates.
 
 ```python
 from docx import Document
+from docx.oxml.ns import qn
+from docx.text.paragraph import Paragraph
+
+def iter_body_paragraphs(parent, document):
+    """Yield direct body paragraphs plus paragraphs nested in block content controls."""
+    for child in parent.iterchildren():
+        if child.tag == qn("w:p"):
+            yield Paragraph(child, document)
+        elif child.tag == qn("w:sdt"):
+            content = child.find(qn("w:sdtContent"))
+            if content is not None:
+                yield from iter_body_paragraphs(content, document)
+
 doc = Document("input.docx")
-for par in doc.paragraphs:
+content_controls = list(doc.element.body.iter(qn("w:sdt")))
+print("block content controls:", len(content_controls))
+for par in iter_body_paragraphs(doc.element.body, doc):
     print(par.style.name, "|", par.text)
 for t, table in enumerate(doc.tables):
     for r, row in enumerate(table.rows):
@@ -25,8 +40,10 @@ for t, table in enumerate(doc.tables):
 
 Notes:
 
-- `doc.paragraphs` is body-level only. Text inside text boxes, headers, footers, footnotes is
-  reached via their own collections (`section.header/.footer`) or raw XML.
+- `doc.paragraphs` includes only direct body paragraphs; it omits paragraphs nested in block
+  content controls (`w:sdt`). Use the traversal above and report the content-control count.
+  Text boxes, headers, footers, and footnotes still require their own collections
+  (`section.header/.footer`) or raw XML.
 - `doc.tables` is top-level only; nested tables require walking cells.
 - For revision/comment metadata, inspect the XML parts directly: `word/comments.xml`,
   `w:ins`/`w:del` elements in `word/document.xml`.

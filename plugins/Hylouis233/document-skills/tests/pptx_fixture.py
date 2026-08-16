@@ -222,27 +222,69 @@ def iter_shapes_with_path(shapes, path=""):
             yield here, shape
 
 
+def iter_text_targets(path, shape):
+    if shape.has_text_frame:
+        yield path, shape.text_frame
+    if shape.has_table:
+        for row_index, row in enumerate(shape.table.rows):
+            for column_index, cell in enumerate(row.cells):
+                yield f"{path}/table[{row_index},{column_index}]", cell.text_frame
+
+
 candidates = [
-    (i, p, sh)
+    (i, location, text_frame)
     for i, s in enumerate(prs6.slides)
     for p, sh in iter_shapes_with_path(s.shapes)
-    if sh.has_text_frame and old_w in sh.text_frame.text
+    for location, text_frame in iter_text_targets(p, sh)
+    if old_w in text_frame.text
 ]
 check("locator reaches text inside the group", len(candidates) == 1, [(i, p) for i, p, _ in candidates])
 check("locator reports a stable nested path", "/" in candidates[0][1], candidates[0][1])
 _, _, target = candidates[0]
-target.text_frame.paragraphs[0].runs[0].text = new_w
+target.paragraphs[0].runs[0].text = new_w
 prs6.save("group-edited.pptx")
 prs_g = Presentation("group-edited.pptx")
 found = [sh for sh in iter_shapes(prs_g.slides[0].shapes)
          if getattr(sh, "text_frame", None) is not None and sh.text_frame.text == new_w]
 check("group member edit persists after save", len(found) == 1)
 
-# ---- analyze.md snippet: per-master theme font resolution ----------------------
-import re
+table_candidates = [
+    (i, location, text_frame)
+    for i, s in enumerate(Presentation("input.pptx").slides)
+    for p, sh in iter_shapes_with_path(s.shapes)
+    for location, text_frame in iter_text_targets(p, sh)
+    if old_cell in text_frame.text
+]
+check("locator reaches wording stored only in a table cell", len(table_candidates) == 1)
+check("table-cell locator retains row and column",
+      table_candidates[0][1].endswith("/table[0,1]"), table_candidates[0][1])
+
+# ---- analyze.md snippet: per-master, script-aware theme font resolution --------
+import xml.etree.ElementTree as ET
 
 prs7 = Presentation("input.pptx")
 theme_cache = {}
+DRAWINGML = {"a": "http://schemas.openxmlformats.org/drawingml/2006/main"}
+
+
+def read_theme_role(root, role):
+    node = root.find(f".//a:{role}Font", DRAWINGML)
+    if node is None:
+        return {"latin": "", "eastAsia": "", "complexScript": "", "scripts": {}}
+
+    def typeface(tag):
+        child = node.find(f"a:{tag}", DRAWINGML)
+        return "" if child is None else child.get("typeface", "")
+
+    return {
+        "latin": typeface("latin"),
+        "eastAsia": typeface("ea"),
+        "complexScript": typeface("cs"),
+        "scripts": {
+            child.get("script"): child.get("typeface", "")
+            for child in node.findall("a:font", DRAWINGML) if child.get("script")
+        },
+    }
 
 
 def theme_faces_for_slide(slide):
@@ -250,65 +292,112 @@ def theme_faces_for_slide(slide):
     cache_key = str(master_part.partname)
     if cache_key not in theme_cache:
         theme_part = master_part.part_related_by(RT.THEME)
-        theme_xml = theme_part.blob.decode("utf-8", "ignore")
-        matches = {
-            "major (headings)": re.search(
-                r'<a:majorFont>\s*<a:latin typeface="([^"]*)"', theme_xml
-            ),
-            "minor (body)": re.search(
-                r'<a:minorFont>\s*<a:latin typeface="([^"]*)"', theme_xml
-            ),
-        }
+        root = ET.fromstring(theme_part.blob)
         theme_cache[cache_key] = {
-            kind: match.group(1) if match else "(not set)"
-            for kind, match in matches.items()
+            "major": read_theme_role(root, "major"),
+            "minor": read_theme_role(root, "minor"),
         }
     return cache_key, theme_cache[cache_key]
 
 
-master_name, theme_faces = theme_faces_for_slide(prs7.slides[0])
+def script_tags(text):
+    tags = []
+    for character in text:
+        codepoint = ord(character)
+        if 0x3040 <= codepoint <= 0x30FF:
+            tags.append("Jpan")
+        elif 0xAC00 <= codepoint <= 0xD7AF:
+            tags.append("Hang")
+        elif 0x2E80 <= codepoint <= 0x9FFF:
+            tags.extend(("Hans", "Hant", "Jpan", "Hang"))
+        elif 0x0400 <= codepoint <= 0x052F:
+            tags.append("Cyrl")
+        elif 0x0590 <= codepoint <= 0x05FF:
+            tags.append("Hebr")
+        elif 0x0600 <= codepoint <= 0x06FF:
+            tags.append("Arab")
+        elif 0x0900 <= codepoint <= 0x097F:
+            tags.append("Deva")
+    return list(dict.fromkeys(tags))
+
+
+def theme_candidates(role_fonts, text):
+    faces = [role_fonts["latin"]]
+    tags = script_tags(text)
+    if any(tag in ("Hans", "Hant", "Jpan", "Hang") for tag in tags):
+        faces.append(role_fonts["eastAsia"])
+    if any(tag in ("Arab", "Hebr", "Deva") for tag in tags):
+        faces.append(role_fonts["complexScript"])
+    faces.extend(role_fonts["scripts"].get(tag, "") for tag in tags)
+    return [face for face in dict.fromkeys(faces) if face]
+
+
+master_name, theme_fonts = theme_faces_for_slide(prs7.slides[0])
 check(
     "theme major/minor fonts resolve through the slide master relationship",
-    all(value != "(not set)" for value in theme_faces.values()),
-    (master_name, theme_faces),
+    theme_fonts["major"]["latin"] and theme_fonts["minor"]["latin"],
+    (master_name, theme_fonts),
 )
-print("theme fonts:", theme_faces)
+print("theme fonts:", ascii(theme_fonts))
 
 
 class StubThemePart:
-    def __init__(self, major, minor):
+    def __init__(self, major, minor, east_asian="", complex_script="", scripts=None):
+        script_nodes = "".join(
+            f'<a:font script="{script}" typeface="{face}"/>'
+            for script, face in (scripts or {}).items()
+        )
         self.blob = (
-            f'<a:theme xmlns:a="stub"><a:themeElements><a:fontScheme>'
-            f'<a:majorFont><a:latin typeface="{major}"/></a:majorFont>'
-            f'<a:minorFont><a:latin typeface="{minor}"/></a:minorFont>'
+            f'<a:theme xmlns:a="{DRAWINGML["a"]}"><a:themeElements><a:fontScheme>'
+            f'<a:majorFont><a:latin typeface="{major}"/><a:ea typeface="{east_asian}"/>'
+            f'<a:cs typeface="{complex_script}"/>{script_nodes}</a:majorFont>'
+            f'<a:minorFont><a:latin typeface="{minor}"/><a:ea typeface="{east_asian}"/>'
+            f'<a:cs typeface="{complex_script}"/>{script_nodes}</a:minorFont>'
             f'</a:fontScheme></a:themeElements></a:theme>'
         ).encode()
 
 
 class StubMasterPart:
-    def __init__(self, name, major, minor):
+    def __init__(self, name, major, minor, **theme_options):
         self.partname = name
-        self.theme_part = StubThemePart(major, minor)
+        self.theme_part = StubThemePart(major, minor, **theme_options)
 
     def part_related_by(self, relationship_type):
         assert relationship_type == RT.THEME
         return self.theme_part
 
 
-def stub_slide(name, major, minor):
-    master = type("Master", (), {"part": StubMasterPart(name, major, minor)})()
+def stub_slide(name, major, minor, **theme_options):
+    master = type("Master", (), {"part": StubMasterPart(name, major, minor, **theme_options)})()
     layout = type("Layout", (), {"slide_master": master})()
     return type("Slide", (), {"slide_layout": layout})()
 
 
-_, first_faces = theme_faces_for_slide(stub_slide("/ppt/slideMasters/one.xml", "Head One", "Body One"))
-_, second_faces = theme_faces_for_slide(stub_slide("/ppt/slideMasters/two.xml", "Head Two", "Body Two"))
+_, first_fonts = theme_faces_for_slide(stub_slide("/ppt/slideMasters/one.xml", "Head One", "Body One"))
+_, second_fonts = theme_faces_for_slide(stub_slide("/ppt/slideMasters/two.xml", "Head Two", "Body Two"))
 check(
     "different slide masters resolve their own theme faces",
-    first_faces["major (headings)"] == "Head One"
-    and second_faces["major (headings)"] == "Head Two"
-    and first_faces != second_faces,
-    (first_faces, second_faces),
+    first_fonts["major"]["latin"] == "Head One"
+    and second_fonts["major"]["latin"] == "Head Two"
+    and first_fonts != second_fonts,
+    (first_fonts, second_fonts),
+)
+
+_, script_fonts = theme_faces_for_slide(stub_slide(
+    "/ppt/slideMasters/scripts.xml", "Latin Theme", "Latin Body",
+    east_asian="East Asian Theme", complex_script="Complex Script Theme",
+    scripts={"Hans": "Simplified Chinese Theme", "Cyrl": "Cyrillic Theme"},
+))
+check(
+    "CJK inherited-font triage includes east-Asian and script-specific faces",
+    {"East Asian Theme", "Simplified Chinese Theme"}
+    <= set(theme_candidates(script_fonts["major"], "汉字")),
+    theme_candidates(script_fonts["major"], "汉字"),
+)
+check(
+    "non-Latin inherited-font triage uses script mappings",
+    "Cyrillic Theme" in theme_candidates(script_fonts["minor"], "текст"),
+    theme_candidates(script_fonts["minor"], "текст"),
 )
 
 check(
