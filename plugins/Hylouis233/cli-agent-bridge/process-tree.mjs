@@ -36,14 +36,92 @@ function runUtility(command, args, timeoutMs = 5_000) {
   });
 }
 
+async function windowsProcessStartIdentity(pid, run = runUtility) {
+  const script = "$p=Get-CimInstance Win32_Process -Filter 'ProcessId = " + String(pid) +
+    "'; if ($null -ne $p) { $p.CreationDate.ToUniversalTime().Ticks.ToString() }";
+  const result = await run("powershell.exe", [
+    "-NoProfile", "-NonInteractive", "-Command", script,
+  ]);
+  if (result.exitCode !== 0) {
+    throw new Error("cannot inspect Windows process identity: " +
+      (result.stderr.trim() || result.error?.message || "unknown error"));
+  }
+  return result.stdout.trim() || null;
+}
+
+export function trackedWindowsProcessTreePids(rootPid, treeState, processes) {
+  treeState.knownStarts ??= new Map();
+  const byPid = new Map(processes.map((item) => [item.pid, item]));
+  const matchesIdentity = (item) => {
+    if (!item.startIdentity) {
+      throw new Error("cannot verify Windows process creation identity for PID " + String(item.pid));
+    }
+    const expected = treeState.knownStarts.get(item.pid);
+    return !expected || expected === item.startIdentity;
+  };
+  for (const pid of [...treeState.knownPids]) {
+    const item = byPid.get(pid);
+    const expected = treeState.knownStarts.get(pid);
+    if (item && expected && item.startIdentity && expected !== item.startIdentity) {
+      treeState.knownPids.delete(pid);
+    }
+  }
+  const descendants = new Set();
+  const parents = new Set();
+  const root = byPid.get(rootPid);
+  if (root && matchesIdentity(root)) {
+    const expectedRoot = treeState.knownStarts.get(rootPid);
+    if (expectedRoot || treeState.windowsSnapshotInitialized !== true) {
+      descendants.add(rootPid);
+      parents.add(rootPid);
+      treeState.knownStarts.set(rootPid, root.startIdentity);
+    }
+  }
+  // During the first relevant snapshot the root may have just exited while
+  // Win32_Process still records its children with the original parent PID.
+  if (treeState.windowsSnapshotInitialized !== true) parents.add(rootPid);
+  for (const pid of treeState.knownPids) {
+    const item = byPid.get(pid);
+    if (pid === rootPid && treeState.windowsSnapshotInitialized === true &&
+        !treeState.knownStarts.has(pid)) continue;
+    if (!item || !matchesIdentity(item)) continue;
+    descendants.add(pid);
+    parents.add(pid);
+  }
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const item of processes) {
+      if (!parents.has(item.parentPid) || descendants.has(item.pid)) continue;
+      if (!matchesIdentity(item)) continue;
+      descendants.add(item.pid);
+      parents.add(item.pid);
+      treeState.knownStarts.set(item.pid, item.startIdentity);
+      changed = true;
+    }
+  }
+  treeState.windowsSnapshotInitialized = true;
+  for (const pid of descendants) treeState.knownPids.add(pid);
+  return [...descendants];
+}
+
 export async function windowsProcessTreePids(
   rootPid,
   treeState = { knownPids: new Set(), knownStarts: new Map() },
   { runUtility: run = runUtility } = {},
 ) {
+  const seeds = [...new Set([rootPid, ...treeState.knownPids])]
+    .filter((pid) => Number.isInteger(pid) && pid > 0)
+    .join(",");
   const script = [
     "$ErrorActionPreference='Stop'",
-    "$items=@(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,@{n='CreationTicks';e={$_.CreationDate.ToUniversalTime().Ticks}})",
+    `$seed=@(${seeds})`,
+    "$queue=New-Object 'System.Collections.Generic.Queue[uint32]'",
+    "$seed | ForEach-Object { $queue.Enqueue([uint32]$_) }",
+    "$expanded=@{}",
+    "$itemSeen=@{}",
+    "$items=@()",
+    "while($queue.Count -gt 0){$parent=$queue.Dequeue();if($expanded.ContainsKey($parent)){continue};$expanded[$parent]=$true;$filter=\"ProcessId = $parent OR ParentProcessId = $parent\";foreach($p in @(Get-CimInstance Win32_Process -Filter $filter)){if(-not $itemSeen.ContainsKey($p.ProcessId)){$itemSeen[$p.ProcessId]=$true;$identity=$(if($null -eq $p.CreationDate){''}else{$p.CreationDate.ToUniversalTime().Ticks.ToString()});$items += [pscustomobject]@{ProcessId=[uint32]$p.ProcessId;ParentProcessId=[uint32]$p.ParentProcessId;CreationTicks=$identity}};if(-not $expanded.ContainsKey($p.ProcessId)){$queue.Enqueue([uint32]$p.ProcessId)}}}",
     "$items | ConvertTo-Json -Compress",
   ].join("; ");
   const result = await run("powershell.exe", [
@@ -60,45 +138,46 @@ export async function windowsProcessTreePids(
     parentPid: Number(item.ParentProcessId),
     startIdentity: String(item.CreationTicks ?? ""),
   }));
-  treeState.knownStarts ??= new Map();
-  const liveIdentities = new Map(processes.map((item) => [item.pid, item.startIdentity]));
-  // A known PID whose creation time changed is an unrelated process that reused
-  // the ID; it must leave the tracked tree before anything is signaled.
-  for (const pid of [...treeState.knownPids]) {
-    const expected = treeState.knownStarts.get(pid);
-    const observed = liveIdentities.get(pid);
-    if (expected && observed && expected !== observed) treeState.knownPids.delete(pid);
+  return trackedWindowsProcessTreePids(rootPid, treeState, processes);
+}
+
+export async function initializeProcessTree(child, treeState) {
+  if (!Number.isInteger(child.pid)) return;
+  if (process.platform === "win32") {
+    // taskkill /T starts from the live ChildProcess root. Defer CIM until
+    // close/termination so short-lived workers do not launch an expensive WMI
+    // query solely to prove that an already-closed root is gone.
+    treeState.knownStarts ??= new Map();
+    return;
   }
-  const livePids = new Set(processes.map((item) => item.pid));
-  const descendants = new Set([...treeState.knownPids].filter((pid) => livePids.has(pid)));
-  if (livePids.has(rootPid)) {
-    const rootExpected = treeState.knownStarts.get(rootPid);
-    const rootObserved = liveIdentities.get(rootPid);
-    // Record the root identity on first observation; afterwards a mismatch
-    // means the backend PID already exited and was reused.
-    if (!rootExpected || !rootObserved || rootExpected === rootObserved) {
-      descendants.add(rootPid);
-      if (rootObserved) treeState.knownStarts.set(rootPid, rootObserved);
-    }
+  await refreshProcessTree(child, treeState);
+}
+
+function parseLinuxStat(pid, statLine) {
+  // comm is parenthesized and may itself contain ')' characters. Fields
+  // after the final ')' begin with: state, ppid, pgrp, ...
+  const close = statLine.lastIndexOf(")");
+  if (close === -1) return null;
+  const fields = statLine.slice(close + 1).trim().split(/\s+/u);
+  const item = {
+    pid,
+    state: fields[0],
+    parentPid: Number(fields[1]),
+    processGroupId: Number(fields[2]),
+    startIdentity: fields[19] ?? "", // field 22: start time since boot
+  };
+  return !item.state || !Number.isInteger(item.pid) ||
+    !Number.isInteger(item.parentPid) || !Number.isInteger(item.processGroupId)
+    ? null : item;
+}
+
+async function readLinuxStat(pid, procRoot, fsOps) {
+  try {
+    return parseLinuxStat(pid, await fsOps.readFile(`${procRoot}/${pid}/stat`, "utf8"));
+  } catch (error) {
+    if (error.code === "ENOENT") return undefined;
+    throw error;
   }
-  const parents = new Set([rootPid, ...treeState.knownPids]);
-  let changed = true;
-  while (changed) {
-    changed = false;
-    for (const item of processes) {
-      if (parents.has(item.parentPid) && !descendants.has(item.pid)) {
-        descendants.add(item.pid);
-        parents.add(item.pid);
-        changed = true;
-      }
-    }
-  }
-  for (const pid of descendants) {
-    const identity = liveIdentities.get(pid);
-    if (identity && !treeState.knownStarts.has(pid)) treeState.knownStarts.set(pid, identity);
-  }
-  for (const pid of descendants) treeState.knownPids.add(pid);
-  return [...descendants];
 }
 
 async function linuxProcessSnapshot(procRoot = "/proc", fsOps = { readdir, readFile }) {
@@ -111,28 +190,14 @@ async function linuxProcessSnapshot(procRoot = "/proc", fsOps = { readdir, readF
   const processes = [];
   for (const entry of entries) {
     if (!entry.isDirectory() || !/^\d+$/u.test(entry.name)) continue;
-    let statLine;
     try {
-      statLine = await fsOps.readFile(`${procRoot}/${entry.name}/stat`, "utf8");
+      const item = await readLinuxStat(Number(entry.name), procRoot, fsOps);
+      if (item === undefined) continue;
+      if (item === null) return null;
+      processes.push(item);
     } catch (error) {
-      if (error.code === "ENOENT") continue;
       return null;
     }
-    // comm is parenthesized and may itself contain ')' characters. Fields
-    // after the final ')' begin with: state, ppid, pgrp, ...
-    const close = statLine.lastIndexOf(")");
-    if (close === -1) return null;
-    const fields = statLine.slice(close + 1).trim().split(/\s+/u);
-    const item = {
-      pid: Number(entry.name),
-      state: fields[0],
-      parentPid: Number(fields[1]),
-      processGroupId: Number(fields[2]),
-      startIdentity: fields[19] ?? "", // field 22: start time since boot
-    };
-    if (!item.state || !Number.isInteger(item.pid) ||
-        !Number.isInteger(item.parentPid) || !Number.isInteger(item.processGroupId)) return null;
-    processes.push(item);
   }
   processes.incomplete = false;
   return processes;
@@ -154,6 +219,61 @@ export async function linuxProcessGroupHasLiveMembers(
   const members = processes.filter((item) => item.processGroupId === processGroupId);
   if (members.length === 0) return null;
   return members.some((item) => isLiveState(item.state));
+}
+
+// Follow only PIDs already owned by this worker and the kernel-maintained child
+// lists for their tasks. This keeps the short escape-detection interval without
+// rescanning every process on the host for the lifetime of a delegation.
+async function linuxTrackedProcessSnapshot(rootPid, treeState, procRoot, fsOps) {
+  treeState.knownStarts ??= new Map();
+  const queue = [...new Set([rootPid, ...treeState.knownPids])];
+  const queued = new Set(queue);
+  const processes = [];
+  for (let index = 0; index < queue.length; index += 1) {
+    const pid = queue[index];
+    let item;
+    try {
+      item = await readLinuxStat(pid, procRoot, fsOps);
+    } catch {
+      return null;
+    }
+    if (item === undefined) continue;
+    if (item === null) return null;
+    const expected = treeState.knownStarts.get(pid);
+    if (expected && item.startIdentity && expected !== item.startIdentity) continue;
+    treeState.knownPids.add(pid);
+    if (item.startIdentity) treeState.knownStarts.set(pid, item.startIdentity);
+    processes.push(item);
+
+    let taskEntries;
+    try {
+      taskEntries = await fsOps.readdir(`${procRoot}/${pid}/task`, { withFileTypes: true });
+    } catch (error) {
+      if (error.code === "ENOENT") continue;
+      return null;
+    }
+    for (const taskEntry of taskEntries) {
+      if (!taskEntry.isDirectory() || !/^\d+$/u.test(taskEntry.name)) continue;
+      let children;
+      try {
+        children = await fsOps.readFile(
+          `${procRoot}/${pid}/task/${taskEntry.name}/children`, "utf8",
+        );
+      } catch (error) {
+        if (error.code === "ENOENT") continue;
+        return null;
+      }
+      for (const value of children.trim().split(/\s+/u)) {
+        if (!value) continue;
+        const childPid = Number(value);
+        if (!Number.isInteger(childPid) || childPid <= 0 || queued.has(childPid)) continue;
+        queued.add(childPid);
+        queue.push(childPid);
+      }
+    }
+  }
+  processes.incomplete = false;
+  return processes;
 }
 
 async function posixProcessSnapshot({
@@ -190,7 +310,16 @@ export async function refreshProcessTree(child, treeState, options = {}) {
     await windowsProcessTreePids(child.pid, treeState, options);
     return null;
   }
-  const processes = await (options.posixProcessSnapshot ?? posixProcessSnapshot)(options);
+  const processes = options.posixProcessSnapshot
+    ? await options.posixProcessSnapshot(options)
+    : platform === "linux"
+      ? await linuxTrackedProcessSnapshot(
+          child.pid,
+          treeState,
+          options.procRoot ?? "/proc",
+          options.fsOps ?? { readdir, readFile },
+        )
+      : await posixProcessSnapshot(options);
   if (processes === null) return null;
   treeState.knownStarts ??= new Map();
   const byPid = new Map(processes.map((item) => [item.pid, item]));
@@ -234,6 +363,7 @@ export async function isProcessTreeAlive(child, treeState, {
 } = {}) {
   if (!Number.isInteger(child.pid)) return false;
   if (platform === "win32") {
+    await treeState.initialRefresh;
     return (await windowsProcessTreePids(child.pid, treeState)).length > 0;
   }
   const processes = await refreshProcessTree(child, treeState, { platform, procRoot, fsOps });
@@ -277,15 +407,17 @@ export async function signalProcessTree(child, signal, treeState, {
 } = {}) {
   if (!Number.isInteger(child.pid)) return;
   if (platform === "win32") {
-    // Windows has no portable SIGTERM equivalent for arbitrary console CLIs;
-    // /T /F is required to terminate the complete tree deterministically.
-    await run("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"]);
-    // If the root exited first, taskkill cannot traverse it. Win32_Process
-    // normally retains the old parent PID, while known PIDs survive re-parenting.
-    // windowsProcessTreePids drops any known PID whose creation identity changed,
-    // so reused PIDs are never signaled.
+    // The ChildProcess handle identifies the current root, so terminate its tree
+    // immediately. Retained PIDs are then checked by creation identity.
+    if (child.exitCode === null && child.signalCode === null) {
+      await run("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"]);
+    }
+    await treeState.initialRefresh;
     const remaining = await windowsProcessTreePids(child.pid, treeState, { runUtility: run });
     for (const pid of remaining.reverse()) {
+      const expected = treeState.knownStarts.get(pid);
+      const current = await windowsProcessStartIdentity(pid, run);
+      if (!current || !expected || current !== expected) continue;
       await run("taskkill.exe", ["/PID", String(pid), "/T", "/F"]);
     }
     return;

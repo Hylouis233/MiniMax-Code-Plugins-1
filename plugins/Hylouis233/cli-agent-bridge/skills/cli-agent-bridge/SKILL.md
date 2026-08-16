@@ -12,8 +12,8 @@ inside the target git repository, and their results come back as a git diff for 
 
 - The user names another CLI explicitly (for example: delegate this to codex).
 - A task is long and self-contained and should not fill the current context.
-- Independent subtasks in separate workspaces can run in parallel across different CLIs;
-  same-workspace delegations queue behind each other.
+- Independent subtasks in separate clones can run in parallel across different CLIs;
+  worktrees sharing one Git common directory queue behind each other.
 - The user wants a second opinion or a cross-check from another agent.
 
 ## Workflow
@@ -21,15 +21,14 @@ inside the target git repository, and their results come back as a git diff for 
 1. Run workspace_status with the workspace path and confirm the working tree is clean.
 2. Pick a backend from list_backends and confirm it is available on this machine.
 3. Run delegate_task with a self-contained task, the workspace path, and the backend name.
-   Delegations to the same workspace are serialized across bridge server processes, so parallel
-   runs from separate MCP clients still queue instead of interleaving edits.
+   Delegations whose worktrees share one Git common directory are serialized across bridge server
+   processes, so linked worktrees and separate MCP clients cannot interleave shared-ref snapshots.
 4. Review the returned result: the before and after git snapshots (status, diff stat, changed
    files including staged and new files), changed refs and the commits block when the worker committed, the
    output and stderr tails, and the exit code. A failed, timed-out, or cancelled run reports
    ok=false (and isError=true at the protocol level); never treat such a result as success.
-   When repositoryConcurrency is true, another delegation was active in the same repository
-   during the run, so the commits block lists attributed commits that may overlap the other
-   worker - do not present them as this worker's exclusive output.
+   If repositoryConcurrency is true, an older bridge instance or external writer overlapped the
+   snapshot; treat the commits block as attributed rather than exclusive output.
 5. If the result is wrong, delegate a follow-up task. delegate_task results do not carry the
    backend's own session id, so use resumeSessionId only when the user already knows one (for
    example from the backend CLI's session history); otherwise start a fresh delegation with the
@@ -51,8 +50,9 @@ inside the target git repository, and their results come back as a git diff for 
   with --permission-mode acceptEdits); treat every returned diff as untrusted until reviewed.
 - Review every change the worker produced before reporting completion. New files the worker
   created are listed under changed files even though they do not appear in git diff --stat.
-- Run independent or comparison workers in separate clean Git worktrees at the same starting
-  commit. A second run in one checkout inherits the first run's edits and is not independent.
+- Run parallel comparison workers in separate clean clones at the same starting commit. Linked
+  worktrees share refs and intentionally serialize; a second run in one checkout also inherits the
+  first run's edits and is not independent.
 - Timeouts: the default is 20 minutes; adjust timeoutMs for very large tasks. The deadline includes
   lock acquisition, preflight Git checks, the worker, and post-run snapshots. A
   timed-out worker has its complete process tree terminated before the lock is released; safe

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -13,11 +13,46 @@ import {
   windowsProcessTreePids,
 } from "../process-tree.mjs";
 
-async function writeProcStat(root, pid, { state, group, command = "worker" }) {
+async function writeProcStat(root, pid, {
+  state, group, parent = 1, startIdentity = pid, command = "worker",
+}) {
   const directory = path.join(root, String(pid));
-  await mkdir(directory);
-  await writeFile(path.join(directory, "stat"), `${pid} (${command}) ${state} 1 ${group} ${group} 0 0 0 0\n`);
+  await mkdir(directory, { recursive: true });
+  const fields = [state, String(parent), String(group), String(group)];
+  while (fields.length < 20) fields.push("0");
+  fields[19] = String(startIdentity);
+  await writeFile(path.join(directory, "stat"), `${pid} (${command}) ${fields.join(" ")}\n`);
 }
+
+async function writeTaskChildren(root, pid, children) {
+  const taskDirectory = path.join(root, String(pid), "task", String(pid));
+  await mkdir(taskDirectory, { recursive: true });
+  await writeFile(path.join(taskDirectory, "children"), children.join(" ") + "\n");
+}
+
+test("Linux ancestry refresh follows task children without scanning all of procfs", async (context) => {
+  const procRoot = await mkdtemp(path.join(os.tmpdir(), "cli-agent-bridge-proc-"));
+  context.after(() => rm(procRoot, { recursive: true, force: true }));
+  await writeProcStat(procRoot, 601, { state: "S", group: 601, startIdentity: 10 });
+  await writeProcStat(procRoot, 602, {
+    state: "S", group: 602, parent: 601, startIdentity: 11,
+  });
+  await writeTaskChildren(procRoot, 601, [602]);
+  await writeTaskChildren(procRoot, 602, []);
+  const fsOps = {
+    readdir: async (target, options) => {
+      assert.notEqual(target, procRoot, "targeted refresh must not enumerate the proc root");
+      return await readdir(target, options);
+    },
+    readFile,
+  };
+  const treeState = { knownPids: new Set([601]), knownStarts: new Map() };
+  const snapshot = await refreshProcessTree({ pid: 601 }, treeState, {
+    platform: "linux", procRoot, fsOps,
+  });
+  assert.deepEqual(new Set(snapshot.map((item) => item.pid)), new Set([601, 602]));
+  assert.equal(treeState.knownStarts.get(602), "11");
+});
 
 test("Linux liveness ignores zombie-only process groups", async (context) => {
   const procRoot = await mkdtemp(path.join(os.tmpdir(), "cli-agent-bridge-proc-"));

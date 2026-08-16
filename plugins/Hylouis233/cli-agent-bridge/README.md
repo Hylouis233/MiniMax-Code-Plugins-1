@@ -36,15 +36,13 @@ diff stat, changed files, and output tail before continuing.
 
 ```text
 Use cli-agent-bridge to have claude and kimi implement the same small feature independently,
-then compare the two diffs. Create two independent worktrees first.
+then compare the two diffs. Create two independent clones first.
 ```
 
-Expected result: the orchestrator creates two git worktrees (`git worktree add ../ws-claude`,
-`git worktree add ../ws-kimi`), delegates the same task to backend=claude in the first and
-backend=kimi in the second, then compares the two diffs reported to the user. Independent
-comparison runs need separate worktrees: the first run leaves its checkout dirty, so a
-same-workspace second run would be rejected by the allowDirty=false guard (same-checkout runs
-are serialized into a queue, which suits follow-up work, not parallel comparisons).
+Expected result: the orchestrator creates two clones at the same starting commit, delegates the
+same task to backend=claude in the first and backend=kimi in the second, then compares the two
+diffs reported to the user. Linked worktrees share refs and therefore queue behind the same
+repository lock; use separate clones when the comparison must run in parallel.
 
 ## Requirements
 
@@ -116,21 +114,18 @@ you already obtained a valid ID from that backend outside this Plugin.
   plays that role instead.
 - The bridge delegates tasks; it does not merge code, commit, or push. The user reviews every
   diff.
-- Delegations and status snapshots targeting the same canonical Git worktree are serialized even
-  when callers name a subdirectory, different path casing, or symlink, and even when separate MCP
-  clients launched separate bridge server processes. Independent comparison runs still require
-  separate clean worktrees. The cross-process lock is an owner blob referenced by an atomic Git-ref
+- Delegations and status snapshots targeting the same Git common directory are serialized even
+  when callers name a subdirectory, different path casing, symlink, or linked worktree, and even
+  when separate MCP clients launched separate bridge server processes. Use separate clean clones
+  for parallel comparison runs. The cross-process lock is an owner blob referenced by an atomic Git-ref
   compare-and-swap. A stale idle lock is reclaimed only when its same-host owner is positively
   confirmed dead; malformed, foreign-host, starting, running, or uncertain records fail closed.
   A crashed bridge cannot reconstruct descendants that escaped into another POSIX session from the
   recorded worker PID alone, so inspect leftover processes and clear those hidden refs manually.
-- Worktrees of the same repository serialize independently (each has its own lock), but Git refs
-  are shared by the whole repository. When another delegation was active in the same repository
-  during a run - detected from live leases plus the run-history record each completed delegation
-  leaves under a hidden `.history` ref - the result sets `repositoryConcurrency: true` and the
-  commits section is labelled as attributed rather than exact, because ref movements may include
-  the other worker's commits. Perfect attribution across shared refs would require serializing
-  the entire repository, which would break parallel independent-worktree runs.
+- Linked worktrees share refs and therefore intentionally share one repository lock. The
+  `repositoryConcurrency` field remains as a fail-safe disclosure if an older bridge instance or
+  an external writer updates bridge history during a snapshot, but current bridge instances do
+  not run linked-worktree delegations concurrently.
 - Locking leaves the worktree and index unchanged, but it requires writable Git object/ref metadata:
   each acquisition writes an owner blob and temporarily updates a hidden ref. Repository
   reference-transaction hooks can observe or reject those updates, and released owner blobs remain
@@ -187,7 +182,7 @@ process-tree termination, escaped POSIX descendants and zombie-only Linux groups
 identity checks before signaling, unusual Git pathnames (including a trailing-space worktree
 root), JSON-RPC id typing, unborn HEAD and non-HEAD ref changes, checkout-only HEAD moves,
 single-count attribution for commits on the checked-out branch, fork-point diff baselines for
-new branches, non-commit refs, repository-concurrency disclosure between linked worktrees,
+new branches, non-commit refs, repository-wide serialization between linked worktrees,
 capture truncation, and Codex prompt delimiters on Windows and POSIX.
 
 ## License

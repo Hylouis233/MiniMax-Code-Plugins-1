@@ -27,9 +27,14 @@ function currentUserLockRoot() {
   return path.join(os.tmpdir(), "minimax-cli-agent-bridge-locks-" + scope);
 }
 
-function workspaceStatePaths(canonicalRoot) {
-  const normalized = path.normalize(canonicalRoot);
-  const key = "git-worktree:" + (process.platform === "win32" ? normalized.toLowerCase() : normalized);
+async function canonicalGitCommonDirectory(workspace) {
+  const { stdout } = await execFileAsync("git", ["rev-parse", "--git-common-dir"], { cwd: workspace });
+  return await realpath(path.resolve(workspace, stdout.trim()));
+}
+
+function repositoryStatePaths(canonicalGitCommonDir) {
+  const normalized = path.normalize(canonicalGitCommonDir);
+  const key = "git-common-dir:" + (process.platform === "win32" ? normalized.toLowerCase() : normalized);
   const digest = createHash("sha256").update(key).digest("hex");
   const root = currentUserLockRoot();
   return {
@@ -295,9 +300,9 @@ test("a cross-process lock waiter obeys the delegation deadline", async (context
 
 test("losing a Git-ref lease never strands the local FIFO gate", async (context) => {
   const { tempRoot, workspace, client } = await makeHarness(context);
-  const canonicalRoot = await realpath(workspace);
+  const canonicalRoot = await canonicalGitCommonDirectory(workspace);
   const normalized = path.normalize(canonicalRoot);
-  const key = "git-worktree:" + (process.platform === "win32" ? normalized.toLowerCase() : normalized);
+  const key = "git-common-dir:" + (process.platform === "win32" ? normalized.toLowerCase() : normalized);
   const ref = workspaceLockRef(key);
   const eventFile = path.join(tempRoot, "lost-lock-events.jsonl");
   const first = client.request("tools/call", taskArguments(workspace, {
@@ -362,11 +367,11 @@ test("unconfirmed termination after lease loss quarantines delegation and status
   let quarantinePath = null;
   try {
     await client.initialize();
-    const canonicalRoot = await realpath(workspace);
-    ({ quarantinePath } = workspaceStatePaths(canonicalRoot));
+    const canonicalRoot = await canonicalGitCommonDirectory(workspace);
+    ({ quarantinePath } = repositoryStatePaths(canonicalRoot));
     context.after(() => rm(quarantinePath, { force: true }));
     const normalized = path.normalize(canonicalRoot);
-    const key = "git-worktree:" + normalized.toLowerCase();
+    const key = "git-common-dir:" + normalized.toLowerCase();
     ref = workspaceLockRef(key);
     const delegated = client.request("tools/call", taskArguments(workspace, {
       name: "unconfirmed-tree", eventFile, delayMs: 60_000,
@@ -436,7 +441,9 @@ test("a quarantine marker blocks delegations in every server process", async (co
   const secondClient = new McpClient(configPath);
   try {
     await secondClient.initialize();
-    const { root, quarantinePath } = workspaceStatePaths(await realpath(workspace));
+    const { root, quarantinePath } = repositoryStatePaths(
+      await canonicalGitCommonDirectory(workspace),
+    );
     await mkdir(root, { recursive: true });
     context.after(() => rm(quarantinePath, { force: true }));
     await writeFile(quarantinePath, JSON.stringify({ terminationError: "fixture" }));
@@ -792,33 +799,39 @@ test("a worker ref pointing at a non-commit object is reported without failing t
   assert.match(out.commits.log, /non-commit object/u);
 });
 
-test("parallel worktree delegations disclose repository concurrency", async (context) => {
-  const harness = await makeHarness(context);
-  const { tempRoot, workspace, configPath } = harness;
-  // A second independent worktree of the same repository: per-worktree locks
-  // are distinct while repository refs are shared.
-  const secondWorktree = path.join(tempRoot, "second-worktree");
-  await execFileAsync("git", ["worktree", "add", secondWorktree], { cwd: workspace });
+test("linked worktrees sharing Git refs serialize across server processes", async (context) => {
+  const { tempRoot, workspace, configPath, client } = await makeHarness(context);
+  const linkedWorkspace = path.join(tempRoot, "linked-worktree");
+  await execFileAsync("git", ["worktree", "add", "-b", "comparison-worktree", linkedWorkspace], {
+    cwd: workspace,
+  });
+  assert.equal(
+    await canonicalGitCommonDirectory(workspace),
+    await canonicalGitCommonDirectory(linkedWorkspace),
+  );
+  const secondClient = new McpClient(configPath);
+  try {
+    await secondClient.initialize();
+    const eventFile = path.join(tempRoot, "linked-worktree-events.jsonl");
+    const first = client.request("tools/call", taskArguments(workspace, {
+      name: "main-worktree", eventFile, delayMs: 800, writeFile: "main-only.txt",
+    }));
+    await waitFor(async () => (await events(eventFile)).some(
+      (item) => item.name === "main-worktree" && item.event === "start",
+    ));
+    const second = secondClient.request("tools/call", taskArguments(linkedWorkspace, {
+      name: "linked-worktree", eventFile, delayMs: 10, writeFile: "linked-only.txt",
+    }));
 
-  const eventFile = path.join(tempRoot, "parallel-events.log");
-  const slowSpec = { name: "slow", delayMs: 3_000, eventFile };
-  const fastClient = new McpClient(configPath);
-  await fastClient.initialize();
-  context.after(async () => { await fastClient.close(); });
-
-  const slowPromise = harness.client.request("tools/call", taskArguments(workspace, slowSpec));
-  await waitFor(async () => (await events(eventFile)).some((item) => item.event === "start"));
-  const overlapping = await fastClient.request("tools/call", taskArguments(secondWorktree, {
-    name: "fast-in-worktree", delayMs: 0,
-  }));
-  const overlappingOut = overlapping.result.structuredContent;
-  assert.equal(overlappingOut.ok, true, JSON.stringify(overlappingOut.error));
-  assert.equal(overlappingOut.repositoryConcurrency, true,
-    "an overlapping delegation in a linked worktree must disclose concurrency");
-  const slowOut = (await slowPromise).result.structuredContent;
-  assert.equal(slowOut.ok, true, JSON.stringify(slowOut.error));
-  assert.equal(slowOut.repositoryConcurrency, true,
-    "the slow delegation observed the overlapping worker in its after snapshot");
+    const responses = await Promise.all([first, second]);
+    assert.ok(responses.every((response) => response.result.structuredContent.ok));
+    assert.deepEqual((await events(eventFile)).map((item) => item.event + ":" + item.name), [
+      "start:main-worktree", "end:main-worktree",
+      "start:linked-worktree", "end:linked-worktree",
+    ]);
+  } finally {
+    await secondClient.close();
+  }
 });
 
 

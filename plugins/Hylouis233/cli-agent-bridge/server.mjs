@@ -13,7 +13,7 @@ import os from "node:os";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
-import { isProcessTreeAlive, refreshProcessTree, signalProcessTree, waitForChildExit, waitForProcessTreeExit } from "./process-tree.mjs";
+import { initializeProcessTree, isProcessTreeAlive, refreshProcessTree, signalProcessTree, waitForChildExit, waitForProcessTreeExit } from "./process-tree.mjs";
 import {
   acquireGitWorkspaceLock,
   WORKSPACE_LOCK_REF_PREFIX,
@@ -265,14 +265,15 @@ async function runCommand(command, args, options = {}) {
       knownPids: new Set(Number.isInteger(child.pid) ? [child.pid] : []),
       knownStarts: new Map(),
     };
-    let treeRefreshActive = false;
+    let treeRefreshPromise = null;
     let treeRefreshTimer = null;
-    const refreshTree = async () => {
-      if (!manageProcessTree || treeRefreshActive) return;
-      treeRefreshActive = true;
-      try { await refreshProcessTree(child, treeState); }
-      catch (error) { terminationError ||= "process-tree inspection failed: " + error.message; }
-      finally { treeRefreshActive = false; }
+    const refreshTree = () => {
+      if (!manageProcessTree) return Promise.resolve();
+      if (treeRefreshPromise) return treeRefreshPromise;
+      treeRefreshPromise = refreshProcessTree(child, treeState)
+        .catch((error) => { terminationError ||= "process-tree inspection failed: " + error.message; })
+        .finally(() => { treeRefreshPromise = null; });
+      return treeRefreshPromise;
     };
     const timeoutMs = options.timeoutMs ?? 30_000;
     const killGraceMs = options.killGraceMs ?? KILL_GRACE_MS;
@@ -334,11 +335,14 @@ async function runCommand(command, args, options = {}) {
       // Capture the root's start identity immediately so termination can later
       // detect a reused PID. Windows performs this one-shot inspection only;
       // POSIX keeps polling to track descendants that escape the process group.
-      // The 250 ms interval trades discovery latency against scanning every
-      // process under /proc (or forking `ps`) for the whole delegation.
-      void refreshTree();
+      // Linux follows only tracked /proc task children, so a short interval
+      // catches session escapes without scanning the host process table.
+      treeState.initialRefresh = initializeProcessTree(child, treeState).catch((error) => {
+        terminationError ||= "process-tree initialization failed: " + error.message;
+      });
       if (process.platform !== "win32") {
-        treeRefreshTimer = setInterval(() => { void refreshTree(); }, 250);
+        const refreshIntervalMs = process.platform === "linux" ? 25 : 250;
+        treeRefreshTimer = setInterval(() => { void refreshTree(); }, refreshIntervalMs);
         treeRefreshTimer.unref?.();
       }
     }
@@ -465,9 +469,24 @@ async function gitWorktreeRoot(workspacePath, options = {}) {
   }
 }
 
-function workspaceLockKey(worktreeRoot) {
-  const normalized = path.normalize(worktreeRoot);
-  return "git-worktree:" + (process.platform === "win32" ? normalized.toLowerCase() : normalized);
+async function gitCommonDirectory(workspacePath, options = {}) {
+  const result = await runGitCommand(["rev-parse", "--git-common-dir"], {
+    cwd: workspacePath, ...options,
+  });
+  const failure = snapshotFailure("git rev-parse --git-common-dir", result);
+  if (failure || !result.stdout.trim()) {
+    throw new Error("cannot identify Git common directory: " + (failure || "empty output"));
+  }
+  try {
+    return await realpath(path.resolve(workspacePath, result.stdout.trim()));
+  } catch (error) {
+    throw new Error("cannot canonicalize Git common directory: " + error.message);
+  }
+}
+
+function repositoryLockKey(gitCommonDir) {
+  const normalized = path.normalize(gitCommonDir);
+  return "git-common-dir:" + (process.platform === "win32" ? normalized.toLowerCase() : normalized);
 }
 
 function snapshotFailure(label, result) {
@@ -1126,6 +1145,7 @@ async function delegateTask(rawArgs, cancel) {
   const deadline = Date.now() + timeoutMs;
   let workspacePath = "";
   let worktreeRoot = "";
+  let gitCommonDir = "";
   try {
     if (cancel?.cancelled) {
       return cancelledDelegation({ backend, workspacePath, worktreeRoot, spec });
@@ -1134,6 +1154,7 @@ async function delegateTask(rawArgs, cancel) {
     if (Date.now() >= deadline) throw new DeadlineExceededError("delegation deadline exceeded");
     await requireGitRepo(workspacePath, { cancel, deadline });
     worktreeRoot = await gitWorktreeRoot(workspacePath, { cancel, deadline });
+    gitCommonDir = await gitCommonDirectory(workspacePath, { cancel, deadline });
   } catch (error) {
     if (error instanceof OperationCancelledError) {
       return cancelledDelegation({ backend, workspacePath, worktreeRoot, spec });
@@ -1149,7 +1170,7 @@ async function delegateTask(rawArgs, cancel) {
     }
     throw error;
   }
-  const lockKey = workspaceLockKey(worktreeRoot);
+  const lockKey = repositoryLockKey(gitCommonDir);
   const existingQuarantine = await readWorkspaceQuarantine(lockKey);
   if (quarantinedWorkspaces.has(lockKey) || existingQuarantine) {
     return quarantinedDelegation({ backend, workspacePath, worktreeRoot, spec }, existingQuarantine);
@@ -1583,6 +1604,7 @@ async function handleMessage(message) {
           const finishRequest = trackActiveRequest(message.id, cancel);
           let workspacePath = "";
           let worktreeRoot = "";
+          let gitCommonDir = "";
           try {
             workspacePath = await validateWorkspace(args.workspacePath);
             if (cancel.cancelled) return cancelledWorkspaceStatus(message.id, { workspacePath });
@@ -1590,6 +1612,7 @@ async function handleMessage(message) {
               await requireGitRepo(workspacePath, { cancel });
               if (cancel.cancelled) return cancelledWorkspaceStatus(message.id, { workspacePath });
               worktreeRoot = await gitWorktreeRoot(workspacePath, { cancel });
+              gitCommonDir = await gitCommonDirectory(workspacePath, { cancel });
             } catch (error) {
               if (error instanceof OperationCancelledError) {
                 return cancelledWorkspaceStatus(message.id, { workspacePath, worktreeRoot });
@@ -1597,7 +1620,7 @@ async function handleMessage(message) {
               throw error;
             }
             if (cancel.cancelled) return cancelledWorkspaceStatus(message.id, { workspacePath, worktreeRoot });
-            const lockKey = workspaceLockKey(worktreeRoot);
+            const lockKey = repositoryLockKey(gitCommonDir);
             const existingQuarantine = await readWorkspaceQuarantine(lockKey);
             if (quarantinedWorkspaces.has(lockKey) || existingQuarantine) {
               return quarantinedWorkspaceStatus(
