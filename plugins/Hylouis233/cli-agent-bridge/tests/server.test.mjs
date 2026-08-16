@@ -1,13 +1,15 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { access, chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { access, chmod, copyFile, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
 import test from "node:test";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
+
+import { workspaceLockRef } from "../workspace-lock.mjs";
 
 const execFileAsync = promisify(execFile);
 const testsRoot = path.dirname(fileURLToPath(import.meta.url));
@@ -32,7 +34,6 @@ function workspaceStatePaths(canonicalRoot) {
   const root = currentUserLockRoot();
   return {
     root,
-    lockPath: path.join(root, digest + ".lock"),
     quarantinePath: path.join(root, digest + ".quarantine"),
   };
 }
@@ -234,69 +235,199 @@ test("canonical worktree locking serializes independent server processes", async
   }
 });
 
-test("a workspace lock left by a dead server process is reclaimed", async (context) => {
-  const { workspace, client } = await makeHarness(context);
-  const canonicalRoot = await realpath(workspace);
-  const { root: lockRoot, lockPath } = workspaceStatePaths(canonicalRoot);
-  await mkdir(lockRoot, { recursive: true });
-  context.after(() => rm(lockPath, { force: true }));
-  await writeFile(lockPath, JSON.stringify({
-    pid: 99_999_999,
-    token: "dead-server-fixture",
-    createdAt: Date.now() - 60_000,
-  }));
-
-  const response = await client.request("tools/call", taskArguments(workspace, {
-    name: "after-stale-lock", writeFile: "reclaimed.txt",
-  }));
-  assert.equal(response.result.structuredContent.ok, true);
-  await assert.rejects(access(lockPath), /ENOENT/u);
-});
-
-test("a stale lock is reclaimed when its PID was reused by another process", async (context) => {
-  const { workspace, client } = await makeHarness(context);
-  const { root, lockPath } = workspaceStatePaths(await realpath(workspace));
-  await mkdir(root, { recursive: true });
-  context.after(() => rm(lockPath, { force: true }));
-  await writeFile(lockPath, JSON.stringify({
-    pid: process.pid,
-    processIdentity: "not-the-current-process-start",
-    token: "reused-pid-fixture",
-    createdAt: Date.now() - 60_000,
-  }));
-  const response = await client.request("tools/call", taskArguments(workspace, {
-    name: "after-reused-pid", writeFile: "reused-pid-reclaimed.txt",
-  }));
-  assert.equal(response.result.structuredContent.ok, true);
-});
-
-test("concurrent stale-lock reclaimers still serialize across processes", async (context) => {
+test("a cross-process lock waiter can be cancelled without starting its backend", async (context) => {
   const { tempRoot, workspace, configPath, client } = await makeHarness(context);
   const secondClient = new McpClient(configPath);
   try {
     await secondClient.initialize();
-    const { root, lockPath } = workspaceStatePaths(await realpath(workspace));
-    await mkdir(root, { recursive: true });
-    context.after(() => rm(lockPath, { force: true }));
-    await writeFile(lockPath, JSON.stringify({
-      pid: 99_999_999,
-      processIdentity: "dead-owner",
-      token: "concurrent-reclaim-fixture",
-      createdAt: Date.now() - 60_000,
-    }));
-    const eventFile = path.join(tempRoot, "reclaim-race-events.jsonl");
-    const first = client.request("tools/call", taskArguments(workspace, {
-      name: "reclaimer-one", eventFile, delayMs: 500,
-    }, { allowDirty: true }), 121);
-    const second = secondClient.request("tools/call", taskArguments(workspace, {
-      name: "reclaimer-two", eventFile, delayMs: 500,
-    }, { allowDirty: true }), 122);
-    const responses = await Promise.all([first, second]);
-    assert.ok(responses.every((response) => response.result.structuredContent.ok));
-    const sequence = (await events(eventFile)).map((item) => item.event);
-    assert.deepEqual(sequence, ["start", "end", "start", "end"]);
+    const eventFile = path.join(tempRoot, "cross-process-cancel-events.jsonl");
+    const holder = client.request("tools/call", taskArguments(workspace, {
+      name: "cancel-holder", eventFile, delayMs: 3_000,
+    }), 121);
+    await waitFor(async () => (await events(eventFile)).some(
+      (item) => item.name === "cancel-holder" && item.event === "start",
+    ));
+    const waiter = secondClient.request("tools/call", taskArguments(workspace, {
+      name: "cancelled-waiter", eventFile,
+    }), 122);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    const cancelledAt = Date.now();
+    secondClient.notify("notifications/cancelled", { requestId: 122 });
+
+    const waiterResponse = await waiter;
+    assert.ok(Date.now() - cancelledAt < 1_500, "cross-process lock cancellation must settle promptly");
+    assert.equal(waiterResponse.result.structuredContent.cancelled, true);
+    assert.equal((await events(eventFile)).some((item) => item.name === "cancelled-waiter"), false);
+    assert.equal((await holder).result.structuredContent.ok, true);
   } finally {
     await secondClient.close();
+  }
+});
+
+test("a cross-process lock waiter obeys the delegation deadline", async (context) => {
+  const { tempRoot, workspace, configPath, client } = await makeHarness(context);
+  const secondClient = new McpClient(configPath);
+  try {
+    await secondClient.initialize();
+    const eventFile = path.join(tempRoot, "cross-process-deadline-events.jsonl");
+    const holder = client.request("tools/call", taskArguments(workspace, {
+      name: "deadline-holder", eventFile, delayMs: 7_000,
+    }), 131);
+    await waitFor(async () => (await events(eventFile)).some(
+      (item) => item.name === "deadline-holder" && item.event === "start",
+    ));
+    const startedAt = Date.now();
+    const waiter = secondClient.request("tools/call", taskArguments(workspace, {
+      name: "deadline-waiter", eventFile,
+    }, { timeoutMs: 5_000 }), 132);
+
+    const waiterResponse = await waiter;
+    const elapsed = Date.now() - startedAt;
+    assert.ok(elapsed >= 4_500 && elapsed < 6_500, "lock wait should consume the overall deadline: " + String(elapsed));
+    assert.equal(waiterResponse.result.structuredContent.timedOut, true);
+    assert.match(waiterResponse.result.structuredContent.error, /waiting for the workspace lock/iu);
+    assert.equal((await events(eventFile)).some((item) => item.name === "deadline-waiter"), false);
+    assert.equal((await holder).result.structuredContent.ok, true);
+  } finally {
+    await secondClient.close();
+  }
+});
+
+test("losing a Git-ref lease never strands the local FIFO gate", async (context) => {
+  const { tempRoot, workspace, client } = await makeHarness(context);
+  const canonicalRoot = await realpath(workspace);
+  const normalized = path.normalize(canonicalRoot);
+  const key = "git-worktree:" + (process.platform === "win32" ? normalized.toLowerCase() : normalized);
+  const ref = workspaceLockRef(key);
+  const eventFile = path.join(tempRoot, "lost-lock-events.jsonl");
+  const first = client.request("tools/call", taskArguments(workspace, {
+    name: "loses-lock", eventFile, delayMs: 12_000,
+  }), 141);
+  await waitFor(async () => (await events(eventFile)).some(
+    (item) => item.name === "loses-lock" && item.event === "start",
+  ));
+  await waitFor(async () => {
+    try {
+      const { stdout: oid } = await execFileAsync("git", ["rev-parse", "--verify", ref], { cwd: workspace });
+      const { stdout: blob } = await execFileAsync("git", ["cat-file", "blob", oid.trim()], { cwd: workspace });
+      return JSON.parse(blob).workerState === "running";
+    } catch {
+      return false;
+    }
+  });
+
+  const replacementPath = path.join(tempRoot, "replacement-owner.json");
+  await writeFile(replacementPath, JSON.stringify({ version: 1, hostIdentity: "foreign:test" }));
+  const { stdout: replacementOidText } = await execFileAsync("git", ["hash-object", "-w", replacementPath], { cwd: workspace });
+  const replacementOid = replacementOidText.trim();
+  const replacedAt = Date.now();
+  await execFileAsync("git", ["update-ref", ref, replacementOid], { cwd: workspace });
+  context.after(async () => {
+    try { await execFileAsync("git", ["update-ref", "-d", ref, replacementOid], { cwd: workspace }); } catch { /* already gone */ }
+  });
+
+  const firstResponse = await first;
+  assert.ok(Date.now() - replacedAt < 9_000, "heartbeat loss must terminate the active worker promptly");
+  assert.match(firstResponse.error?.message ?? "", /workspace lock ownership changed/iu);
+  assert.equal((await events(eventFile)).some(
+    (item) => item.name === "loses-lock" && item.event === "end",
+  ), false, "the original 12-second worker should be terminated before normal completion");
+  await execFileAsync("git", ["update-ref", "-d", ref, replacementOid], { cwd: workspace });
+
+  const followUp = await client.request("tools/call", taskArguments(workspace, {
+    name: "after-lost-lock", eventFile, delayMs: 10,
+  }), 142);
+  assert.equal(followUp.result.structuredContent.ok, true, JSON.stringify(followUp));
+  assert.ok((await events(eventFile)).some((item) => item.name === "after-lost-lock" && item.event === "end"));
+});
+
+test("unconfirmed termination after lease loss quarantines delegation and status", {
+  skip: process.platform !== "win32",
+}, async (context) => {
+  const { tempRoot, workspace, configPath } = await makeHarness(context);
+  const shimDirectory = path.join(tempRoot, "failing-taskkill");
+  await mkdir(shimDirectory);
+  const windowsRoot = process.env.SystemRoot ?? "C:\\Windows";
+  const realTaskkill = path.join(windowsRoot, "System32", "taskkill.exe");
+  await copyFile(path.join(windowsRoot, "System32", "cmd.exe"), path.join(shimDirectory, "taskkill.exe"));
+  const client = new McpClient(configPath, {
+    NODE_ENV: "test",
+    CLI_AGENT_BRIDGE_TEST_KILL_GRACE_MS: "100",
+    PATH: shimDirectory + path.delimiter + process.env.PATH,
+  });
+  const eventFile = path.join(tempRoot, "quarantine-events.jsonl");
+  let workerPid = null;
+  let replacementOid = null;
+  let ref = null;
+  let quarantinePath = null;
+  try {
+    await client.initialize();
+    const canonicalRoot = await realpath(workspace);
+    ({ quarantinePath } = workspaceStatePaths(canonicalRoot));
+    context.after(() => rm(quarantinePath, { force: true }));
+    const normalized = path.normalize(canonicalRoot);
+    const key = "git-worktree:" + normalized.toLowerCase();
+    ref = workspaceLockRef(key);
+    const delegated = client.request("tools/call", taskArguments(workspace, {
+      name: "unconfirmed-tree", eventFile, delayMs: 60_000,
+    }), 151);
+    await waitFor(async () => {
+      const started = (await events(eventFile)).find(
+        (item) => item.name === "unconfirmed-tree" && item.event === "start",
+      );
+      workerPid = started?.pid ?? null;
+      return Number.isInteger(workerPid);
+    });
+    await waitFor(async () => {
+      try {
+        const { stdout: oid } = await execFileAsync("git", ["rev-parse", "--verify", ref], { cwd: workspace });
+        const { stdout: blob } = await execFileAsync("git", ["cat-file", "blob", oid.trim()], { cwd: workspace });
+        return JSON.parse(blob).workerState === "running";
+      } catch {
+        return false;
+      }
+    });
+    const replacementPath = path.join(tempRoot, "quarantine-replacement-owner.json");
+    await writeFile(replacementPath, JSON.stringify({ version: 1, hostIdentity: "foreign:quarantine" }));
+    const replacement = await execFileAsync("git", ["hash-object", "-w", replacementPath], { cwd: workspace });
+    replacementOid = replacement.stdout.trim();
+    const queuedStatus = client.request("tools/call", {
+      name: "workspace_status",
+      arguments: { workspacePath: workspace },
+    }, 153);
+    await execFileAsync("git", ["update-ref", ref, replacementOid], { cwd: workspace });
+
+    const failed = await delegated;
+    assert.match(failed.error?.message ?? "", /workspace lock ownership changed/iu);
+    const status = await queuedStatus;
+    assert.equal(status.result.structuredContent.git, null);
+    assert.match(status.result.structuredContent.error, /could not be confirmed terminated/iu);
+    const followUp = await client.request("tools/call", taskArguments(workspace, {
+      name: "must-not-start-after-quarantine", eventFile,
+    }), 152);
+    assert.equal(followUp.result.structuredContent.treeTerminated, false);
+    assert.match(followUp.result.structuredContent.error, /quarantined/iu);
+    assert.equal((await events(eventFile)).some(
+      (item) => item.name === "must-not-start-after-quarantine",
+    ), false);
+
+    await execFileAsync(realTaskkill, ["/PID", String(workerPid), "/T", "/F"]);
+    workerPid = null;
+    await rm(quarantinePath, { force: true });
+    await execFileAsync("git", ["update-ref", "-d", ref, replacementOid], { cwd: workspace });
+    replacementOid = null;
+    const recovered = await client.request("tools/call", taskArguments(workspace, {
+      name: "after-manual-quarantine-recovery", eventFile, delayMs: 10,
+    }), 154);
+    assert.equal(recovered.result.structuredContent.ok, true, JSON.stringify(recovered));
+  } finally {
+    if (ref && replacementOid) {
+      try { await execFileAsync("git", ["update-ref", "-d", ref, replacementOid], { cwd: workspace }); } catch { /* already gone */ }
+    }
+    if (Number.isInteger(workerPid)) {
+      try { await execFileAsync(realTaskkill, ["/PID", String(workerPid), "/T", "/F"]); } catch { /* already gone */ }
+    }
+    await client.close();
   }
 });
 

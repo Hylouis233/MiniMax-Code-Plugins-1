@@ -50,8 +50,8 @@ inside the target git repository, and their results come back as a git diff for 
   created are listed under changed files even though they do not appear in git diff --stat.
 - Run independent or comparison workers in separate clean Git worktrees at the same starting
   commit. A second run in one checkout inherits the first run's edits and is not independent.
-- Timeouts: the default is 20 minutes; adjust timeoutMs for very large tasks. The deadline starts
-  after lock acquisition and covers preflight Git checks, the worker, and post-run snapshots. A
+- Timeouts: the default is 20 minutes; adjust timeoutMs for very large tasks. The deadline includes
+  lock acquisition, preflight Git checks, the worker, and post-run snapshots. A
   timed-out worker has its complete process tree terminated before the lock is released; safe
   termination may use the additional kill grace period.
 - Cancellation: cancelling an in-flight delegate_task call terminates the complete worker process
@@ -64,6 +64,12 @@ inside the target git repository, and their results come back as a git diff for 
   backend tail as partial.
 - Cancelling workspace_status while it is queued or snapshotting returns promptly with
   cancelled=true; it does not run a delayed status snapshot after the active delegation finishes.
+- workspace_status does not edit worktree files, but cross-process serialization temporarily writes
+  a hidden Git lock ref and owner blob. Git metadata must be writable, and repository
+  reference-transaction hooks may observe or reject the lock update.
+- Only stale idle locks with a positively dead same-host owner are reclaimed automatically. A stale
+  starting/running ref fails closed because escaped descendants cannot be reconstructed after a
+  bridge crash; inspect the process tree before deliberately clearing that hidden ref.
 
 ## Notes
 

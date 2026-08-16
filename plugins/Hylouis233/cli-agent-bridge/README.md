@@ -119,20 +119,31 @@ you already obtained a valid ID from that backend outside this Plugin.
 - Delegations and status snapshots targeting the same canonical Git worktree are serialized even
   when callers name a subdirectory, different path casing, or symlink, and even when separate MCP
   clients launched separate bridge server processes. Independent comparison runs still require
-  separate clean worktrees. The cross-process lock lives in a current-user-scoped directory under
-  the OS temporary directory. Dead-owner recovery compares both PID and process-start identity;
-  an atomic reclaim claim prevents two waiters from deleting a newly acquired lock.
+  separate clean worktrees. The cross-process lock is an owner blob referenced by an atomic Git-ref
+  compare-and-swap. A stale idle lock is reclaimed only when its same-host owner is positively
+  confirmed dead; malformed, foreign-host, starting, running, or uncertain records fail closed.
+  A crashed bridge cannot reconstruct descendants that escaped into another POSIX session from the
+  recorded worker PID alone, so inspect leftover processes and clear those hidden refs manually.
+- Locking leaves the worktree and index unchanged, but it requires writable Git object/ref metadata:
+  each acquisition writes an owner blob and temporarily updates a hidden ref. Repository
+  reference-transaction hooks can observe or reject those updates, and released owner blobs remain
+  unreachable until normal Git garbage collection. For that reason workspace_status is not marked
+  read-only in its MCP annotations even though the snapshot itself does not edit worktree files.
 - Cancellation and timeout confirm that the delegated process tree has exited before releasing
   the workspace mutex. A lightweight ancestry monitor records descendants that create a new POSIX
   session/process group so cancellation still terminates them. If termination cannot be confirmed,
   the bridge writes a shared quarantine marker and every bridge process refuses further delegation
   until an operator checks for leftovers and deliberately removes the reported quarantinePath.
+  A retained Git-ref lease may also require deliberate removal after that process check; Windows
+  cannot safely reclaim a stale lease that recorded a running worker because descendant liveness
+  cannot be proven. The quarantine marker itself lives in a current-user-scoped OS temporary
+  directory.
   On Linux, zombie-only tracked trees count as terminated; zombies cannot edit the workspace and
   may otherwise persist when container PID 1 does not reap them.
 - Cancelling a workspace_status request interrupts its queued lock wait or Git snapshot and returns
   a cancelled tool result instead of performing a stale snapshot later.
-- timeoutMs is an overall deadline that starts after the workspace lock is acquired and covers
-  preflight Git checks, the worker, and post-run snapshots. Safe process-tree termination can
+- timeoutMs is an overall deadline that includes workspace lock acquisition, preflight Git checks,
+  the worker, and post-run snapshots. Safe process-tree termination can
   extend beyond that deadline by the documented kill grace period.
 - Snapshots include all Git refs as well as HEAD, so a worker that commits on a new branch and
   returns to the original branch still reports the created ref and commit. Any bounded Git capture
@@ -149,13 +160,14 @@ Run the dependency-free fake-backend suites from the repository root:
 ```text
 node --test plugins/Hylouis233/cli-agent-bridge/test/server.test.mjs
 node --test plugins/Hylouis233/cli-agent-bridge/tests/server.test.mjs
+node --test plugins/Hylouis233/cli-agent-bridge/tests/workspace-lock.test.mjs
 ```
 
-They cover the full MCP flow plus in-process and cross-process canonical worktree locking, atomic
-stale-lock/PID-reuse recovery, shared quarantine markers, queued and discovery-phase cancellation,
-cancel/timeout process-tree termination, escaped POSIX descendants and zombie-only Linux groups,
-unusual Git pathnames, JSON-RPC id typing, unborn HEAD and non-HEAD ref changes, capture truncation,
-and Codex prompt delimiters on Windows and POSIX.
+They cover the full MCP flow plus in-process and cross-process canonical worktree locking, stale
+owner compare-and-swap, live-owner non-steal, shared quarantine markers, queued and discovery-phase
+cancellation, overall deadlines, cancel/timeout process-tree termination, escaped POSIX descendants
+and zombie-only Linux groups, unusual Git pathnames, JSON-RPC id typing, unborn HEAD and non-HEAD
+ref changes, capture truncation, and Codex prompt delimiters on Windows and POSIX.
 
 ## License
 

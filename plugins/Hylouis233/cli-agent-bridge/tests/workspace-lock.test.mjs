@@ -1,0 +1,269 @@
+import assert from "node:assert/strict";
+import { execFile, execFileSync } from "node:child_process";
+import { writeFileSync } from "node:fs";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+import { promisify } from "node:util";
+
+import {
+  acquireGitWorkspaceLock,
+  localHostIdentity,
+  tryAcquireGitWorkspaceLock,
+  workspaceLockRef,
+} from "../workspace-lock.mjs";
+
+const execFileAsync = promisify(execFile);
+
+async function git(cwd, args, input = undefined) {
+  const result = await execFileAsync("git", args, {
+    cwd,
+    input,
+    encoding: "utf8",
+  });
+  return result.stdout.trim();
+}
+
+async function makeRepo(context) {
+  const root = await mkdtemp(path.join(os.tmpdir(), "cli-agent-lock-test-"));
+  const repo = path.join(root, "repo");
+  await mkdir(repo);
+  await git(repo, ["init", "-b", "main"]);
+  context.after(() => rm(root, { recursive: true, force: true }));
+  return repo;
+}
+
+async function installOwner(repo, ref, owner) {
+  const oid = execFileSync("git", ["hash-object", "-w", "--stdin"], {
+    cwd: repo,
+    input: JSON.stringify(owner) + "\n",
+    encoding: "utf8",
+  }).trim();
+  await git(repo, ["update-ref", ref, oid]);
+  return oid;
+}
+
+test("a stale same-host lock is replaced only when its owner is confirmed dead", async (context) => {
+  const repo = await makeRepo(context);
+  const key = "git-worktree:" + repo;
+  const ref = workspaceLockRef(key);
+  const now = Date.now();
+  const oldOid = await installOwner(repo, ref, {
+    version: 1,
+    token: "dead-owner",
+    hostIdentity: localHostIdentity(),
+    ownerPid: 12345,
+    workerState: "idle",
+    workerPid: null,
+    acquiredAt: now - 60_000,
+    heartbeatAt: now - 60_000,
+  });
+
+  const result = await tryAcquireGitWorkspaceLock({
+    cwd: repo,
+    key,
+    now,
+    staleMs: 1_000,
+    heartbeatMs: 60_000,
+    processProbe: () => "dead",
+  });
+  assert.equal(result.acquired, true);
+  const newOid = await git(repo, ["rev-parse", ref]);
+  assert.notEqual(newOid, oldOid, "stale-owner takeover must CAS the ref to a new owner blob");
+  await result.lease.release();
+  await assert.rejects(execFileAsync("git", ["rev-parse", "--verify", ref], { cwd: repo }), /Command failed/u);
+});
+
+test("a stale lock with a live owner is never stolen", async (context) => {
+  const repo = await makeRepo(context);
+  const key = "git-worktree:" + repo;
+  const ref = workspaceLockRef(key);
+  const now = Date.now();
+  const oldOid = await installOwner(repo, ref, {
+    version: 1,
+    token: "live-owner",
+    hostIdentity: localHostIdentity(),
+    ownerPid: 23456,
+    workerState: "idle",
+    workerPid: null,
+    acquiredAt: now - 60_000,
+    heartbeatAt: now - 60_000,
+  });
+
+  const result = await tryAcquireGitWorkspaceLock({
+    cwd: repo,
+    key,
+    now,
+    staleMs: 1_000,
+    processProbe: () => "alive",
+  });
+  assert.deepEqual(result, { acquired: false, reason: "held" });
+  assert.equal(await git(repo, ["rev-parse", ref]), oldOid);
+});
+
+test("uncertain worker liveness fails closed during stale-owner recovery", async (context) => {
+  const repo = await makeRepo(context);
+  const key = "git-worktree:" + repo;
+  const ref = workspaceLockRef(key);
+  const now = Date.now();
+  const oldOid = await installOwner(repo, ref, {
+    version: 1,
+    token: "uncertain-worker",
+    hostIdentity: localHostIdentity(),
+    ownerPid: 34567,
+    workerState: "starting",
+    workerPid: null,
+    acquiredAt: now - 60_000,
+    heartbeatAt: now - 60_000,
+  });
+
+  const result = await tryAcquireGitWorkspaceLock({
+    cwd: repo,
+    key,
+    now,
+    staleMs: 1_000,
+    processProbe: () => "dead",
+  });
+  assert.deepEqual(result, { acquired: false, reason: "held" });
+  assert.equal(await git(repo, ["rev-parse", ref]), oldOid);
+});
+
+test("a stale running lock fails closed even when its original process group is gone", async (context) => {
+  const repo = await makeRepo(context);
+  const key = "git-worktree:" + repo;
+  const ref = workspaceLockRef(key);
+  const now = Date.now();
+  const oldOid = await installOwner(repo, ref, {
+    version: 1,
+    token: "escaped-descendant-uncertain",
+    hostIdentity: localHostIdentity(),
+    ownerPid: 45678,
+    workerState: "running",
+    workerPid: 56789,
+    acquiredAt: now - 60_000,
+    heartbeatAt: now - 60_000,
+  });
+
+  const result = await tryAcquireGitWorkspaceLock({
+    cwd: repo,
+    key,
+    now,
+    staleMs: 1_000,
+    processProbe: () => "dead",
+    processGroupProbe: async () => "dead",
+  });
+  assert.deepEqual(result, { acquired: false, reason: "held" });
+  assert.equal(await git(repo, ["rev-parse", ref]), oldOid);
+});
+
+test("an update-ref infrastructure failure is not misclassified as contention", async (context) => {
+  const repo = await makeRepo(context);
+  const key = "git-worktree:" + repo;
+  const ref = workspaceLockRef(key);
+  const gitDirectory = path.resolve(repo, await git(repo, ["rev-parse", "--git-dir"]));
+  const refPath = path.join(gitDirectory, ...ref.split("/"));
+  await mkdir(path.dirname(refPath), { recursive: true });
+  const blocker = refPath + ".lock";
+  await writeFile(blocker, "intentional test lock\n");
+  context.after(() => rm(blocker, { force: true }));
+
+  await assert.rejects(
+    tryAcquireGitWorkspaceLock({ cwd: repo, key }),
+    /cannot update workspace lock ref/iu,
+  );
+});
+
+test("a failed release can be recovered by the next local holder in every completed state", async (context) => {
+  for (const state of ["idle", "starting", "running"]) {
+    const repo = await makeRepo(context);
+    const key = "git-worktree:" + repo;
+    const first = await tryAcquireGitWorkspaceLock({ cwd: repo, key, heartbeatMs: 60_000 });
+    assert.equal(first.acquired, true);
+    if (state !== "idle") await first.lease.markWorkerStarting();
+    if (state === "running") await first.lease.markWorkerRunning(process.pid);
+    const gitDirectory = path.resolve(repo, await git(repo, ["rev-parse", "--git-dir"]));
+    const refPath = path.join(gitDirectory, ...first.lease.ref.split("/"));
+    await mkdir(path.dirname(refPath), { recursive: true });
+    const blocker = refPath + ".lock";
+    await writeFile(blocker, "intentional release failure\n");
+    await assert.rejects(first.lease.release(), /cannot delete workspace lock ref/iu);
+    first.lease.allowLocalRecovery();
+    await rm(blocker, { force: true });
+
+    const second = await tryAcquireGitWorkspaceLock({ cwd: repo, key, heartbeatMs: 60_000 });
+    assert.equal(second.acquired, true, "the next local holder should replace the " + state + " ref");
+    await second.lease.release();
+  }
+});
+
+test("post-CAS cancellation remains recoverable when its compensating delete fails", async (context) => {
+  const repo = await makeRepo(context);
+  const key = "git-worktree:" + repo;
+  const ref = workspaceLockRef(key);
+  const gitDirectory = path.resolve(repo, await git(repo, ["rev-parse", "--git-dir"]));
+  const refPath = path.join(gitDirectory, ...ref.split("/"));
+  await mkdir(path.dirname(refPath), { recursive: true });
+  const blocker = refPath + ".lock";
+  let cancellationChecks = 0;
+  const cancel = {
+    get cancelled() {
+      cancellationChecks += 1;
+      if (cancellationChecks === 7) writeFileSync(blocker, "intentional compensating-delete failure\n");
+      return cancellationChecks >= 7;
+    },
+  };
+
+  await assert.rejects(
+    tryAcquireGitWorkspaceLock({ cwd: repo, key, cancel, heartbeatMs: 60_000 }),
+    /cancelled/iu,
+  );
+  assert.equal(cancellationChecks, 7, "cancellation must be observed only after the CAS commits");
+  await rm(blocker, { force: true });
+  const recovered = await tryAcquireGitWorkspaceLock({ cwd: repo, key, heartbeatMs: 60_000 });
+  assert.equal(recovered.acquired, true);
+  await recovered.lease.release();
+});
+
+test("long lock waits unsubscribe cancellation listeners after every retry", async (context) => {
+  const repo = await makeRepo(context);
+  const key = "git-worktree:" + repo;
+  const holder = await tryAcquireGitWorkspaceLock({
+    cwd: repo,
+    key,
+    ownerPid: 111_111,
+    heartbeatMs: 60_000,
+  });
+  assert.equal(holder.acquired, true);
+  const listeners = new Set();
+  let resolveCancelled;
+  let maximumListeners = 0;
+  const cancel = {
+    cancelled: false,
+    promise: new Promise((resolve) => { resolveCancelled = resolve; }),
+    subscribe(listener) {
+      listeners.add(listener);
+      maximumListeners = Math.max(maximumListeners, listeners.size);
+      return () => { listeners.delete(listener); };
+    },
+    cancel() {
+      this.cancelled = true;
+      resolveCancelled();
+      for (const listener of [...listeners]) listener();
+    },
+  };
+
+  const waiting = acquireGitWorkspaceLock({
+    cwd: repo,
+    key,
+    ownerPid: 222_222,
+    cancel,
+    pollMs: 5,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  cancel.cancel();
+  await assert.rejects(waiting, /cancelled/iu);
+  assert.equal(listeners.size, 0);
+  assert.ok(maximumListeners <= 1, "listeners accumulated across retries: " + String(maximumListeners));
+  await holder.lease.release();
+});

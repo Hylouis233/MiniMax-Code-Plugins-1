@@ -95,6 +95,9 @@ test("tools/list exposes the three bridge tools", async () => {
     assert.deepEqual(names, ["delegate_task", "list_backends", "workspace_status"]);
     const delegate = list.result.tools.find((t) => t.name === "delegate_task");
     assert.equal(delegate.annotations.destructiveHint, true);
+    const status = list.result.tools.find((t) => t.name === "workspace_status");
+    assert.equal(status.annotations.readOnlyHint, false);
+    assert.equal(status.annotations.idempotentHint, false);
   });
 });
 
@@ -156,6 +159,11 @@ test("delegate_task returns before and after snapshots and committed deltas", as
     assert.equal(out.exitCode, 0);
     assert.ok(out.gitBefore && out.git, "before and after snapshots must both be present");
     assert.ok(out.git.changedFiles.includes("marker.txt"));
+    assert.equal(out.commits, null, "internal lease heartbeats must not appear as committed changes");
+    assert.ok(Object.keys(out.gitBefore.refs).every((ref) =>
+      !ref.startsWith("refs/cli-agent-bridge/workspace-locks/")));
+    assert.ok(Object.keys(out.git.refs).every((ref) =>
+      !ref.startsWith("refs/cli-agent-bridge/workspace-locks/")));
   });
 });
 

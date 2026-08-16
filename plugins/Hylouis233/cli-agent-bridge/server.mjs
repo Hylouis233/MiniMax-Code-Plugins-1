@@ -14,6 +14,12 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 
 import { isProcessTreeAlive, refreshProcessTree, signalProcessTree, waitForChildExit, waitForProcessTreeExit } from "./process-tree.mjs";
+import {
+  acquireGitWorkspaceLock,
+  WORKSPACE_LOCK_REF_PREFIX,
+  WorkspaceLockCancelledError,
+  WorkspaceLockDeadlineError,
+} from "./workspace-lock.mjs";
 
 const SERVER_NAME = "cli-agent-bridge";
 const SERVER_VERSION = "0.1.0";
@@ -23,11 +29,14 @@ const MIN_TIMEOUT_MS = 5_000;
 const MAX_TIMEOUT_MS = 3_600_000;
 const VERSION_CHECK_TIMEOUT_MS = 15_000;
 const GIT_TIMEOUT_MS = 30_000;
-const KILL_GRACE_MS = 10_000;
+const TEST_KILL_GRACE_MS = process.env.NODE_ENV === "test"
+  ? Number(process.env.CLI_AGENT_BRIDGE_TEST_KILL_GRACE_MS)
+  : NaN;
+const KILL_GRACE_MS = Number.isInteger(TEST_KILL_GRACE_MS) && TEST_KILL_GRACE_MS >= 50
+  ? Math.min(10_000, TEST_KILL_GRACE_MS)
+  : 10_000;
 const MAX_CAPTURE_CHARS = 5_000_000;
 const RAW_TAIL_CHARS = 60_000;
-const WORKSPACE_LOCK_RETRY_MS = 50;
-
 function currentUserLockScope() {
   let identity;
   try {
@@ -101,7 +110,7 @@ const TOOLS = [
     name: "workspace_status",
     title: "Workspace Git Status",
     description:
-      "Return git status, diff stat, and changed files for a workspace before delegating work. Read-only.",
+      "Return git status, diff stat, and changed files for a workspace before delegating work. Does not change the worktree, but acquires and releases hidden Git-ref lock metadata while snapshotting.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -114,7 +123,7 @@ const TOOLS = [
       },
       required: ["workspacePath"],
     },
-    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   },
   {
     name: "delegate_task",
@@ -155,7 +164,7 @@ const TOOLS = [
           minimum: MIN_TIMEOUT_MS,
           maximum: MAX_TIMEOUT_MS,
           default: DEFAULT_TIMEOUT_MS,
-          description: "Overall deadline in milliseconds after the workspace lock is acquired. Covers preflight Git checks, the worker, and post-run snapshots. Defaults to 1200000 (20 minutes). Confirming safe process-tree termination may extend beyond the deadline by the kill grace period.",
+          description: "Overall deadline in milliseconds, including workspace lock acquisition, preflight Git checks, the worker, and post-run snapshots. Defaults to 1200000 (20 minutes). Confirming safe process-tree termination may extend beyond the deadline by the kill grace period.",
         },
       },
       required: ["backend", "task", "workspacePath"],
@@ -409,18 +418,18 @@ async function validateWorkspace(workspacePath) {
   return resolved;
 }
 
-async function requireGitRepo(workspacePath, cancel = null) {
+async function requireGitRepo(workspacePath, options = {}) {
   const result = await runGitCommand(["rev-parse", "--is-inside-work-tree"], {
-    cwd: workspacePath, cancel,
+    cwd: workspacePath, timeoutMs: 15_000, ...options,
   });
   if (result.exitCode !== 0 || result.stdout.trim() !== "true") {
     throw new Error("workspacePath is not a git repository: " + workspacePath);
   }
 }
 
-async function gitWorktreeRoot(workspacePath, cancel = null) {
+async function gitWorktreeRoot(workspacePath, options = {}) {
   const result = await runGitCommand(["rev-parse", "--show-toplevel"], {
-    cwd: workspacePath, cancel,
+    cwd: workspacePath, ...options,
   });
   const failure = snapshotFailure("git rev-parse --show-toplevel", result);
   if (failure || !result.stdout.trim()) {
@@ -450,7 +459,13 @@ function snapshotFailure(label, result) {
 class OperationCancelledError extends Error {}
 class DeadlineExceededError extends Error {}
 
-async function runGitCommand(args, { cwd, cancel = null, deadline = null, stdinText } = {}) {
+async function runGitCommand(args, {
+  cwd,
+  cancel = null,
+  deadline = null,
+  stdinText,
+  timeoutMs = GIT_TIMEOUT_MS,
+} = {}) {
   if (cancel?.cancelled) throw new OperationCancelledError("operation cancelled by client");
   const remaining = deadline === null ? GIT_TIMEOUT_MS : deadline - Date.now();
   if (remaining <= 0) throw new DeadlineExceededError("delegation deadline exceeded");
@@ -458,7 +473,7 @@ async function runGitCommand(args, { cwd, cancel = null, deadline = null, stdinT
   const result = await runCommand("git", args, {
     cwd,
     stdinText,
-    timeoutMs: Math.max(1, Math.min(GIT_TIMEOUT_MS, remaining)),
+    timeoutMs: Math.max(1, Math.min(timeoutMs, remaining)),
     killGraceMs: 1_000,
     shouldCancel: () => Boolean(cancel?.cancelled),
     onChild: (current) => {
@@ -521,7 +536,10 @@ async function gitSnapshot(worktreeRoot, options = {}) {
   for (const line of String(out.refs ?? "").split(/\r?\n/u)) {
     if (!line) continue;
     const separator = line.indexOf("\t");
-    if (separator > 0) refs[line.slice(0, separator)] = line.slice(separator + 1);
+    if (separator <= 0) continue;
+    const ref = line.slice(0, separator);
+    if (ref.startsWith(WORKSPACE_LOCK_REF_PREFIX)) continue;
+    refs[ref] = line.slice(separator + 1);
   }
   return {
     statusShort: String(out.status ?? "").trim(),
@@ -618,11 +636,6 @@ async function listBackends() {
   return entries;
 }
 
-function workspaceFileLockPath(key) {
-  const digest = createHash("sha256").update(key).digest("hex");
-  return path.join(WORKSPACE_LOCK_ROOT, digest + ".lock");
-}
-
 function workspaceQuarantinePath(key) {
   const digest = createHash("sha256").update(key).digest("hex");
   return path.join(WORKSPACE_LOCK_ROOT, digest + ".quarantine");
@@ -659,27 +672,6 @@ async function markWorkspaceQuarantined(key, details) {
     try { await unlink(temporaryPath); } catch (error) { if (error.code !== "ENOENT") throw error; }
   }
   return quarantinePath;
-}
-
-async function processIsAlive(pid) {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  if (process.platform === "linux") {
-    try {
-      const raw = await readFile("/proc/" + String(pid) + "/stat", "utf8");
-      const close = raw.lastIndexOf(")");
-      const state = close < 0 ? "" : raw.slice(close + 1).trim().split(/\s+/u)[0];
-      if (state === "Z" || state === "X" || state === "x") return false;
-    } catch (error) {
-      if (error.code === "ENOENT") return false;
-      // Fall through to kill(0) when procfs is unavailable or restricted.
-    }
-  }
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error.code === "EPERM";
-  }
 }
 
 let linuxBootIdPromise = null;
@@ -730,126 +722,36 @@ async function cachedProcessStartIdentity(pid) {
   return value;
 }
 
-async function lockOwnerMatchesLiveProcess(owner) {
-  const ownerPid = Number(owner.pid);
-  const currentIdentity = await cachedProcessStartIdentity(ownerPid);
-  if (currentIdentity) {
-    // Old lock records without an identity fail safe while their PID is live.
-    return !owner.processIdentity || owner.processIdentity === currentIdentity;
-  }
-  return await processIsAlive(ownerPid);
-}
-
-async function reclaimDeadWorkspaceFileLock(lockPath) {
-  let observed;
-  try {
-    observed = await readFile(lockPath, "utf8");
-  } catch (error) {
-    if (error.code === "ENOENT") return true;
-    throw error;
-  }
-  let owner;
-  try {
-    owner = JSON.parse(observed);
-  } catch {
-    // Lock records are linked into place only after a complete metadata file
-    // has been written, so malformed content is not safe to reclaim blindly.
-    return false;
-  }
-  if (await lockOwnerMatchesLiveProcess(owner)) return false;
-  const claimPath = lockPath + ".reclaim";
-  try {
-    // Creating this hard link is an atomic single-reclaimer claim on the exact
-    // lock inode. Other contenders cannot authorize a concurrent unlink.
-    await link(lockPath, claimPath);
-  } catch (error) {
-    if (error.code === "ENOENT") return true;
-    if (error.code === "EEXIST") return false;
-    throw error;
-  }
-  try {
-    const [claimed, current, claimStat, lockStat] = await Promise.all([
-      readFile(claimPath, "utf8"),
-      readFile(lockPath, "utf8"),
-      stat(claimPath),
-      stat(lockPath),
-    ]);
-    if (claimed !== observed || current !== observed ||
-        claimStat.dev !== lockStat.dev || claimStat.ino !== lockStat.ino) return false;
-    const latestOwner = JSON.parse(current);
-    if (await lockOwnerMatchesLiveProcess(latestOwner)) return false;
-    await unlink(lockPath);
-    return true;
-  } catch (error) {
-    if (error.code === "ENOENT") return true;
-    throw error;
-  } finally {
-    try { await unlink(claimPath); } catch (error) { if (error.code !== "ENOENT") throw error; }
-  }
-}
-
-async function waitForWorkspaceLockRetry(cancel) {
-  const retry = new Promise((resolve) => setTimeout(() => resolve(true), WORKSPACE_LOCK_RETRY_MS));
-  return cancel
-    ? await Promise.race([retry, cancel.promise.then(() => false)])
-    : await retry;
-}
-
-async function acquireWorkspaceFileLock(key, cancel = null) {
-  await mkdir(WORKSPACE_LOCK_ROOT, { recursive: true, mode: 0o700 });
-  const lockPath = workspaceFileLockPath(key);
-  const token = process.pid + "-" + randomUUID();
-  const ownerPath = lockPath + ".owner-" + token;
-  const processIdentity = await cachedProcessStartIdentity(process.pid);
-  const ownerText = JSON.stringify({
-    pid: process.pid, processIdentity, token, createdAt: Date.now(),
-  });
-  await writeFile(ownerPath, ownerText, { flag: "wx", mode: 0o600 });
-  try {
-    while (true) {
-      if (cancel?.cancelled) return null;
-      try {
-        // Hard-link creation is an atomic create-if-absent operation on both
-        // NTFS and POSIX filesystems. The linked metadata is already complete.
-        await link(ownerPath, lockPath);
-        let released = false;
-        return {
-          async release() {
-            if (released) return;
-            released = true;
-            try {
-              if (await readFile(lockPath, "utf8") === ownerText) await unlink(lockPath);
-            } catch (error) {
-              if (error.code !== "ENOENT") throw error;
-            }
-          },
-        };
-      } catch (error) {
-        if (error.code !== "EEXIST") throw error;
-      }
-      if (await reclaimDeadWorkspaceFileLock(lockPath)) continue;
-      if (!await waitForWorkspaceLockRetry(cancel)) return null;
-    }
-  } finally {
-    try { await unlink(ownerPath); } catch (error) { if (error.code !== "ENOENT") throw error; }
-  }
-}
-
-// The in-memory queue preserves FIFO order within this server. The atomic
-// filesystem lock extends the same canonical-worktree mutex across independent
-// stdio server processes, so two MCP clients cannot interleave workers.
+// The in-memory queue preserves FIFO order within this server. A Git-ref CAS
+// lease extends the same canonical-worktree mutex across independent stdio
+// server processes without a read-then-unlink stale-owner race.
 const workspaceLocks = new Map();
-async function withWorkspaceLock(key, fn, { cancel = null, onCancelled = null } = {}) {
+const quarantinedWorkspaces = new Set();
+async function withWorkspaceLock(key, worktreeRoot, fn, {
+  cancel = null,
+  deadline = null,
+  onCancelled = null,
+  onDeadline = null,
+  isUnavailable = null,
+  onUnavailable = null,
+} = {}) {
   const prev = workspaceLocks.get(key) ?? Promise.resolve();
   const prevDone = prev.catch(() => {});
   let release;
   const gate = new Promise((r) => { release = r; });
   const next = prevDone.then(() => gate);
   workspaceLocks.set(key, next);
-  const acquired = cancel
-    ? await Promise.race([prevDone.then(() => true), cancel.promise.then(() => false)])
-    : (await prevDone, true);
-  if (!acquired) {
+  let deadlineTimer = null;
+  const waiters = [prevDone.then(() => "acquired")];
+  if (cancel) waiters.push(cancel.promise.then(() => "cancelled"));
+  if (deadline !== null) {
+    waiters.push(new Promise((resolve) => {
+      deadlineTimer = setTimeout(() => resolve("deadline"), Math.max(0, deadline - Date.now()));
+    }));
+  }
+  const localResult = await Promise.race(waiters);
+  clearTimeout(deadlineTimer);
+  if (localResult !== "acquired") {
     release();
     // Keep the already-resolved gate chained behind its predecessor until the
     // predecessor releases. Deleting the map entry now would let a third
@@ -857,35 +759,70 @@ async function withWorkspaceLock(key, fn, { cancel = null, onCancelled = null } 
     void next.finally(() => {
       if (workspaceLocks.get(key) === next) workspaceLocks.delete(key);
     });
-    return typeof onCancelled === "function" ? onCancelled() : undefined;
-  }
-  let fileLock = null;
-  try {
-    fileLock = await acquireWorkspaceFileLock(key, cancel);
-    if (!fileLock || cancel?.cancelled) {
-      if (fileLock) await fileLock.release();
-      fileLock = null;
+    if (localResult === "cancelled") {
       return typeof onCancelled === "function" ? onCancelled() : undefined;
     }
-    return await fn();
+    return typeof onDeadline === "function" ? onDeadline() : undefined;
+  }
+  let lease = null;
+  try {
+    if (typeof isUnavailable === "function" && await isUnavailable()) {
+      return typeof onUnavailable === "function" ? onUnavailable() : undefined;
+    }
+    try {
+      lease = await acquireGitWorkspaceLock({ cwd: worktreeRoot, key, cancel, deadline });
+    } catch (error) {
+      if (error instanceof WorkspaceLockCancelledError) {
+        return typeof onCancelled === "function" ? onCancelled() : undefined;
+      }
+      if (error instanceof WorkspaceLockDeadlineError) {
+        return typeof onDeadline === "function" ? onDeadline() : undefined;
+      }
+      throw error;
+    }
+    return await fn(lease);
   } finally {
-    if (fileLock) await fileLock.release();
-    release();
-    if (workspaceLocks.get(key) === next) workspaceLocks.delete(key);
+    try {
+      if (lease) {
+        try {
+          await lease.release();
+        } catch (error) {
+          // Register the exact leftover OID before releasing the local FIFO
+          // gate. This permits only this server's next local holder to repair
+          // a failed delete, including starting/running owner records.
+          lease.allowLocalRecovery();
+          throw error;
+        }
+      }
+    } finally {
+      release();
+      if (workspaceLocks.get(key) === next) workspaceLocks.delete(key);
+    }
   }
 }
 
 function createCancellation() {
   let resolve;
   const promise = new Promise((done) => { resolve = done; });
+  const listeners = new Set();
   return {
     controller: null,
     cancelled: false,
     promise,
+    subscribe(listener) {
+      if (this.cancelled) {
+        queueMicrotask(listener);
+        return () => {};
+      }
+      listeners.add(listener);
+      return () => { listeners.delete(listener); };
+    },
     cancel() {
       if (this.cancelled) return;
       this.cancelled = true;
       resolve();
+      for (const listener of listeners) listener();
+      listeners.clear();
       if (this.controller) void this.controller.terminate("cancelled");
     },
   };
@@ -912,6 +849,46 @@ function cancelledDelegation({ backend, workspacePath, worktreeRoot, spec, befor
   };
 }
 
+function lockDeadlineDelegation({
+  backend,
+  workspacePath,
+  worktreeRoot,
+  spec,
+  error = "delegation timed out while waiting for the workspace lock; the worker never started",
+}) {
+  return {
+    ok: false,
+    error,
+    backend,
+    workspacePath,
+    worktreeRoot,
+    exitCode: null,
+    timedOut: true,
+    killed: false,
+    cancelled: false,
+    treeTerminated: true,
+    outputTail: "",
+    stderrTail: "",
+    gitBefore: null,
+    git: null,
+    commits: null,
+    experimental: Boolean(spec.experimental),
+  };
+}
+
+function quarantinedDelegation({ backend, workspacePath, worktreeRoot, spec }, sharedQuarantine = null) {
+  return {
+    ok: false,
+    error: "this workspace is quarantined because a previous worker process tree could not be confirmed terminated; inspect leftover processes, then remove the reported quarantine file deliberately",
+    backend, workspacePath, worktreeRoot, exitCode: null, timedOut: false, killed: false, cancelled: false,
+    treeTerminated: false, outputTail: "", stderrTail: "",
+    gitBefore: null, git: null, commits: null,
+    quarantinePath: sharedQuarantine?.quarantinePath ?? "",
+    quarantine: sharedQuarantine?.details ?? null,
+    experimental: Boolean(spec.experimental),
+  };
+}
+
 function cancelledWorkspaceStatus(id, { workspacePath = "", worktreeRoot = "" } = {}) {
   const out = {
     ok: false,
@@ -920,6 +897,24 @@ function cancelledWorkspaceStatus(id, { workspacePath = "", worktreeRoot = "" } 
     workspacePath,
     worktreeRoot,
     git: null,
+  };
+  return jsonRpcResult(id, {
+    content: [{ type: "text", text: textResult("Workspace Status", out) }],
+    structuredContent: out,
+    isError: true,
+  });
+}
+
+function quarantinedWorkspaceStatus(id, { workspacePath = "", worktreeRoot = "" } = {}, sharedQuarantine = null) {
+  const out = {
+    ok: false,
+    error: "workspace status is unavailable because an earlier worker process tree could not be confirmed terminated",
+    cancelled: false,
+    workspacePath,
+    worktreeRoot,
+    git: null,
+    quarantinePath: sharedQuarantine?.quarantinePath ?? "",
+    quarantine: sharedQuarantine?.details ?? null,
   };
   return jsonRpcResult(id, {
     content: [{ type: "text", text: textResult("Workspace Status", out) }],
@@ -941,36 +936,45 @@ async function delegateTask(rawArgs, cancel) {
   if (typeof rawArgs.task !== "string" || !rawArgs.task.trim()) {
     throw new Error("task must be a non-empty string");
   }
-  const workspacePath = await validateWorkspace(rawArgs.workspacePath);
+  const timeoutMs = Number.isInteger(rawArgs.timeoutMs)
+    ? Math.min(MAX_TIMEOUT_MS, Math.max(MIN_TIMEOUT_MS, rawArgs.timeoutMs))
+    : DEFAULT_TIMEOUT_MS;
+  const deadline = Date.now() + timeoutMs;
+  let workspacePath = "";
   let worktreeRoot = "";
   try {
-    await requireGitRepo(workspacePath, cancel);
-    worktreeRoot = await gitWorktreeRoot(workspacePath, cancel);
+    if (cancel?.cancelled) {
+      return cancelledDelegation({ backend, workspacePath, worktreeRoot, spec });
+    }
+    workspacePath = await validateWorkspace(rawArgs.workspacePath);
+    if (Date.now() >= deadline) throw new DeadlineExceededError("delegation deadline exceeded");
+    await requireGitRepo(workspacePath, { cancel, deadline });
+    worktreeRoot = await gitWorktreeRoot(workspacePath, { cancel, deadline });
   } catch (error) {
     if (error instanceof OperationCancelledError) {
       return cancelledDelegation({ backend, workspacePath, worktreeRoot, spec });
     }
+    if (error instanceof DeadlineExceededError) {
+      return lockDeadlineDelegation({
+        backend,
+        workspacePath,
+        worktreeRoot,
+        spec,
+        error: "delegation timed out while identifying the Git worktree; the worker never started",
+      });
+    }
     throw error;
   }
   const lockKey = workspaceLockKey(worktreeRoot);
-  const timeoutMs = Number.isInteger(rawArgs.timeoutMs)
-    ? Math.min(MAX_TIMEOUT_MS, Math.max(MIN_TIMEOUT_MS, rawArgs.timeoutMs))
-    : DEFAULT_TIMEOUT_MS;
-
-  return await withWorkspaceLock(lockKey, async () => {
-    const deadline = Date.now() + timeoutMs;
+  const existingQuarantine = await readWorkspaceQuarantine(lockKey);
+  if (quarantinedWorkspaces.has(lockKey) || existingQuarantine) {
+    return quarantinedDelegation({ backend, workspacePath, worktreeRoot, spec }, existingQuarantine);
+  }
+  let observedQuarantine = null;
+  return await withWorkspaceLock(lockKey, worktreeRoot, async (workspaceLease) => {
     const sharedQuarantine = await readWorkspaceQuarantine(lockKey);
-    if (sharedQuarantine) {
-      return {
-        ok: false,
-        error: "this workspace is quarantined because a previous worker process tree could not be confirmed terminated; inspect leftover processes, then remove the reported quarantine file deliberately",
-        backend, workspacePath, worktreeRoot, exitCode: null, timedOut: false, killed: false, cancelled: false,
-        treeTerminated: false, outputTail: "", stderrTail: "",
-        gitBefore: null, git: null, commits: null,
-        quarantinePath: sharedQuarantine.quarantinePath,
-        quarantine: sharedQuarantine.details,
-        experimental: Boolean(spec.experimental),
-      };
+    if (quarantinedWorkspaces.has(lockKey) || sharedQuarantine) {
+      return quarantinedDelegation({ backend, workspacePath, worktreeRoot, spec }, sharedQuarantine);
     }
     if (cancel && cancel.cancelled) {
       return cancelledDelegation({ backend, workspacePath, worktreeRoot, spec });
@@ -1035,6 +1039,7 @@ async function delegateTask(rawArgs, cancel) {
       return cancelledDelegation({ backend, workspacePath, worktreeRoot, spec, before });
     }
 
+    await workspaceLease.markWorkerStarting();
     const remaining = deadline - Date.now();
     if (remaining <= 0) {
       return {
@@ -1052,6 +1057,25 @@ async function delegateTask(rawArgs, cancel) {
       return cancelledDelegation({ backend, workspacePath, worktreeRoot, spec, before });
     }
     let workerController = null;
+    let workerFinished = false;
+    let ownershipLostError = null;
+    let ownershipTermination = Promise.resolve();
+    let ownershipTerminationStarted = false;
+    let ownershipTerminationError = null;
+    const recordOwnershipLoss = (error) => {
+      ownershipLostError ??= error;
+      if (workerController && !workerFinished && !ownershipTerminationStarted) {
+        ownershipTerminationStarted = true;
+        ownershipTermination = workerController.terminate("workspace-lock-lost").catch((terminationError) => {
+          ownershipTerminationError ??= terminationError;
+        });
+      }
+      return ownershipTermination;
+    };
+    void workspaceLease.lost.then(recordOwnershipLoss).catch((error) => {
+      ownershipLostError ??= error;
+    });
+    let workerLockUpdate = Promise.resolve();
     const result = await runCommand(spec.command, args, {
       cwd: workspacePath,
       timeoutMs: remaining,
@@ -1060,17 +1084,44 @@ async function delegateTask(rawArgs, cancel) {
       onChild: (controller) => {
         workerController = controller;
         if (cancel) cancel.controller = controller;
+        if (ownershipLostError) void recordOwnershipLoss(ownershipLostError);
+        workerLockUpdate = workspaceLease.markWorkerRunning(controller.child.pid).catch(recordOwnershipLoss);
       },
     });
+    // Keep the controller live while runCommand is still inspecting or
+    // terminating escaped descendants after the leader closes. Once the full
+    // command result settles, clear it before any further await so a late lease
+    // notification cannot signal a reused PID/process-group identifier.
+    workerFinished = true;
     if (cancel?.controller === workerController) cancel.controller = null;
+    workerController = null;
+    await workerLockUpdate;
     let quarantinePath = "";
     if (!result.treeTerminated) {
+      quarantinedWorkspaces.add(lockKey);
+      workspaceLease.retain();
       quarantinePath = await markWorkspaceQuarantined(lockKey, {
         backend,
         workspacePath,
         worktreeRoot,
         terminationError: result.terminationError,
       });
+      // The shared marker is now authoritative and removable by an operator;
+      // retain the local fallback only when writing that marker failed.
+      quarantinedWorkspaces.delete(lockKey);
+    } else if (!ownershipLostError) {
+      try {
+        await workspaceLease.markWorkerIdle();
+      } catch (error) {
+        await recordOwnershipLoss(error);
+      }
+    }
+    if (ownershipLostError) {
+      await ownershipTermination;
+      if (ownershipTerminationError && ownershipLostError.cause === undefined) {
+        ownershipLostError.cause = ownershipTerminationError;
+      }
+      throw ownershipLostError;
     }
     let after = null;
     let commits = null;
@@ -1130,7 +1181,16 @@ async function delegateTask(rawArgs, cancel) {
     };
   }, {
     cancel,
+    deadline,
     onCancelled: () => cancelledDelegation({ backend, workspacePath, worktreeRoot, spec }),
+    onDeadline: () => lockDeadlineDelegation({ backend, workspacePath, worktreeRoot, spec }),
+    isUnavailable: async () => {
+      observedQuarantine = await readWorkspaceQuarantine(lockKey);
+      return quarantinedWorkspaces.has(lockKey) || Boolean(observedQuarantine);
+    },
+    onUnavailable: () => quarantinedDelegation(
+      { backend, workspacePath, worktreeRoot, spec }, observedQuarantine,
+    ),
   });
 }
 
@@ -1272,8 +1332,9 @@ async function handleMessage(message) {
             workspacePath = await validateWorkspace(args.workspacePath);
             if (cancel.cancelled) return cancelledWorkspaceStatus(message.id, { workspacePath });
             try {
-              await requireGitRepo(workspacePath, cancel);
-              worktreeRoot = await gitWorktreeRoot(workspacePath, cancel);
+              await requireGitRepo(workspacePath, { cancel });
+              if (cancel.cancelled) return cancelledWorkspaceStatus(message.id, { workspacePath });
+              worktreeRoot = await gitWorktreeRoot(workspacePath, { cancel });
             } catch (error) {
               if (error instanceof OperationCancelledError) {
                 return cancelledWorkspaceStatus(message.id, { workspacePath, worktreeRoot });
@@ -1282,7 +1343,20 @@ async function handleMessage(message) {
             }
             if (cancel.cancelled) return cancelledWorkspaceStatus(message.id, { workspacePath, worktreeRoot });
             const lockKey = workspaceLockKey(worktreeRoot);
-            return await withWorkspaceLock(lockKey, async () => {
+            const existingQuarantine = await readWorkspaceQuarantine(lockKey);
+            if (quarantinedWorkspaces.has(lockKey) || existingQuarantine) {
+              return quarantinedWorkspaceStatus(
+                message.id, { workspacePath, worktreeRoot }, existingQuarantine,
+              );
+            }
+            let observedQuarantine = null;
+            return await withWorkspaceLock(lockKey, worktreeRoot, async () => {
+              const sharedQuarantine = await readWorkspaceQuarantine(lockKey);
+              if (quarantinedWorkspaces.has(lockKey) || sharedQuarantine) {
+                return quarantinedWorkspaceStatus(
+                  message.id, { workspacePath, worktreeRoot }, sharedQuarantine,
+                );
+              }
               try {
                 const git = await gitSnapshot(worktreeRoot, { cancel });
                 if (cancel.cancelled) {
@@ -1301,6 +1375,13 @@ async function handleMessage(message) {
             }, {
               cancel,
               onCancelled: () => cancelledWorkspaceStatus(message.id, { workspacePath, worktreeRoot }),
+              isUnavailable: async () => {
+                observedQuarantine = await readWorkspaceQuarantine(lockKey);
+                return quarantinedWorkspaces.has(lockKey) || Boolean(observedQuarantine);
+              },
+              onUnavailable: () => quarantinedWorkspaceStatus(
+                message.id, { workspacePath, worktreeRoot }, observedQuarantine,
+              ),
             });
           } finally {
             finishRequest();
