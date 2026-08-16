@@ -151,9 +151,14 @@ you already obtained a valid ID from that backend outside this Plugin.
   process refuses further delegation until an operator checks for leftovers and deliberately
   removes the reported quarantinePath - removing that marker also authorizes the next delegation
   to reclaim the quarantined lease. If the bridge crashes mid-run, a lease recording a running
-  worker still cannot be reclaimed automatically (descendant liveness cannot be proven); after
-  checking for leftover processes, delete the lock ref recorded in the quarantine marker with
-  `git --git-dir=<git-common-dir>/cli-agent-bridge-lock-store.git update-ref -d <lock-ref>`. The
+  worker still cannot be reclaimed automatically (descendant liveness cannot be proven), and an
+  abrupt crash may leave no quarantine marker. Locate and inspect the retained lease explicitly:
+  first run `git rev-parse --path-format=absolute --git-common-dir`, append
+  `cli-agent-bridge-lock-store.git` to obtain `<lock-store>`, then run
+  `git --git-dir=<lock-store> for-each-ref --format="%(refname) %(objectname)" refs/cli-agent-bridge/workspace-locks/`
+  and `git --git-dir=<lock-store> cat-file blob <object-id>`. The JSON owner record contains the
+  server/worker state and PIDs. Only after checking those processes and escaped descendants are
+  gone, clear the listed ref with `git --git-dir=<lock-store> update-ref -d <lock-ref>`. The
   quarantine marker itself lives in a current-user-scoped OS temporary directory.
   On Linux, zombie-only tracked trees count as terminated; zombies cannot edit the workspace and
   may otherwise persist when container PID 1 does not reap them.

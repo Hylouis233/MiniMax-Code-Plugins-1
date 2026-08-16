@@ -528,7 +528,7 @@ async function gitWorktreeRoot(workspacePath, options = {}) {
     throw new Error("cannot identify Git worktree root: " + (failure || "empty output"));
   }
   try {
-    return await realpath(output);
+    return await interruptibleFilesystemOperation(realpath(output), options);
   } catch (error) {
     throw new Error("cannot canonicalize Git worktree root: " + error.message);
   }
@@ -544,7 +544,9 @@ async function gitCommonDirectory(workspacePath, options = {}) {
     throw new Error("cannot identify Git common directory: " + (failure || "empty output"));
   }
   try {
-    return await realpath(path.resolve(workspacePath, output));
+    return await interruptibleFilesystemOperation(
+      realpath(path.resolve(workspacePath, output)), options,
+    );
   } catch (error) {
     throw new Error("cannot canonicalize Git common directory: " + error.message);
   }
@@ -637,6 +639,7 @@ async function gitSnapshot(worktreeRoot, options = {}) {
     ["git diff --cached --name-only -z", "cachedDiffNames", ["diff", "--cached", "--ignore-submodules=none", "--name-only", "-z"], false, true],
     ["git ls-files --others --exclude-standard -z", "untracked", ["ls-files", "--others", "--exclude-standard", "-z"], false, true],
     ["git rev-parse --verify --quiet HEAD", "head", ["rev-parse", "--verify", "--quiet", "HEAD"], true],
+    ["git symbolic-ref --quiet HEAD", "headRef", ["symbolic-ref", "--quiet", "HEAD"], true],
     ["git for-each-ref", "refs", ["for-each-ref", "--format=%(refname)%09%(objectname)", "refs"]],
   ];
   // Run serially: status/diff may both refresh the index, so concurrent Git
@@ -744,6 +747,7 @@ async function gitSnapshot(worktreeRoot, options = {}) {
     diffStat,
     changedFiles,
     head: String(out.head ?? "").trim(),
+    headRef: String(out.headRef ?? "").replace(/\r?\n$/u, ""),
     refs,
     concurrentDelegations,
   };
@@ -836,7 +840,7 @@ async function committedDelta(worktreeRoot, before, after, options = {}) {
     const afterOid = after.refs?.[ref] ?? "";
     return beforeOid === afterOid ? [] : [{ ref, before: beforeOid, after: afterOid }];
   });
-  if (before.head === after.head && refsChanged.length === 0) return null;
+  if (before.head === after.head && before.headRef === after.headRef && refsChanged.length === 0) return null;
 
   let emptyTreeId = "";
   async function emptyTree() {
@@ -921,6 +925,12 @@ async function committedDelta(worktreeRoot, before, after, options = {}) {
   const movementLogs = externalRefChanges.map((change) =>
     change.ref + " moved to externally sourced history; excluded from worker-created commits",
   );
+  if ((before.headRef ?? "") !== (after.headRef ?? "")) {
+    movementLogs.push(
+      "HEAD symbolic target " + (before.headRef || "(detached)") +
+      " -> " + (after.headRef || "(detached)"),
+    );
+  }
   const statNotes = [];
   const statRanges = new Map();
   const attributedCommits = new Map();
@@ -1474,7 +1484,18 @@ async function delegateTask(rawArgs, cancel) {
     }
 
     let template;
-    if (typeof rawArgs.resumeSessionId === "string" && rawArgs.resumeSessionId.trim() && Array.isArray(spec.resumeArgs)) {
+    const resumeRequested = typeof rawArgs.resumeSessionId === "string" && rawArgs.resumeSessionId.trim();
+    if (resumeRequested && !Array.isArray(spec.resumeArgs)) {
+      return {
+        ok: false,
+        error: "backend \"" + backend + "\" does not support resuming sessions",
+        backend, workspacePath, worktreeRoot, exitCode: null, timedOut: false, killed: false, cancelled: false,
+        treeTerminated: true, outputTail: "", stderrTail: "",
+        gitBefore: before, git: before, commits: null,
+        experimental: Boolean(spec.experimental),
+      };
+    }
+    if (resumeRequested) {
       template = spec.resumeArgs;
     } else if (Array.isArray(spec.buildArgs)) {
       template = spec.buildArgs;
@@ -1658,8 +1679,10 @@ async function delegateTask(rawArgs, cancel) {
       error = "backend process tree could not be confirmed terminated; the shared workspace quarantine remains until an operator checks for leftovers and removes quarantinePath";
     } else if (cancel && cancel.cancelled) {
       error = "delegation cancelled by client; post-run snapshot may be unavailable";
-    } else if (result.timedOut || postRunDeadlineExceeded) {
+    } else if (result.timedOut) {
       error = "backend \"" + backend + "\" timed out after " + timeoutMs + " ms" + (result.killed ? " and was force-killed" : "");
+    } else if (postRunDeadlineExceeded) {
+      error = "backend exited, but the post-run Git snapshot or commit attribution exceeded the overall deadline";
     } else if (result.orphanedProcesses) {
       error = "backend exited while descendant processes were still running; the bridge terminated the remaining process tree";
     } else if (result.errorMessage) {
@@ -1675,7 +1698,8 @@ async function delegateTask(rawArgs, cancel) {
       workspacePath,
       worktreeRoot,
       exitCode: result.exitCode,
-      timedOut: result.timedOut || postRunDeadlineExceeded,
+      timedOut: result.timedOut,
+      postRunDeadlineExceeded,
       killed: result.killed,
       cancelled: Boolean(cancel && cancel.cancelled),
       orphanedProcesses: result.orphanedProcesses,
@@ -1720,6 +1744,7 @@ function textResult(header, obj) {
     lines.push("", "## " + label + " git diff stat", "", "~~~text", git.diffStat || "(empty)", "~~~");
     lines.push("", "## " + label + " changed files", "", "~~~text", (git.changedFiles ?? []).join("\n") || "(none)", "~~~");
     lines.push("", "## " + label + " HEAD", "", "~~~text", git.head || "(unborn)", "~~~");
+    lines.push("", "## " + label + " symbolic HEAD", "", "~~~text", git.headRef || "(detached/unborn)", "~~~");
   };  gitBlock("before", obj.gitBefore);
   gitBlock("after", obj.git);
   if (obj.commits) {

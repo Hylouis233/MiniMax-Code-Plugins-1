@@ -194,6 +194,17 @@ test("Codex templates delimit option-looking task text", async () => {
   assert.match(source, /resumeArgs: \["exec", "resume", "<session>", "--", "<task>"\]/u);
 });
 
+test("delegate_task rejects resume for a backend without resume support", async (context) => {
+  const { workspace, client } = await makeHarness(context);
+  const response = await client.request("tools/call", taskArguments(workspace, {
+    name: "must-not-start", writeFile: "unsupported-resume.txt",
+  }, { resumeSessionId: "session-123" }));
+  const out = response.result.structuredContent;
+  assert.equal(out.ok, false);
+  assert.match(out.error, /does not support resuming/iu);
+  await assert.rejects(access(path.join(workspace, "unsupported-resume.txt")), /ENOENT/u);
+});
+
 test("dirty checks include untracked files even when Git config hides them", async (context) => {
   const { workspace, client } = await makeHarness(context);
   await execFileAsync("git", ["config", "status.showUntrackedFiles", "no"], { cwd: workspace });
@@ -961,6 +972,21 @@ test("checking out a pre-existing divergent branch is not reported as worker com
   assert.match(out.commits.log, /branch checkout or reset/u);
   assert.doesNotMatch(out.commits.log, /pre-existing divergent commit/u,
     "history that predates the delegation must not be attributed to the worker");
+});
+
+test("switching symbolic HEAD at the same commit is reported", async (context) => {
+  const { workspace, client } = await makeHarness(context);
+  await execFileAsync("git", ["branch", "same-tip"], { cwd: workspace });
+  const response = await client.request("tools/call", taskArguments(workspace, {
+    name: "same-tip-checkout", checkoutExisting: true, branchName: "same-tip",
+  }));
+  const out = response.result.structuredContent;
+  assert.equal(out.ok, true, JSON.stringify(out.error));
+  assert.equal(out.gitBefore.head, out.git.head);
+  assert.equal(out.gitBefore.headRef, "refs/heads/main");
+  assert.equal(out.git.headRef, "refs/heads/same-tip");
+  assert.ok(out.commits);
+  assert.match(out.commits.log, /HEAD symbolic target refs\/heads\/main -> refs\/heads\/same-tip/u);
 });
 
 test("a worker ref pointing at a non-commit object is reported without failing the delegation", async (context) => {
