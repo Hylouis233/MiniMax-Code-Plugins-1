@@ -117,22 +117,25 @@ you already obtained a valid ID from that backend outside this Plugin.
 - Delegations and status snapshots targeting the same Git common directory are serialized even
   when callers name a subdirectory, different path casing, symlink, or linked worktree, and even
   when separate MCP clients launched separate bridge server processes. Use separate clean clones
-  for parallel comparison runs. The cross-process lock is an owner blob referenced by an atomic Git-ref
-  compare-and-swap. A stale idle lock is reclaimed only when its same-host owner is positively
+  for parallel comparison runs. The cross-process lock is an owner blob referenced by an atomic
+  Git-ref compare-and-swap in a private bare repository at
+  `<git-common-dir>/cli-agent-bridge-lock-store.git`. Keeping coordination refs out of the target
+  repository prevents `git push --mirror` from publishing host/process/token metadata. A stale
+  idle lock is reclaimed only when its same-host owner is positively
   confirmed dead; owner records include the bridge process start identity so a reused PID cannot
   pin the queue. The host identity also includes the OS user, so another user cannot interpret a
   user-scoped quarantine marker as cleared. Malformed, foreign-user/host, starting, running, or
   uncertain records fail closed.
   A crashed bridge cannot reconstruct descendants that escaped into another POSIX session from the
-  recorded worker PID alone, so inspect leftover processes and clear those hidden refs manually.
+  recorded worker PID alone, so inspect leftover processes before clearing its coordination ref.
 - Linked worktrees share refs and therefore intentionally share one repository lock. The
   `repositoryConcurrency` field remains as a fail-safe disclosure if an older bridge instance or
   an external writer updates bridge history during a snapshot, but current bridge instances do
   not run linked-worktree delegations concurrently.
-- Locking leaves the worktree and index unchanged, but it requires writable Git object/ref metadata:
-  each acquisition writes an owner blob and temporarily updates a hidden ref. Repository
-  reference-transaction hooks can observe or reject those updates, and released owner blobs remain
-  unreachable until normal Git garbage collection. For that reason workspace_status is not marked
+- Locking leaves the target repository refs, worktree, and index unchanged, but it requires writable
+  metadata in the private bare lock store. Each acquisition writes an owner blob and temporarily
+  updates a coordination ref there; released owner blobs remain unreachable until that store's
+  normal Git garbage collection. For that reason workspace_status is not marked
   read-only in its MCP annotations even though the snapshot itself does not edit worktree files.
 - Cancellation and timeout confirm that the delegated process tree has exited before releasing
   the workspace mutex. A lightweight ancestry monitor records descendants that create a new POSIX
@@ -148,9 +151,9 @@ you already obtained a valid ID from that backend outside this Plugin.
   process refuses further delegation until an operator checks for leftovers and deliberately
   removes the reported quarantinePath - removing that marker also authorizes the next delegation
   to reclaim the quarantined lease. If the bridge crashes mid-run, a lease recording a running
-  worker still cannot be reclaimed automatically (descendant liveness cannot be proven); delete
-  the hidden lock ref recorded in the quarantine marker (or run `git update-ref -d` on the ref
-  under `refs/cli-agent-bridge/workspace-locks/`) after checking for leftover processes. The
+  worker still cannot be reclaimed automatically (descendant liveness cannot be proven); after
+  checking for leftover processes, delete the lock ref recorded in the quarantine marker with
+  `git --git-dir=<git-common-dir>/cli-agent-bridge-lock-store.git update-ref -d <lock-ref>`. The
   quarantine marker itself lives in a current-user-scoped OS temporary directory.
   On Linux, zombie-only tracked trees count as terminated; zombies cannot edit the workspace and
   may otherwise persist when container PID 1 does not reap them.

@@ -32,6 +32,10 @@ async function canonicalGitCommonDirectory(workspace) {
   return await realpath(path.resolve(workspace, stdout.replace(/\r?\n$/u, "")));
 }
 
+async function coordinationLockStore(workspace) {
+  return path.join(await canonicalGitCommonDirectory(workspace), "cli-agent-bridge-lock-store.git");
+}
+
 function repositoryStatePaths(canonicalGitCommonDir) {
   const normalized = path.normalize(canonicalGitCommonDir);
   const key = "git-common-dir:" + normalized;
@@ -414,6 +418,7 @@ test("losing a Git-ref lease never strands the local FIFO gate", async (context)
   const normalized = path.normalize(canonicalRoot);
   const key = "git-common-dir:" + normalized;
   const ref = workspaceLockRef(key);
+  const lockStore = await coordinationLockStore(workspace);
   const eventFile = path.join(tempRoot, "lost-lock-events.jsonl");
   const first = client.request("tools/call", taskArguments(workspace, {
     name: "loses-lock", eventFile, delayMs: 12_000,
@@ -423,8 +428,8 @@ test("losing a Git-ref lease never strands the local FIFO gate", async (context)
   ));
   await waitFor(async () => {
     try {
-      const { stdout: oid } = await execFileAsync("git", ["rev-parse", "--verify", ref], { cwd: workspace });
-      const { stdout: blob } = await execFileAsync("git", ["cat-file", "blob", oid.trim()], { cwd: workspace });
+      const { stdout: oid } = await execFileAsync("git", ["rev-parse", "--verify", ref], { cwd: lockStore });
+      const { stdout: blob } = await execFileAsync("git", ["cat-file", "blob", oid.trim()], { cwd: lockStore });
       return JSON.parse(blob).workerState === "running";
     } catch {
       return false;
@@ -433,12 +438,12 @@ test("losing a Git-ref lease never strands the local FIFO gate", async (context)
 
   const replacementPath = path.join(tempRoot, "replacement-owner.json");
   await writeFile(replacementPath, JSON.stringify({ version: 1, hostIdentity: "foreign:test" }));
-  const { stdout: replacementOidText } = await execFileAsync("git", ["hash-object", "-w", replacementPath], { cwd: workspace });
+  const { stdout: replacementOidText } = await execFileAsync("git", ["hash-object", "-w", replacementPath], { cwd: lockStore });
   const replacementOid = replacementOidText.trim();
   const replacedAt = Date.now();
-  await execFileAsync("git", ["update-ref", ref, replacementOid], { cwd: workspace });
+  await execFileAsync("git", ["update-ref", ref, replacementOid], { cwd: lockStore });
   context.after(async () => {
-    try { await execFileAsync("git", ["update-ref", "-d", ref, replacementOid], { cwd: workspace }); } catch { /* already gone */ }
+    try { await execFileAsync("git", ["update-ref", "-d", ref, replacementOid], { cwd: lockStore }); } catch { /* already gone */ }
   });
 
   const firstResponse = await first;
@@ -447,7 +452,7 @@ test("losing a Git-ref lease never strands the local FIFO gate", async (context)
   assert.equal((await events(eventFile)).some(
     (item) => item.name === "loses-lock" && item.event === "end",
   ), false, "the original 12-second worker should be terminated before normal completion");
-  await execFileAsync("git", ["update-ref", "-d", ref, replacementOid], { cwd: workspace });
+  await execFileAsync("git", ["update-ref", "-d", ref, replacementOid], { cwd: lockStore });
 
   const followUp = await client.request("tools/call", taskArguments(workspace, {
     name: "after-lost-lock", eventFile, delayMs: 10,
@@ -474,6 +479,7 @@ test("unconfirmed termination after lease loss quarantines delegation and status
   let workerPid = null;
   let replacementOid = null;
   let ref = null;
+  let lockStore = null;
   let quarantinePath = null;
   try {
     await client.initialize();
@@ -483,6 +489,7 @@ test("unconfirmed termination after lease loss quarantines delegation and status
     const normalized = path.normalize(canonicalRoot);
     const key = "git-common-dir:" + normalized;
     ref = workspaceLockRef(key);
+    lockStore = await coordinationLockStore(workspace);
     const delegated = client.request("tools/call", taskArguments(workspace, {
       name: "unconfirmed-tree", eventFile, delayMs: 60_000,
     }), 151);
@@ -495,8 +502,8 @@ test("unconfirmed termination after lease loss quarantines delegation and status
     });
     await waitFor(async () => {
       try {
-        const { stdout: oid } = await execFileAsync("git", ["rev-parse", "--verify", ref], { cwd: workspace });
-        const { stdout: blob } = await execFileAsync("git", ["cat-file", "blob", oid.trim()], { cwd: workspace });
+        const { stdout: oid } = await execFileAsync("git", ["rev-parse", "--verify", ref], { cwd: lockStore });
+        const { stdout: blob } = await execFileAsync("git", ["cat-file", "blob", oid.trim()], { cwd: lockStore });
         return JSON.parse(blob).workerState === "running";
       } catch {
         return false;
@@ -504,13 +511,13 @@ test("unconfirmed termination after lease loss quarantines delegation and status
     });
     const replacementPath = path.join(tempRoot, "quarantine-replacement-owner.json");
     await writeFile(replacementPath, JSON.stringify({ version: 1, hostIdentity: "foreign:quarantine" }));
-    const replacement = await execFileAsync("git", ["hash-object", "-w", replacementPath], { cwd: workspace });
+    const replacement = await execFileAsync("git", ["hash-object", "-w", replacementPath], { cwd: lockStore });
     replacementOid = replacement.stdout.trim();
     const queuedStatus = client.request("tools/call", {
       name: "workspace_status",
       arguments: { workspacePath: workspace },
     }, 153);
-    await execFileAsync("git", ["update-ref", ref, replacementOid], { cwd: workspace });
+    await execFileAsync("git", ["update-ref", ref, replacementOid], { cwd: lockStore });
 
     const failed = await delegated;
     assert.match(failed.error?.message ?? "", /workspace lock ownership changed/iu);
@@ -529,15 +536,15 @@ test("unconfirmed termination after lease loss quarantines delegation and status
     await execFileAsync(realTaskkill, ["/PID", String(workerPid), "/T", "/F"]);
     workerPid = null;
     await rm(quarantinePath, { force: true });
-    await execFileAsync("git", ["update-ref", "-d", ref, replacementOid], { cwd: workspace });
+    await execFileAsync("git", ["update-ref", "-d", ref, replacementOid], { cwd: lockStore });
     replacementOid = null;
     const recovered = await client.request("tools/call", taskArguments(workspace, {
       name: "after-manual-quarantine-recovery", eventFile, delayMs: 10,
     }), 154);
     assert.equal(recovered.result.structuredContent.ok, true, JSON.stringify(recovered));
   } finally {
-    if (ref && replacementOid) {
-      try { await execFileAsync("git", ["update-ref", "-d", ref, replacementOid], { cwd: workspace }); } catch { /* already gone */ }
+    if (ref && replacementOid && lockStore) {
+      try { await execFileAsync("git", ["update-ref", "-d", ref, replacementOid], { cwd: lockStore }); } catch { /* already gone */ }
     }
     if (Number.isInteger(workerPid)) {
       try { await execFileAsync(realTaskkill, ["/PID", String(workerPid), "/T", "/F"]); } catch { /* already gone */ }
@@ -631,6 +638,27 @@ test("cancellation interrupts initial Git repository discovery", {
   } finally {
     await delayedClient.close();
   }
+});
+
+test("cancellation interrupts workspace filesystem canonicalization", async (context) => {
+  const { workspace, configPath } = await makeHarness(context);
+  const delayedClient = new McpClient(configPath, {
+    NODE_ENV: "test",
+    CLI_AGENT_BRIDGE_TEST_WORKSPACE_VALIDATION_DELAY_MS: "10000",
+  });
+  context.after(() => delayedClient.close());
+  await delayedClient.initialize();
+  const request = delayedClient.request("tools/call", taskArguments(workspace, {
+    name: "must-not-start", writeFile: "canonicalization-bypass.txt",
+  }), 611);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const cancelledAt = Date.now();
+  delayedClient.notify("notifications/cancelled", { requestId: 611 });
+  const response = await request;
+  assert.ok(Date.now() - cancelledAt < 1_500,
+    "filesystem validation must not pin the request after cancellation");
+  assert.equal(response.result.structuredContent.cancelled, true);
+  await assert.rejects(access(path.join(workspace, "canonicalization-bypass.txt")), /ENOENT/u);
 });
 
 test("cancellation terminates descendants before returning", async (context) => {
@@ -1153,6 +1181,43 @@ test("a fetched tag tip is an external baseline for later worker commits", async
   assert.match(out.commits.diffStat, /worker-after-tag\.txt/u);
 });
 
+test("prefetch refs are external baselines for later worker commits", async (context) => {
+  const { workspace, client } = await makeHarness(context);
+  const response = await client.request("tools/call", taskArguments(workspace, {
+    name: "prefetch-then-work", fetchAndCommit: true, fetchPrefetch: true,
+    branchName: "prefetched-work", writeFile: "worker-after-prefetch.txt",
+    commitMessage: "worker commit after prefetch",
+  }));
+  const out = response.result.structuredContent;
+  assert.equal(out.ok, true, JSON.stringify(out.error));
+  assert.equal(out.commits.newCommitCount, 1, out.commits.log);
+  assert.match(out.commits.log, /worker commit after prefetch/u);
+  assert.doesNotMatch(out.commits.log, /fetched upstream commit/u);
+  assert.match(out.commits.log, /refs\/prefetch\/remotes\/origin\/main moved to externally sourced history/u);
+  assert.doesNotMatch(out.commits.diffStat, /upstream\.txt/u);
+  assert.match(out.commits.diffStat, /worker-after-prefetch\.txt/u);
+});
+
+test("workspace lock metadata is absent from mirrored repository refs", async (context) => {
+  const { tempRoot, workspace, client } = await makeHarness(context);
+  const mirror = path.join(tempRoot, "mirror.git");
+  await execFileAsync("git", ["init", "--bare", mirror], { cwd: tempRoot });
+  const response = await client.request("tools/call", taskArguments(workspace, {
+    name: "mirror", mirrorPush: true, remotePath: mirror,
+  }));
+  assert.equal(response.result.structuredContent.ok, true, response.result.structuredContent.error);
+  const { stdout: mirroredRefs } = await execFileAsync(
+    "git", ["for-each-ref", "--format=%(refname)"], { cwd: mirror },
+  );
+  assert.match(mirroredRefs, /refs\/heads\/main/u);
+  assert.doesNotMatch(mirroredRefs, /cli-agent-bridge|workspace-locks/iu,
+    "coordination metadata must live outside the repository ref namespace");
+  const { stdout: localInternalRefs } = await execFileAsync(
+    "git", ["for-each-ref", "--format=%(refname)", "refs/cli-agent-bridge"], { cwd: workspace },
+  );
+  assert.equal(localInternalRefs, "");
+});
+
 test("list_backends can be cancelled while a version probe hangs", async (context) => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), "cli-agent-bridge-test-"));
   context.after(async () => { await rm(tempRoot, { recursive: true, force: true }); });
@@ -1223,6 +1288,23 @@ test("PowerShell shim runner fails closed for a missing backend", {
   }
   assert.ok(failure, "missing backend must return a non-zero exit code");
   assert.notEqual(failure.code, 0);
+});
+
+test("PowerShell shim runner preserves native backend exit codes", {
+  skip: process.platform !== "win32",
+}, async () => {
+  const runner = path.join(pluginRoot, "ps1-runner.ps1");
+  let failure = null;
+  try {
+    await execFileAsync("powershell.exe", [
+      "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", runner,
+      "cmd.exe", "/d", "/c", "exit", "37",
+    ]);
+  } catch (error) {
+    failure = error;
+  }
+  assert.ok(failure);
+  assert.equal(failure.code, 37);
 });
 
 test("a worktree root ending in whitespace is canonicalized without trimming it", async (context) => {

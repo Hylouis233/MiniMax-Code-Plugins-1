@@ -56,6 +56,8 @@ if (spec.branchRoundTrip) {
   execFileSync("git", ["branch", "-D", "fixture-upstream"]);
   if (spec.fetchTagOnly) {
     execFileSync("git", ["update-ref", "refs/tags/fetched-tag", upstreamOid]);
+  } else if (spec.fetchPrefetch) {
+    execFileSync("git", ["update-ref", "refs/prefetch/remotes/origin/main", upstreamOid]);
   } else {
     execFileSync("git", ["update-ref", "refs/remotes/origin/main", upstreamOid]);
   }
@@ -64,6 +66,10 @@ if (spec.branchRoundTrip) {
   execFileSync("git", ["add", spec.writeFile ?? "worker-after-fetch.txt"]);
   execFileSync("git", ["commit", "-m", spec.commitMessage ?? "worker commit after fetch"]);
   execFileSync("git", ["checkout", original]);
+  event("end");
+} else if (spec.mirrorPush) {
+  event("start");
+  execFileSync("git", ["push", "--mirror", spec.remotePath]);
   event("end");
 } else if (spec.newBranchFromExisting) {
   // Fork a new branch from a pre-existing divergent branch, commit, and return.

@@ -12,12 +12,13 @@ try {
     $resolved = Get-Command -Name $Command -CommandType Application, ExternalScript -ErrorAction Stop
     $global:LASTEXITCODE = $null
     & $resolved.Source @rest
-    if (-not $?) { exit 1 }
-    if ($null -eq $LASTEXITCODE) { exit 0 }
-    exit [int]$LASTEXITCODE
+    $succeeded = $?
+    $nativeExitCode = $LASTEXITCODE
+    if ($null -ne $nativeExitCode) { exit [int]$nativeExitCode }
+    if (-not $succeeded) { exit 1 }
+    exit 0
 }
 catch {
     [Console]::Error.WriteLine($_.Exception.Message)
     exit 127
 }
-

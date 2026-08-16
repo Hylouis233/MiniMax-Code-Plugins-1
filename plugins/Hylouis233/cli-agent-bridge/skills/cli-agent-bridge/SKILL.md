@@ -67,12 +67,13 @@ inside the target git repository, and their results come back as a git diff for 
   backend tail as partial.
 - Cancelling workspace_status while it is queued or snapshotting returns promptly with
   cancelled=true; it does not run a delayed status snapshot after the active delegation finishes.
-- workspace_status does not edit worktree files, but cross-process serialization temporarily writes
-  a hidden Git lock ref and owner blob. Git metadata must be writable, and repository
-  reference-transaction hooks may observe or reject the lock update.
+- workspace_status does not edit target refs or worktree files, but cross-process serialization
+  writes an owner blob and coordination ref in the private bare repository at
+  `<git-common-dir>/cli-agent-bridge-lock-store.git`. That store must be writable and is separate
+  so mirrored pushes cannot publish lock metadata.
 - Only stale idle locks with a positively dead same-host owner are reclaimed automatically. A stale
   starting/running ref fails closed because escaped descendants cannot be reconstructed after a
-  bridge crash; inspect the process tree before deliberately clearing that hidden ref. A lease
+  bridge crash; inspect the process tree before deliberately clearing its lock-store ref. A lease
   moved to the quarantined state is reclaimable once the operator removes the quarantine marker.
 
 ## Notes

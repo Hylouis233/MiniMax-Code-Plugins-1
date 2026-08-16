@@ -444,15 +444,55 @@ function tail(text, count) {
   return text.length > count ? text.slice(-count) : text;
 }
 
-async function validateWorkspace(workspacePath) {
+function interruptibleFilesystemOperation(operation, { cancel = null, deadline = null } = {}) {
+  if (cancel?.cancelled) return Promise.reject(new OperationCancelledError("operation cancelled by client"));
+  if (deadline !== null && Date.now() >= deadline) {
+    return Promise.reject(new DeadlineExceededError("delegation deadline exceeded"));
+  }
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timer = null;
+    let unsubscribe = () => {};
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      unsubscribe();
+      callback(value);
+    };
+    const cancelled = () => finish(reject, new OperationCancelledError("operation cancelled by client"));
+    if (typeof cancel?.subscribe === "function") unsubscribe = cancel.subscribe(cancelled);
+    else if (cancel?.promise) void cancel.promise.then(cancelled);
+    if (deadline !== null) {
+      timer = setTimeout(() => finish(
+        reject, new DeadlineExceededError("delegation deadline exceeded"),
+      ), Math.max(0, deadline - Date.now()));
+    }
+    Promise.resolve(operation).then(
+      (value) => finish(resolve, value),
+      (error) => finish(reject, error),
+    );
+  });
+}
+
+async function validateWorkspace(workspacePath, options = {}) {
   if (typeof workspacePath !== "string" || !workspacePath.trim()) {
     throw new Error("workspacePath must be a non-empty string");
   }
   const resolved = path.resolve(workspacePath);
   let stats;
   try {
-    stats = await stat(resolved);
+    if (process.env.NODE_ENV === "test") {
+      const delayMs = Number(process.env.CLI_AGENT_BRIDGE_TEST_WORKSPACE_VALIDATION_DELAY_MS ?? 0);
+      if (Number.isFinite(delayMs) && delayMs > 0) {
+        await interruptibleFilesystemOperation(
+          new Promise((resolve) => setTimeout(resolve, delayMs)), options,
+        );
+      }
+    }
+    stats = await interruptibleFilesystemOperation(stat(resolved), options);
   } catch (error) {
+    if (error instanceof OperationCancelledError || error instanceof DeadlineExceededError) throw error;
     throw new Error("workspacePath does not exist: " + resolved);
   }
   if (!stats.isDirectory()) throw new Error("workspacePath must be a directory: " + resolved);
@@ -460,8 +500,9 @@ async function validateWorkspace(workspacePath) {
     // Keep the execution directory bound to the directory validated here. A
     // symlink supplied by the caller may be retargeted while the request waits
     // for the repository lease, so it must not be resolved again at launch.
-    return await realpath(resolved);
+    return await interruptibleFilesystemOperation(realpath(resolved), options);
   } catch (error) {
+    if (error instanceof OperationCancelledError || error instanceof DeadlineExceededError) throw error;
     throw new Error("cannot canonicalize workspacePath: " + error.message);
   }
 }
@@ -515,6 +556,26 @@ function repositoryLockKey(gitCommonDir) {
   // Preserve the result: NTFS directories can opt into case sensitivity and
   // may legally contain distinct repositories whose names differ only by case.
   return "git-common-dir:" + normalized;
+}
+
+const WORKSPACE_LOCK_STORE_NAME = "cli-agent-bridge-lock-store.git";
+async function ensureWorkspaceLockStore(gitCommonDir, options = {}) {
+  const storeRoot = path.join(gitCommonDir, WORKSPACE_LOCK_STORE_NAME);
+  let initialized = false;
+  try {
+    const head = await interruptibleFilesystemOperation(stat(path.join(storeRoot, "HEAD")), options);
+    initialized = head.isFile();
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  if (!initialized) {
+    const result = await runGitCommand(["init", "--bare", "--quiet", storeRoot], {
+      cwd: gitCommonDir, ...options,
+    });
+    const failure = snapshotFailure("git init --bare workspace lock store", result);
+    if (failure) throw new Error("cannot initialize workspace lock store: " + failure);
+  }
+  return await interruptibleFilesystemOperation(realpath(storeRoot), options);
 }
 
 function snapshotFailure(label, result) {
@@ -821,7 +882,7 @@ async function committedDelta(worktreeRoot, before, after, options = {}) {
   ].filter(Boolean));
   const externalRefChanges = [];
   for (const change of refsChanged) {
-    if (change.ref.startsWith("refs/remotes/")) {
+    if (change.ref.startsWith("refs/remotes/") || change.ref.startsWith("refs/prefetch/")) {
       externalRefChanges.push(change);
       continue;
     }
@@ -1109,7 +1170,7 @@ async function serverProcessStartIdentity() {
 // server processes without a read-then-unlink stale-owner race.
 const workspaceLocks = new Map();
 const quarantinedWorkspaces = new Set();
-async function withWorkspaceLock(key, worktreeRoot, fn, {
+async function withWorkspaceLock(key, lockStoreRoot, fn, {
   cancel = null,
   deadline = null,
   onCancelled = null,
@@ -1154,7 +1215,7 @@ async function withWorkspaceLock(key, worktreeRoot, fn, {
     }
     try {
       lease = await acquireGitWorkspaceLock({
-        cwd: worktreeRoot,
+        cwd: lockStoreRoot,
         key,
         cancel,
         deadline,
@@ -1334,15 +1395,17 @@ async function delegateTask(rawArgs, cancel) {
   let workspacePath = "";
   let worktreeRoot = "";
   let gitCommonDir = "";
+  let lockStoreRoot = "";
   try {
     if (cancel?.cancelled) {
       return cancelledDelegation({ backend, workspacePath, worktreeRoot, spec });
     }
-    workspacePath = await validateWorkspace(rawArgs.workspacePath);
+    workspacePath = await validateWorkspace(rawArgs.workspacePath, { cancel, deadline });
     if (Date.now() >= deadline) throw new DeadlineExceededError("delegation deadline exceeded");
     await requireGitRepo(workspacePath, { cancel, deadline });
     worktreeRoot = await gitWorktreeRoot(workspacePath, { cancel, deadline });
     gitCommonDir = await gitCommonDirectory(workspacePath, { cancel, deadline });
+    lockStoreRoot = await ensureWorkspaceLockStore(gitCommonDir, { cancel, deadline });
   } catch (error) {
     if (error instanceof OperationCancelledError) {
       return cancelledDelegation({ backend, workspacePath, worktreeRoot, spec });
@@ -1364,7 +1427,7 @@ async function delegateTask(rawArgs, cancel) {
     return quarantinedDelegation({ backend, workspacePath, worktreeRoot, spec }, existingQuarantine);
   }
   let observedQuarantine = null;
-  return await withWorkspaceLock(lockKey, worktreeRoot, async (workspaceLease) => {
+  return await withWorkspaceLock(lockKey, lockStoreRoot, async (workspaceLease) => {
     const sharedQuarantine = await readWorkspaceQuarantine(lockKey);
     if (quarantinedWorkspaces.has(lockKey) || sharedQuarantine) {
       return quarantinedDelegation({ backend, workspacePath, worktreeRoot, spec }, sharedQuarantine);
@@ -1796,14 +1859,16 @@ async function handleMessage(message) {
           let workspacePath = "";
           let worktreeRoot = "";
           let gitCommonDir = "";
+          let lockStoreRoot = "";
           try {
-            workspacePath = await validateWorkspace(args.workspacePath);
+            workspacePath = await validateWorkspace(args.workspacePath, { cancel });
             if (cancel.cancelled) return cancelledWorkspaceStatus(message.id, { workspacePath });
             try {
               await requireGitRepo(workspacePath, { cancel });
               if (cancel.cancelled) return cancelledWorkspaceStatus(message.id, { workspacePath });
               worktreeRoot = await gitWorktreeRoot(workspacePath, { cancel });
               gitCommonDir = await gitCommonDirectory(workspacePath, { cancel });
+              lockStoreRoot = await ensureWorkspaceLockStore(gitCommonDir, { cancel });
             } catch (error) {
               if (error instanceof OperationCancelledError) {
                 return cancelledWorkspaceStatus(message.id, { workspacePath, worktreeRoot });
@@ -1819,7 +1884,7 @@ async function handleMessage(message) {
               );
             }
             let observedQuarantine = null;
-            return await withWorkspaceLock(lockKey, worktreeRoot, async () => {
+            return await withWorkspaceLock(lockKey, lockStoreRoot, async () => {
               const sharedQuarantine = await readWorkspaceQuarantine(lockKey);
               if (quarantinedWorkspaces.has(lockKey) || sharedQuarantine) {
                 return quarantinedWorkspaceStatus(
