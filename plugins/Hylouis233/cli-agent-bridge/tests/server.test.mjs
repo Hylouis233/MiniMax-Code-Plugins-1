@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { access, chmod, copyFile, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { access, chmod, copyFile, mkdir, mkdtemp, readFile, realpath, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
@@ -34,7 +34,7 @@ async function canonicalGitCommonDirectory(workspace) {
 
 function repositoryStatePaths(canonicalGitCommonDir) {
   const normalized = path.normalize(canonicalGitCommonDir);
-  const key = "git-common-dir:" + (process.platform === "win32" ? normalized.toLowerCase() : normalized);
+  const key = "git-common-dir:" + normalized;
   const digest = createHash("sha256").update(key).digest("hex");
   const root = currentUserLockRoot();
   return {
@@ -204,6 +204,43 @@ test("dirty checks include untracked files even when Git config hides them", asy
   await assert.rejects(access(path.join(workspace, "worker-output.txt")), /ENOENT/u);
 });
 
+test("porcelain status preserves the unstaged first-column space", async (context) => {
+  const { workspace, client } = await makeHarness(context);
+  await writeFile(path.join(workspace, "baseline.txt"), "unstaged change\n");
+  const response = await client.request("tools/call", {
+    name: "workspace_status", arguments: { workspacePath: workspace },
+  });
+  assert.match(response.result.structuredContent.git.statusShort, /^ M baseline\.txt$/u);
+});
+
+test("dirty checks override submodule ignore configuration", async (context) => {
+  const { tempRoot, workspace, client } = await makeHarness(context);
+  const source = path.join(tempRoot, "submodule-source");
+  await mkdir(source);
+  await execFileAsync("git", ["init", "-b", "main"], { cwd: source });
+  await execFileAsync("git", ["config", "user.name", "Bridge Test"], { cwd: source });
+  await execFileAsync("git", ["config", "user.email", "bridge-test@example.invalid"], { cwd: source });
+  await writeFile(path.join(source, "tracked.txt"), "baseline\n");
+  await execFileAsync("git", ["add", "tracked.txt"], { cwd: source });
+  await execFileAsync("git", ["commit", "-m", "submodule baseline"], { cwd: source });
+  await execFileAsync("git", ["-c", "protocol.file.allow=always", "submodule", "add", source, "nested-submodule"], {
+    cwd: workspace,
+  });
+  await execFileAsync("git", ["commit", "-am", "add submodule"], { cwd: workspace });
+  await execFileAsync("git", ["config", "submodule.nested-submodule.ignore", "all"], { cwd: workspace });
+  await writeFile(path.join(workspace, "nested-submodule", "tracked.txt"), "pre-existing edit\n");
+
+  const response = await client.request("tools/call", taskArguments(workspace, {
+    name: "must-not-start", writeFile: "submodule-bypass.txt",
+  }));
+  const out = response.result.structuredContent;
+  assert.equal(out.ok, false);
+  assert.match(out.error, /working tree is dirty/iu);
+  assert.match(out.gitBefore.statusShort, /nested-submodule/u);
+  assert.ok(out.gitBefore.changedFiles.includes("nested-submodule"));
+  await assert.rejects(access(path.join(workspace, "submodule-bypass.txt")), /ENOENT/u);
+});
+
 test("canonical Git worktree locking serializes root and symlink paths", async (context) => {
   const { tempRoot, workspace, client } = await makeHarness(context);
   const alias = path.join(tempRoot, "workspace-alias");
@@ -225,6 +262,65 @@ test("canonical Git worktree locking serializes root and symlink paths", async (
     "start:first", "end:first", "start:second", "end:second",
   ]);
   assert.equal(firstResponse.result.structuredContent.worktreeRoot, secondResponse.result.structuredContent.worktreeRoot);
+});
+
+test("a retargeted workspace symlink cannot redirect a queued worker", async (context) => {
+  if (process.platform === "win32") return; // creating/retargeting symlinks is privilege-dependent
+  const { tempRoot, workspace, client } = await makeHarness(context);
+  const other = path.join(tempRoot, "other-workspace");
+  await mkdir(other);
+  await execFileAsync("git", ["init", "-b", "main"], { cwd: other });
+  await execFileAsync("git", ["config", "user.name", "Bridge Test"], { cwd: other });
+  await execFileAsync("git", ["config", "user.email", "bridge-test@example.invalid"], { cwd: other });
+  await writeFile(path.join(other, "baseline.txt"), "other baseline\n");
+  await execFileAsync("git", ["add", "baseline.txt"], { cwd: other });
+  await execFileAsync("git", ["commit", "-m", "other baseline"], { cwd: other });
+  const alias = path.join(tempRoot, "retargetable-workspace");
+  await symlink(workspace, alias, "dir");
+  const eventFile = path.join(tempRoot, "retarget-events.jsonl");
+  const holder = client.request("tools/call", taskArguments(workspace, {
+    name: "holder", eventFile, delayMs: 900, writeFile: "holder.txt",
+  }));
+  await waitFor(async () => (await events(eventFile)).some((item) => item.name === "holder" && item.event === "start"));
+  const queued = client.request("tools/call", taskArguments(alias, {
+    name: "queued", eventFile, writeFile: "queued.txt",
+  }, { allowDirty: true }));
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  await unlink(alias);
+  await symlink(other, alias, "dir");
+
+  assert.equal((await holder).result.structuredContent.ok, true);
+  assert.equal((await queued).result.structuredContent.ok, true);
+  await access(path.join(workspace, "queued.txt"));
+  await assert.rejects(access(path.join(other, "queued.txt")), /ENOENT/u);
+});
+
+test("relative backend commands resolve from their configuration directory", async (context) => {
+  if (process.platform === "win32") return; // executable symlink setup is POSIX-specific
+  const { tempRoot, workspace } = await makeHarness(context);
+  const configDirectory = path.join(tempRoot, "relative-config");
+  await mkdir(configDirectory);
+  const nodeAlias = path.join(configDirectory, "node-wrapper");
+  await symlink(process.execPath, nodeAlias, "file");
+  const configPath = path.join(configDirectory, "backends.json");
+  await writeFile(configPath, JSON.stringify({ backends: { relative: {
+    label: "Relative fixture", command: "./node-wrapper",
+    buildArgs: [fakeBackendPath, "<task>"], resumeArgs: null, experimental: false,
+  } } }));
+  const relativeClient = new McpClient(configPath);
+  context.after(() => relativeClient.close());
+  await relativeClient.initialize();
+  const listed = await relativeClient.request("tools/call", { name: "list_backends", arguments: {} });
+  assert.equal(listed.result.structuredContent.backends[0].available, true);
+  const delegated = await relativeClient.request("tools/call", {
+    name: "delegate_task",
+    arguments: {
+      backend: "relative", task: JSON.stringify({ name: "relative", writeFile: "relative.txt" }),
+      workspacePath: workspace,
+    },
+  });
+  assert.equal(delegated.result.structuredContent.ok, true, delegated.result.structuredContent.error);
+  await access(path.join(workspace, "relative.txt"));
 });
 
 test("canonical worktree locking serializes independent server processes", async (context) => {
@@ -316,7 +412,7 @@ test("losing a Git-ref lease never strands the local FIFO gate", async (context)
   const { tempRoot, workspace, client } = await makeHarness(context);
   const canonicalRoot = await canonicalGitCommonDirectory(workspace);
   const normalized = path.normalize(canonicalRoot);
-  const key = "git-common-dir:" + (process.platform === "win32" ? normalized.toLowerCase() : normalized);
+  const key = "git-common-dir:" + normalized;
   const ref = workspaceLockRef(key);
   const eventFile = path.join(tempRoot, "lost-lock-events.jsonl");
   const first = client.request("tools/call", taskArguments(workspace, {
@@ -385,7 +481,7 @@ test("unconfirmed termination after lease loss quarantines delegation and status
     ({ quarantinePath } = repositoryStatePaths(canonicalRoot));
     context.after(() => rm(quarantinePath, { force: true }));
     const normalized = path.normalize(canonicalRoot);
-    const key = "git-common-dir:" + normalized.toLowerCase();
+    const key = "git-common-dir:" + normalized;
     ref = workspaceLockRef(key);
     const delegated = client.request("tools/call", taskArguments(workspace, {
       name: "unconfirmed-tree", eventFile, delayMs: 60_000,
@@ -695,6 +791,20 @@ test("changedFiles preserves unusual names and scans from the worktree root", as
   assert.equal(status.result.structuredContent.worktreeRoot, await realpath(workspace));
 });
 
+test("changedFiles losslessly represents non-UTF-8 Git path bytes", async (context) => {
+  if (process.platform === "win32") return; // Windows filenames are Unicode, not arbitrary byte strings
+  const { workspace, client } = await makeHarness(context);
+  const rawName = Buffer.from([0x62, 0x61, 0x64, 0x2d, 0x80, 0x2e, 0x74, 0x78, 0x74]);
+  const rawPath = Buffer.concat([Buffer.from(workspace), Buffer.from(path.sep), rawName]);
+  await writeFile(rawPath, "invalid UTF-8 filename\n");
+  const status = await client.request("tools/call", {
+    name: "workspace_status", arguments: { workspacePath: workspace },
+  });
+  assert.ok(status.result.structuredContent.git.changedFiles.includes(
+    "\0git-path-bytes:" + rawName.toString("hex"),
+  ), JSON.stringify(status.result.structuredContent.git.changedFiles));
+});
+
 test("truncated backend capture is disclosed instead of presented as complete", async (context) => {
   const { workspace, client } = await makeHarness(context);
   const response = await client.request("tools/call", taskArguments(workspace, {
@@ -854,6 +964,30 @@ test("a ref moved from a blob to a new commit uses a commit-safe diff base", asy
   assert.match(out.commits.log, /commit behind moved ref/u);
   assert.match(out.commits.diffStat, /ref-commit\.txt/u);
   assert.doesNotMatch(out.commits.diffStat, new RegExp(blobOid.trim(), "u"));
+});
+
+test("a force-moved ref diffs from an ancestral pre-run baseline", async (context) => {
+  const { workspace, client } = await makeHarness(context);
+  await execFileAsync("git", ["branch", "force-target"], { cwd: workspace });
+  await execFileAsync("git", ["checkout", "-b", "source-lineage"], { cwd: workspace });
+  await writeFile(path.join(workspace, "source-only.txt"), "pre-existing source history\n");
+  await execFileAsync("git", ["add", "source-only.txt"], { cwd: workspace });
+  await execFileAsync("git", ["commit", "-m", "pre-existing source commit"], { cwd: workspace });
+  await execFileAsync("git", ["checkout", "main"], { cwd: workspace });
+
+  const response = await client.request("tools/call", taskArguments(workspace, {
+    name: "force-ref", forceRefFromExisting: true, fromBranch: "source-lineage",
+    refName: "refs/heads/force-target", writeFile: "forced-worker.txt",
+    commitMessage: "worker commit after force move",
+  }));
+  const out = response.result.structuredContent;
+  assert.equal(out.ok, true, JSON.stringify(out.error));
+  assert.equal(out.commits.newCommitCount, 1, out.commits.log);
+  assert.match(out.commits.log, /worker commit after force move/u);
+  assert.doesNotMatch(out.commits.log, /pre-existing source commit/u);
+  assert.match(out.commits.diffStat, /forced-worker\.txt/u);
+  assert.doesNotMatch(out.commits.diffStat, /source-only\.txt/u,
+    "the old non-ancestral ref tip must not be used as the diff base");
 });
 
 test("linked worktrees sharing Git refs serialize across server processes", async (context) => {

@@ -373,14 +373,19 @@ export async function refreshProcessTree(child, treeState, options = {}) {
   // Remember the leader's own start identity so a later signal or liveness
   // check can detect that the PID exited and was reused by another process.
   const leader = byPid.get(child.pid);
-  if (leader?.startIdentity && !treeState.knownStarts.has(child.pid)) {
+  const expectedLeaderStart = treeState.knownStarts.get(child.pid);
+  const leaderIsOriginal = Boolean(leader) &&
+    (!expectedLeaderStart || !leader.startIdentity || leader.startIdentity === expectedLeaderStart);
+  if (leaderIsOriginal && leader.startIdentity && !expectedLeaderStart) {
     treeState.knownStarts.set(child.pid, leader.startIdentity);
   }
   const matchesKnownIdentity = (item) => {
     const expected = treeState.knownStarts.get(item.pid);
     return !expected || !item.startIdentity || expected === item.startIdentity;
   };
-  const parents = new Set([child.pid]);
+  // A recycled leader PID must not seed ancestry or process-group discovery:
+  // doing so would adopt and later signal the replacement process's children.
+  const parents = new Set(leaderIsOriginal ? [child.pid] : []);
   for (const pid of treeState.knownPids) {
     const item = byPid.get(pid);
     if (item && matchesKnownIdentity(item)) parents.add(pid);
@@ -389,7 +394,7 @@ export async function refreshProcessTree(child, treeState, options = {}) {
   while (changed) {
     changed = false;
     for (const item of processes) {
-      if ((item.processGroupId === child.pid || parents.has(item.parentPid)) &&
+      if (((leaderIsOriginal && item.processGroupId === child.pid) || parents.has(item.parentPid)) &&
           !parents.has(item.pid)) {
         parents.add(item.pid);
         treeState.knownPids.add(item.pid);
@@ -512,6 +517,9 @@ export async function signalProcessTree(child, signal, treeState, {
     if (pid === child.pid) continue;
     const item = byPid.get(pid);
     const expected = treeState.knownStarts?.get(pid);
+    // A successful snapshot proves an absent PID has exited. Never signal its
+    // numeric value after the enumeration, where it could already be reused.
+    if (processes !== null && !item) continue;
     if (item && expected && item.startIdentity && expected !== item.startIdentity) continue;
     try { killOne(pid, signal); }
     catch (error) { if (error.code !== "ESRCH") throw error; }

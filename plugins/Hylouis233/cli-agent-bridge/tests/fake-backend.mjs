@@ -101,6 +101,22 @@ if (spec.branchRoundTrip) {
   execFileSync("git", ["branch", "-D", temporaryBranch]);
   execFileSync("git", ["update-ref", spec.refName, oid]);
   event("end");
+} else if (spec.forceRefFromExisting) {
+  // Force-move an existing ref onto a different pre-existing lineage, then
+  // add exactly one worker commit without leaving a temporary branch behind.
+  event("start");
+  const original = execFileSync("git", ["branch", "--show-current"], { encoding: "utf8" }).trim();
+  const temporaryBranch = spec.temporaryBranch ?? "temporary-force-ref";
+  execFileSync("git", ["checkout", spec.fromBranch]);
+  execFileSync("git", ["checkout", "-b", temporaryBranch]);
+  writeFileSync(path.resolve(process.cwd(), spec.writeFile ?? "forced-ref.txt"), "worker\n");
+  execFileSync("git", ["add", spec.writeFile ?? "forced-ref.txt"]);
+  execFileSync("git", ["commit", "-m", spec.commitMessage ?? "worker commit on forced ref"]);
+  const oid = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  execFileSync("git", ["checkout", original]);
+  execFileSync("git", ["branch", "-D", temporaryBranch]);
+  execFileSync("git", ["update-ref", spec.refName, oid]);
+  event("end");
 } else if (spec.mode === "descendant") {
   event("descendant-start");
   await delay(spec.delayMs ?? 1_000);

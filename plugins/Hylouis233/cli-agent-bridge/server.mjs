@@ -185,7 +185,15 @@ async function loadBackends() {
       const backends = parsed && typeof parsed === "object" && parsed.backends && typeof parsed.backends === "object"
         ? parsed.backends
         : FALLBACK_BACKENDS;
-      if (Object.keys(backends).length > 0) return backends;
+      if (Object.keys(backends).length > 0) {
+        const configDirectory = path.dirname(file);
+        return Object.fromEntries(Object.entries(backends).map(([name, spec]) => {
+          if (!spec || typeof spec.command !== "string" || !/[\\/]/u.test(spec.command)) {
+            return [name, spec];
+          }
+          return [name, { ...spec, command: path.resolve(configDirectory, spec.command) }];
+        }));
+      }
     } catch {
       // fall through to the next candidate
     }
@@ -203,13 +211,14 @@ function substituteArgs(template, task, session) {
 
 // Bounded capture: chunks are kept in a ring buffer with a running length, so a
 // runaway CLI never triggers repeated multi-megabyte string copies.
-function capture() {
+function capture(binary = false) {
   let chunks = [];
   let length = 0;
   let truncated = false;
   return {
     push(chunk) {
-      if (typeof chunk !== "string" || chunk.length === 0) return;
+      if (binary ? !Buffer.isBuffer(chunk) : typeof chunk !== "string") return;
+      if (chunk.length === 0) return;
       chunks.push(chunk);
       length += chunk.length;
       while (length > MAX_CAPTURE_CHARS && chunks.length > 0) {
@@ -218,16 +227,17 @@ function capture() {
         truncated = true;
       }
     },
-    text() { return chunks.join(""); },
+    value() { return binary ? Buffer.concat(chunks, length) : chunks.join(""); },
     truncated() { return truncated; },
   };
 }
 
 async function runCommand(command, args, options = {}) {
   const spawnOnce = (argv, shellArgs) => new Promise((resolve) => {
+    const binaryStdout = options.binaryStdout === true;
     if (typeof options.shouldCancel === "function" && options.shouldCancel()) {
       resolve({
-        stdout: "", stderr: "", exitCode: null, timedOut: false, killed: false,
+        stdout: binaryStdout ? Buffer.alloc(0) : "", stderr: "", exitCode: null, timedOut: false, killed: false,
         orphanedProcesses: false, treeTerminated: true, terminationError: "",
         errorMessage: "command cancelled before spawn", spawnError: null,
         stdoutTruncated: false, stderrTruncated: false,
@@ -256,7 +266,7 @@ async function runCommand(command, args, options = {}) {
           windowsHide: true,
           stdio: [options.stdinText === undefined ? "ignore" : "pipe", "pipe", "pipe"],
         });
-    const stdoutBuf = capture();
+    const stdoutBuf = capture(binaryStdout);
     const stderrBuf = capture();
     let settled = false;
     let spawnError = null;
@@ -290,8 +300,8 @@ async function runCommand(command, args, options = {}) {
       clearTimeout(timer);
       if (treeRefreshTimer) clearInterval(treeRefreshTimer);
       resolve({
-        stdout: stdoutBuf.text(),
-        stderr: stderrBuf.text(),
+        stdout: stdoutBuf.value(),
+        stderr: stderrBuf.value(),
         exitCode,
         timedOut,
         killed,
@@ -357,7 +367,7 @@ async function runCommand(command, args, options = {}) {
 
     const timer = setTimeout(() => { void terminate("timeout"); }, timeoutMs);
 
-    child.stdout.setEncoding("utf8");
+    if (!binaryStdout) child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk) => { stdoutBuf.push(chunk); });
     child.stderr.on("data", (chunk) => { stderrBuf.push(chunk); });
@@ -369,8 +379,8 @@ async function runCommand(command, args, options = {}) {
       clearTimeout(timer);
       if (treeRefreshTimer) clearInterval(treeRefreshTimer);
       resolve({
-        stdout: stdoutBuf.text(),
-        stderr: stderrBuf.text(),
+        stdout: stdoutBuf.value(),
+        stderr: stderrBuf.value(),
         exitCode: null,
         timedOut,
         killed,
@@ -446,7 +456,14 @@ async function validateWorkspace(workspacePath) {
     throw new Error("workspacePath does not exist: " + resolved);
   }
   if (!stats.isDirectory()) throw new Error("workspacePath must be a directory: " + resolved);
-  return resolved;
+  try {
+    // Keep the execution directory bound to the directory validated here. A
+    // symlink supplied by the caller may be retargeted while the request waits
+    // for the repository lease, so it must not be resolved again at launch.
+    return await realpath(resolved);
+  } catch (error) {
+    throw new Error("cannot canonicalize workspacePath: " + error.message);
+  }
 }
 
 async function requireGitRepo(workspacePath, options = {}) {
@@ -494,7 +511,10 @@ async function gitCommonDirectory(workspacePath, options = {}) {
 
 function repositoryLockKey(gitCommonDir) {
   const normalized = path.normalize(gitCommonDir);
-  return "git-common-dir:" + (process.platform === "win32" ? normalized.toLowerCase() : normalized);
+  // realpath() has already canonicalized ordinary aliases and path casing.
+  // Preserve the result: NTFS directories can opt into case sensitivity and
+  // may legally contain distinct repositories whose names differ only by case.
+  return "git-common-dir:" + normalized;
 }
 
 function snapshotFailure(label, result) {
@@ -514,6 +534,7 @@ async function runGitCommand(args, {
   cancel = null,
   deadline = null,
   stdinText,
+  binaryStdout = false,
   timeoutMs = GIT_TIMEOUT_MS,
 } = {}) {
   if (cancel?.cancelled) throw new OperationCancelledError("operation cancelled by client");
@@ -523,6 +544,7 @@ async function runGitCommand(args, {
   const result = await runCommand("git", args, {
     cwd,
     stdinText,
+    binaryStdout,
     timeoutMs: Math.max(1, Math.min(timeoutMs, remaining)),
     killGraceMs: 1_000,
     shouldCancel: () => Boolean(cancel?.cancelled),
@@ -547,12 +569,12 @@ const CONCURRENT_LEASE_STALE_MS = 30_000;
 async function gitSnapshot(worktreeRoot, options = {}) {
   const ownLockRef = typeof options.ownLockRef === "string" ? options.ownLockRef : null;
   const jobs = [
-    ["git status --short", "status", ["status", "--short", "--untracked-files=all"]],
-    ["git diff --stat", "diffStat", ["diff", "--stat"]],
-    ["git diff --name-only -z", "diffNames", ["diff", "--name-only", "-z"]],
-    ["git diff --cached --stat", "cachedDiffStat", ["diff", "--cached", "--stat"]],
-    ["git diff --cached --name-only -z", "cachedDiffNames", ["diff", "--cached", "--name-only", "-z"]],
-    ["git ls-files --others --exclude-standard -z", "untracked", ["ls-files", "--others", "--exclude-standard", "-z"]],
+    ["git status --short", "status", ["status", "--short", "--untracked-files=all", "--ignore-submodules=none"]],
+    ["git diff --stat", "diffStat", ["diff", "--ignore-submodules=none", "--stat"]],
+    ["git diff --name-only -z", "diffNames", ["diff", "--ignore-submodules=none", "--name-only", "-z"], false, true],
+    ["git diff --cached --stat", "cachedDiffStat", ["diff", "--cached", "--ignore-submodules=none", "--stat"]],
+    ["git diff --cached --name-only -z", "cachedDiffNames", ["diff", "--cached", "--ignore-submodules=none", "--name-only", "-z"], false, true],
+    ["git ls-files --others --exclude-standard -z", "untracked", ["ls-files", "--others", "--exclude-standard", "-z"], false, true],
     ["git rev-parse --verify --quiet HEAD", "head", ["rev-parse", "--verify", "--quiet", "HEAD"], true],
     ["git for-each-ref", "refs", ["for-each-ref", "--format=%(refname)%09%(objectname)", "refs"]],
   ];
@@ -560,7 +582,9 @@ async function gitSnapshot(worktreeRoot, options = {}) {
   // processes can race for .git/index.lock on the same repository.
   const results = [];
   for (const job of jobs) {
-    results.push(await runGitCommand(job[2], { cwd: worktreeRoot, ...options }));
+    results.push(await runGitCommand(job[2], {
+      cwd: worktreeRoot, ...options, binaryStdout: job[4] === true,
+    }));
   }
   const failures = [];
   const out = {};
@@ -578,7 +602,30 @@ async function gitSnapshot(worktreeRoot, options = {}) {
     throw new Error("git snapshot unreliable: " + failures.join("; "));
   }
   const seen = new Set();
-  const nulNames = (value) => String(value ?? "").split("\0").filter((name) => name.length > 0);
+  const nulNames = (value) => {
+    if (!Buffer.isBuffer(value)) {
+      return String(value ?? "").split("\0").filter((name) => name.length > 0);
+    }
+    const names = [];
+    const decoder = new TextDecoder("utf-8", { fatal: true });
+    let start = 0;
+    for (let index = 0; index <= value.length; index += 1) {
+      if (index < value.length && value[index] !== 0) continue;
+      if (index > start) {
+        const raw = value.subarray(start, index);
+        try {
+          names.push(decoder.decode(raw));
+        } catch {
+          // JSON strings cannot contain invalid UTF-8 bytes. A leading NUL can
+          // never be a legal Git path, so this reserved representation is both
+          // unambiguous and lossless for callers that need the original bytes.
+          names.push("\0git-path-bytes:" + raw.toString("hex"));
+        }
+      }
+      start = index + 1;
+    }
+    return names;
+  };
   const changedFiles = [
     ...nulNames(out.diffNames),
     ...nulNames(out.cachedDiffNames),
@@ -630,7 +677,9 @@ async function gitSnapshot(worktreeRoot, options = {}) {
     } catch { /* malformed owner blob: ignore for disclosure */ }
   }
   return {
-    statusShort: String(out.status ?? "").trim(),
+    // The leading space in porcelain's first XY column is significant (for
+    // example, " M" means unstaged). Remove only Git's final line terminator.
+    statusShort: String(out.status ?? "").replace(/\r?\n$/u, ""),
     diffStat,
     changedFiles,
     head: String(out.head ?? "").trim(),
@@ -863,18 +912,18 @@ async function committedDelta(worktreeRoot, before, after, options = {}) {
         attributedCommits.set(oid, { oid, subject, labels: new Set(labels) });
       }
     }
-    // For a ref that did not exist before, diff from its best common ancestor
-    // with the pre-delegation state, not from the original HEAD: a new branch
-    // created from another divergent branch would otherwise attribute every
-    // pre-existing difference between those branches to the worker.
+    // Diff from the closest ancestral pre-run tip, even for an existing ref.
+    // A force update can move a ref onto a pre-existing descendant lineage;
+    // using its older (but still ancestral) tip would attribute that lineage's
+    // already-existing changes to the worker.
     let base;
     const previousTarget = beforeOid
       ? await peelCommitish(worktreeRoot, beforeOid, cache, options)
       : null;
-    if (previousTarget) {
-      base = previousTarget;
-    } else if (baselineCommits.length > 0) {
+    if (baselineCommits.length > 0) {
       base = await closestExistingBase(worktreeRoot, target, baselineCommits, options) ?? await emptyTree();
+    } else if (previousTarget) {
+      base = previousTarget;
     } else {
       base = before.head || await emptyTree();
     }

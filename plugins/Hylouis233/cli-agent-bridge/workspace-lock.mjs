@@ -212,7 +212,7 @@ async function compareAndSwap(cwd, ref, newOid, expectedOid, options = {}) {
     returnOnTimeout: true,
   });
   if (result.exitCode === 0) return true;
-  const observedOid = await readRefOid(cwd, ref);
+  const observedOid = await readRefOid(cwd, ref, options);
   if (observedOid === newOid) return true;
   const expectedAbsent = /^0+$/u.test(expectedOid);
   if (expectedAbsent ? observedOid !== null : observedOid !== expectedOid) return false;
@@ -466,10 +466,10 @@ export async function tryAcquireGitWorkspaceLock({
   if (!current) {
     const zeroOid = "0".repeat(newOid.length);
     checkInterrupted(cancel, deadline);
-    acquired = await compareAndSwap(cwd, ref, newOid, zeroOid);
+    acquired = await compareAndSwap(cwd, ref, newOid, zeroOid, { cancel, deadline });
   } else {
     checkInterrupted(cancel, deadline);
-    acquired = await compareAndSwap(cwd, ref, newOid, current.oid);
+    acquired = await compareAndSwap(cwd, ref, newOid, current.oid, { cancel, deadline });
   }
   if (!acquired) return { acquired: false, reason: "contended" };
   locallyAbandonedRefs.delete(localRefKey);

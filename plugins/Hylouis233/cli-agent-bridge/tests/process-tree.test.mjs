@@ -230,6 +230,47 @@ test("the process group is signaled only while its leader identity is original",
   assert.deepEqual(groupSignalsAfterReuse, [], "a reused leader identity stops group signaling");
 });
 
+test("a reused POSIX leader cannot contribute unrelated descendants", async () => {
+  const child = { pid: 9300 };
+  const treeState = {
+    knownPids: new Set([9300]),
+    knownStarts: new Map([[9300, "original-leader"]]),
+  };
+  const reused = snapshotOf([
+    { pid: 9300, parentPid: 1, processGroupId: 9300, state: "S", startIdentity: "replacement-leader" },
+    { pid: 9301, parentPid: 9300, processGroupId: 9300, state: "S", startIdentity: "unrelated-child" },
+  ]);
+  await refreshProcessTree(child, treeState, {
+    platform: "linux", posixProcessSnapshot: reused,
+  });
+  assert.equal(treeState.knownPids.has(9301), false,
+    "children of the replacement leader must not enter the tracked tree");
+  const oneSignals = [];
+  await signalProcessTree(child, "SIGKILL", treeState, {
+    platform: "linux", posixProcessSnapshot: reused,
+    killGroup: () => { throw new Error("a reused group must not be signaled"); },
+    killOne: (pid) => { oneSignals.push(pid); },
+  });
+  assert.deepEqual(oneSignals, []);
+});
+
+test("tracked POSIX PIDs absent from a successful signal snapshot are skipped", async () => {
+  const child = { pid: 9400 };
+  const treeState = {
+    knownPids: new Set([9400, 9401]),
+    knownStarts: new Map([[9400, "leader"], [9401, "exited-child"]]),
+  };
+  const snapshot = snapshotOf([
+    { pid: 9400, parentPid: 1, processGroupId: 9400, state: "S", startIdentity: "leader" },
+  ]);
+  const oneSignals = [];
+  await signalProcessTree(child, "SIGTERM", treeState, {
+    platform: "linux", posixProcessSnapshot: snapshot,
+    killGroup: () => {}, killOne: (pid) => { oneSignals.push(pid); },
+  });
+  assert.deepEqual(oneSignals, [], "the stale numeric PID could already belong to another process");
+});
+
 test("windows tree inspection drops known PIDs whose creation identity changed", async () => {
   const treeState = {
     knownPids: new Set([500, 501]),

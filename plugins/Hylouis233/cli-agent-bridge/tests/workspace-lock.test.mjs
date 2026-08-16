@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile, execFileSync } from "node:child_process";
 import { writeFileSync } from "node:fs";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -349,6 +349,57 @@ test("worker state updates honour the delegation cancellation and deadline", asy
   );
   await expiredLease.lease.release();
   await assert.rejects(execFileAsync("git", ["rev-parse", "--verify", workspaceLockRef(key)], { cwd: repo }), /Command failed/u);
+});
+
+test("initial acquisition CAS obeys cancellation while a Git hook blocks", async (context) => {
+  if (process.platform === "win32") return; // executable hook setup is POSIX-specific
+  const repo = await makeRepo(context);
+  const gitDirectory = path.resolve(repo, await git(repo, ["rev-parse", "--git-dir"]));
+  const hook = path.join(gitDirectory, "hooks", "reference-transaction");
+  const ready = path.join(path.dirname(repo), "hook-ready");
+  const release = path.join(path.dirname(repo), "hook-release");
+  await writeFile(hook, [
+    "#!/usr/bin/env node",
+    "const { existsSync, writeFileSync } = require('node:fs');",
+    `writeFileSync(${JSON.stringify(ready)}, 'ready\\n');`,
+    `while (!existsSync(${JSON.stringify(release)})) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);`,
+    "",
+  ].join("\n"));
+  await chmod(hook, 0o755);
+  context.after(() => writeFile(release, "release\n").catch(() => {}));
+
+  const listeners = new Set();
+  let resolveCancelled;
+  const cancel = {
+    cancelled: false,
+    promise: new Promise((resolve) => { resolveCancelled = resolve; }),
+    subscribe(listener) {
+      listeners.add(listener);
+      return () => { listeners.delete(listener); };
+    },
+    cancel() {
+      this.cancelled = true;
+      resolveCancelled();
+      for (const listener of [...listeners]) listener();
+    },
+  };
+  const acquisition = tryAcquireGitWorkspaceLock({
+    cwd: repo, key: "git-worktree:" + repo, cancel, heartbeatMs: 60_000,
+  });
+  const readyDeadline = Date.now() + 3_000;
+  while (true) {
+    try { await access(ready); break; }
+    catch {
+      if (Date.now() >= readyDeadline) throw new Error("reference-transaction hook did not start");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }
+  const cancelledAt = Date.now();
+  cancel.cancel();
+  await assert.rejects(acquisition, WorkspaceLockCancelledError);
+  assert.ok(Date.now() - cancelledAt < 1_500,
+    "cancellation must interrupt the update-ref CAS instead of waiting for the hook timeout");
+  await writeFile(release, "release\n");
 });
 
 test("quarantined leases are reclaimable after the operator clears the marker", async (context) => {
