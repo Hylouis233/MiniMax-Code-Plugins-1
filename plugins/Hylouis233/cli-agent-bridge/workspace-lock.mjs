@@ -5,6 +5,7 @@ import os from "node:os";
 
 export const WORKSPACE_LOCK_REF_PREFIX = "refs/cli-agent-bridge/workspace-locks/";
 const WORKSPACE_HISTORY_REF_SUFFIX = ".history";
+const WORKSPACE_RECOVERY_REF_SUFFIX = ".recovery";
 const DEFAULT_STALE_MS = 30_000;
 const DEFAULT_HEARTBEAT_MS = 5_000;
 const DEFAULT_POLL_MS = 100;
@@ -13,13 +14,6 @@ const CAPTURE_LIMIT = 64_000;
 const PIPE_DRAIN_MS = 100;
 const RELEASE_RETRY_MS = 50;
 const RELEASE_ATTEMPTS = 3;
-// A failed release may leave this process's exact owner blob installed. The
-// server registers that OID while its in-process FIFO gate is still held, so
-// only the next local holder may replace it after the failed request unwinds.
-// The ref already includes the repository-scoped key; do not add a worktree
-// cwd, because linked worktrees share this same lease.
-const locallyAbandonedRefs = new Map();
-
 export class WorkspaceLockCancelledError extends Error {}
 export class WorkspaceLockDeadlineError extends Error {}
 
@@ -64,6 +58,50 @@ async function writeRunHistory(cwd, lockRef, owner) {
   } catch {
     // Best effort: a missing history record only weakens concurrency
     // disclosure, never correctness of locking.
+  }
+}
+
+async function writeRecoveryAuthorization(cwd, lockRef, ownerOid, ownerToken) {
+  const recoveryRef = lockRef + WORKSPACE_RECOVERY_REF_SUFFIX;
+  const record = {
+    version: 1,
+    lockRef,
+    ownerOid,
+    ownerToken,
+    authorizedAt: Date.now(),
+  };
+  const recordOid = await writeOwnerBlob(cwd, record);
+  const result = await runGit(cwd, ["update-ref", "--no-deref", recoveryRef, recordOid]);
+  if (result.exitCode !== 0) {
+    throw new Error("cannot persist workspace lock recovery authorization: " + (
+      result.stderr.trim() || "git update-ref exited with code " + String(result.exitCode)
+    ));
+  }
+  return { ref: recoveryRef, oid: recordOid };
+}
+
+async function readRecoveryAuthorization(cwd, lockRef, options = {}) {
+  return await readCurrentOwner(cwd, lockRef + WORKSPACE_RECOVERY_REF_SUFFIX, options);
+}
+
+async function clearRecoveryAuthorization(cwd, authorization) {
+  if (!authorization) return;
+  try {
+    await compareAndDelete(cwd, authorization.ref, authorization.oid);
+  } catch {
+    // A stale authorization is harmless because it names one exact owner OID
+    // and token. A later holder can overwrite or remove it.
+  }
+}
+
+async function maintainLockStore(cwd) {
+  try {
+    // Git's automatic maintenance uses its own repository locks and its normal
+    // prune grace period, so it is safe alongside acquisitions in other bridge
+    // processes while eventually collecting superseded owner/history blobs.
+    await runGit(cwd, ["gc", "--auto", "--quiet"]);
+  } catch {
+    // Maintenance is best effort and must never change lock correctness.
   }
 }
 
@@ -297,7 +335,6 @@ function makeOwner({ hostIdentity, ownerPid, ownerIdentity, now }) {
 }
 
 function createLease({ cwd, ref, oid, owner, heartbeatMs }) {
-  const localRefKey = ref;
   const ownerToken = owner.token;
   let currentOid = oid;
   let currentOwner = owner;
@@ -349,10 +386,31 @@ function createLease({ cwd, ref, oid, owner, heartbeatMs }) {
     });
   };
 
+  const queueOwnershipProbe = () => {
+    updateChain = updateChain.then(async () => {
+      if (stopped || lostError || interruptedError) return;
+      const observedOid = await readRefOid(cwd, ref);
+      if (observedOid !== currentOid) {
+        throw new Error("workspace lock ownership changed during heartbeat probe");
+      }
+    }).catch((error) => {
+      if (isInterruption(error)) {
+        interruptedError ??= error;
+        return;
+      }
+      rememberLoss(error);
+    });
+    return updateChain;
+  };
+
   const timer = setInterval(() => {
     if (stopped || heartbeatPending || lostError || interruptedError) return;
     heartbeatPending = true;
-    void queueUpdate({}).catch(() => {}).finally(() => { heartbeatPending = false; });
+    // Process liveness and start-identity checks protect stale acquisition, so
+    // the periodic heartbeat only needs to prove this exact ref is still ours.
+    // A read-only probe avoids creating an unreachable content-addressed blob
+    // every few seconds during long delegations.
+    void queueOwnershipProbe().catch(() => {}).finally(() => { heartbeatPending = false; });
   }, heartbeatMs);
   timer.unref?.();
 
@@ -380,9 +438,6 @@ function createLease({ cwd, ref, oid, owner, heartbeatMs }) {
     retain() {
       retained = true;
     },
-    allowLocalRecovery() {
-      if (stopped && !retained && !released) locallyAbandonedRefs.set(localRefKey, currentOid);
-    },
     async release() {
       if (released) return;
       if (releasePromise) return await releasePromise;
@@ -404,6 +459,12 @@ function createLease({ cwd, ref, oid, owner, heartbeatMs }) {
             if (observed && observed.owner?.token === ownerToken) currentOid = observed.oid;
           } catch { /* best effort; the delete below still uses the last known OID */ }
         }
+        // Persist authorization before deleting. If deletion exhausts its
+        // retries, every bridge process sharing this lock store can safely CAS
+        // away only this exact completed owner record.
+        const recoveryAuthorization = await writeRecoveryAuthorization(
+          cwd, ref, currentOid, ownerToken,
+        );
         let deleted = false;
         let deleteError = null;
         for (let attempt = 0; attempt < RELEASE_ATTEMPTS; attempt += 1) {
@@ -421,6 +482,8 @@ function createLease({ cwd, ref, oid, owner, heartbeatMs }) {
         if (deleteError) throw deleteError;
         released = true;
         if (deleted) await writeRunHistory(cwd, ref, currentOwner);
+        await clearRecoveryAuthorization(cwd, recoveryAuthorization);
+        await maintainLockStore(cwd);
         if (lostError) throw lostError;
         if (!deleted) throw new Error("workspace lock ownership changed before release");
       })();
@@ -450,12 +513,15 @@ export async function tryAcquireGitWorkspaceLock({
 } = {}) {
   checkInterrupted(cancel, deadline);
   const ref = workspaceLockRef(key);
-  const localRefKey = ref;
   const current = await readCurrentOwner(cwd, ref, { cancel, deadline });
-  const abandonedOid = locallyAbandonedRefs.get(localRefKey);
-  const locallyAbandoned = Boolean(current && abandonedOid === current.oid);
-  if (!current || (abandonedOid && !locallyAbandoned)) locallyAbandonedRefs.delete(localRefKey);
-  if (current && !locallyAbandoned && !await canReclaim(current.owner, {
+  const recovery = await readRecoveryAuthorization(cwd, ref, { cancel, deadline });
+  const sharedRecoveryAuthorized = Boolean(
+    current && recovery?.owner?.version === 1 &&
+    recovery.owner.lockRef === ref &&
+    recovery.owner.ownerOid === current.oid &&
+    recovery.owner.ownerToken === current.owner?.token,
+  );
+  if (current && !sharedRecoveryAuthorized && !await canReclaim(current.owner, {
     now, staleMs, hostIdentity, processProbe, processIdentityProbe, operatorCleared,
   })) {
     return { acquired: false, reason: "held" };
@@ -472,7 +538,12 @@ export async function tryAcquireGitWorkspaceLock({
     acquired = await compareAndSwap(cwd, ref, newOid, current.oid, { cancel, deadline });
   }
   if (!acquired) return { acquired: false, reason: "contended" };
-  locallyAbandonedRefs.delete(localRefKey);
+  if (recovery) {
+    await clearRecoveryAuthorization(cwd, {
+      ref: ref + WORKSPACE_RECOVERY_REF_SUFFIX,
+      oid: recovery.oid,
+    });
+  }
   const lease = createLease({ cwd, ref, oid: newOid, owner, heartbeatMs });
   try {
     checkInterrupted(cancel, deadline);
@@ -480,10 +551,8 @@ export async function tryAcquireGitWorkspaceLock({
     try {
       await lease.release();
     } catch (releaseError) {
-      // Acquisition committed before cancellation/deadline was observed. If
-      // the compensating delete fails, preserve the exact OID for the next
-      // local FIFO holder instead of orphaning an unrecoverable live-owner ref.
-      lease.allowLocalRecovery();
+      // release() persisted authorization before its compensating delete, so
+      // another bridge process can recover the exact completed owner record.
       if (error.cause === undefined) error.cause = releaseError;
     }
     throw error;

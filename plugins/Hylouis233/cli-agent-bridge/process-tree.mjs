@@ -441,7 +441,11 @@ export async function isProcessTreeAlive(child, treeState, {
     if (platform === "linux" && treeState.runMarker &&
         !processes.some((item) => item.pid === child.pid) &&
         treeState.markerObservationComplete !== true) {
-      const observationDeadline = Date.now() + MARKER_OBSERVATION_GRACE_MS;
+      const configuredGrace = Number(treeState.markerObservationGraceMs);
+      const observationGraceMs = Number.isFinite(configuredGrace) && configuredGrace >= 0
+        ? configuredGrace
+        : MARKER_OBSERVATION_GRACE_MS;
+      const observationDeadline = Date.now() + observationGraceMs;
       while (Date.now() < observationDeadline) {
         await new Promise((resolve) => setTimeout(resolve, 25));
         processes = await refreshProcessTree(child, treeState, { platform, procRoot, fsOps });

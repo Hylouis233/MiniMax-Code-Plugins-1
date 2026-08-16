@@ -228,6 +228,53 @@ test("porcelain status preserves the unstaged first-column space", async (contex
   assert.match(response.result.structuredContent.git.statusShort, /^ M baseline\.txt$/u);
 });
 
+test("the private lock store inherits the repository sharing mode", async (context) => {
+  const { workspace, client } = await makeHarness(context);
+  await execFileAsync("git", ["config", "core.sharedRepository", "group"], { cwd: workspace });
+  const response = await client.request("tools/call", {
+    name: "workspace_status", arguments: { workspacePath: workspace },
+  });
+  assert.equal(response.result.structuredContent.ok, true);
+  const lockStore = await coordinationLockStore(workspace);
+  const { stdout } = await execFileAsync(
+    "git", ["--git-dir", lockStore, "config", "--get", "core.sharedRepository"],
+  );
+  assert.ok(["1", "group"].includes(stdout.trim()), stdout);
+});
+
+test("Git snapshot commands terminate escaped hook descendants", {
+  skip: process.platform !== "linux" ? "Linux /proc marker containment fixture" : false,
+}, async (context) => {
+  const { tempRoot, workspace, client } = await makeHarness(context);
+  const hook = path.join(tempRoot, "fsmonitor-hook.sh");
+  const ready = path.join(tempRoot, "fsmonitor-ready.txt");
+  const survivor = path.join(tempRoot, "fsmonitor-descendant-survived.txt");
+  const childCode = [
+    "const fs=require('node:fs')",
+    "setTimeout(()=>fs.writeFileSync(process.argv[1],'survived\\n'),1200)",
+  ].join(";");
+  await writeFile(hook, [
+    "#!/bin/sh",
+    "printf invoked > " + JSON.stringify(ready),
+    "setsid " + JSON.stringify(process.execPath) + " -e " + JSON.stringify(childCode) +
+      " " + JSON.stringify(survivor) + " >/dev/null 2>&1 &",
+    "printf 'fixture-token\\0'",
+    "",
+  ].join("\n"));
+  await chmod(hook, 0o755);
+  await execFileAsync("git", ["config", "core.fsmonitor", hook], { cwd: workspace });
+  await execFileAsync("git", ["config", "core.fsmonitorHookVersion", "2"], { cwd: workspace });
+
+  const response = await client.request("tools/call", {
+    name: "workspace_status", arguments: { workspacePath: workspace },
+  });
+  assert.equal(response.result.structuredContent.ok, true, client.stderr);
+  await access(ready);
+  await new Promise((resolve) => setTimeout(resolve, 1_400));
+  await assert.rejects(access(survivor), /ENOENT/u,
+    "the fsmonitor descendant must be dead before the workspace lease is released");
+});
+
 test("dirty checks override submodule ignore configuration", async (context) => {
   const { tempRoot, workspace, client } = await makeHarness(context);
   const source = path.join(tempRoot, "submodule-source");

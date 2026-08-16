@@ -206,7 +206,7 @@ test("an update-ref infrastructure failure is not misclassified as contention", 
   );
 });
 
-test("a failed release can be recovered by the next local holder in every completed state", async (context) => {
+test("a failed release can be recovered by the next holder in every completed state", async (context) => {
   for (const state of ["idle", "starting", "running"]) {
     const repo = await makeRepo(context);
     const key = "git-worktree:" + repo;
@@ -220,7 +220,6 @@ test("a failed release can be recovered by the next local holder in every comple
     const blocker = refPath + ".lock";
     await writeFile(blocker, "intentional release failure\n");
     await assert.rejects(first.lease.release(), /cannot delete workspace lock ref/iu);
-    first.lease.allowLocalRecovery();
     await rm(blocker, { force: true });
 
     const second = await tryAcquireGitWorkspaceLock({ cwd: repo, key, heartbeatMs: 60_000 });
@@ -245,13 +244,30 @@ test("a failed release in one linked worktree is recoverable from another", asyn
   const blocker = refPath + ".lock";
   await writeFile(blocker, "intentional linked-worktree release failure\n");
   await assert.rejects(first.lease.release(), /cannot delete workspace lock ref/iu);
-  first.lease.allowLocalRecovery();
   await rm(blocker, { force: true });
 
-  const second = await tryAcquireGitWorkspaceLock({ cwd: linked, key, heartbeatMs: 60_000 });
+  // A cache-busted module instance has no shared JavaScript memory with the
+  // first holder and therefore proves recovery authorization lives in Git.
+  const otherModule = await import("../workspace-lock.mjs?shared-recovery=" + Date.now());
+  const second = await otherModule.tryAcquireGitWorkspaceLock({
+    cwd: linked, key, heartbeatMs: 60_000,
+  });
   assert.equal(second.acquired, true,
-    "the repository-scoped abandoned OID is visible from every linked worktree");
+    "the repository-scoped recovery record is visible across module/process boundaries");
   await second.lease.release();
+});
+
+test("periodic ownership probes do not create heartbeat blobs", async (context) => {
+  const repo = await makeRepo(context);
+  const key = "git-worktree:" + repo;
+  const result = await tryAcquireGitWorkspaceLock({ cwd: repo, key, heartbeatMs: 10 });
+  assert.equal(result.acquired, true);
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  const countOutput = await git(repo, ["count-objects", "-v"]);
+  const looseCount = Number(/^count:\s+(\d+)$/mu.exec(countOutput)?.[1]);
+  assert.equal(looseCount, 1,
+    "read-only heartbeat probes must leave only the current owner blob");
+  await result.lease.release();
 });
 
 test("post-CAS cancellation remains recoverable when its compensating delete fails", async (context) => {

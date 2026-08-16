@@ -133,9 +133,13 @@ you already obtained a valid ID from that backend outside this Plugin.
   an external writer updates bridge history during a snapshot, but current bridge instances do
   not run linked-worktree delegations concurrently.
 - Locking leaves the target repository refs, worktree, and index unchanged, but it requires writable
-  metadata in the private bare lock store. Each acquisition writes an owner blob and temporarily
-  updates a coordination ref there; released owner blobs remain unreachable until that store's
-  normal Git garbage collection. For that reason workspace_status is not marked
+  metadata in the private bare lock store. Its initialization inherits the enclosing repository's
+  `core.sharedRepository` mode for group/multi-user repositories. Each acquisition writes an owner
+  blob and temporarily updates a coordination ref there. Periodic ownership checks read that ref
+  without manufacturing new heartbeat blobs, and each normal release schedules Git's safe automatic
+  maintenance for superseded state. A failed release first leaves an exact-owner recovery record in
+  the shared store, so another bridge process can finish cleanup after the transient failure clears.
+  For these reasons workspace_status is not marked
   read-only in its MCP annotations even though the snapshot itself does not edit worktree files.
 - Cancellation and timeout confirm that the delegated process tree has exited before releasing
   the workspace mutex. A lightweight ancestry monitor records descendants that create a new POSIX
@@ -145,7 +149,9 @@ you already obtained a valid ID from that backend outside this Plugin.
   leader identity still matches. On Linux, descendants also inherit a per-run environment marker;
   if the parent exits before ancestry polling, the close path uses a bounded observation grace and
   marker scans to recover children that become visible just after the leader exits, without
-  continuously scanning all of `/proc`. If termination cannot be
+  continuously scanning all of `/proc`. Repository discovery and snapshot Git commands use the same
+  containment, so a hook or helper cannot leave an untracked descendant behind after the lease is
+  released. If termination cannot be
   confirmed, the bridge writes a shared
   quarantine marker, moves its lease into the recoverable `quarantined` state, and every bridge
   process refuses further delegation until an operator checks for leftovers and deliberately

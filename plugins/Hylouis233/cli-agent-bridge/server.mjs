@@ -281,6 +281,7 @@ async function runCommand(command, args, options = {}) {
       knownPids: new Set(Number.isInteger(child.pid) ? [child.pid] : []),
       knownStarts: new Map(),
       runMarker: linuxRunMarker,
+      markerObservationGraceMs: options.markerObservationGraceMs,
     };
     let treeRefreshPromise = null;
     let treeRefreshTimer = null;
@@ -571,7 +572,20 @@ async function ensureWorkspaceLockStore(gitCommonDir, options = {}) {
     if (error.code !== "ENOENT") throw error;
   }
   if (!initialized) {
-    const result = await runGitCommand(["init", "--bare", "--quiet", storeRoot], {
+    const sharedResult = await runGitCommand([
+      "--git-dir", gitCommonDir, "config", "--get", "core.sharedRepository",
+    ], { cwd: gitCommonDir, ...options });
+    const sharedFailure = sharedResult.exitCode === 1 && !sharedResult.stdout.trim()
+      ? ""
+      : snapshotFailure("git config core.sharedRepository", sharedResult);
+    if (sharedFailure) {
+      throw new Error("cannot inspect repository sharing mode: " + sharedFailure);
+    }
+    const shared = sharedResult.stdout.replace(/\r?\n$/u, "");
+    const initArgs = ["init", "--bare", "--quiet"];
+    if (shared) initArgs.push("--shared=" + shared);
+    initArgs.push(storeRoot);
+    const result = await runGitCommand(initArgs, {
       cwd: gitCommonDir, ...options,
     });
     const failure = snapshotFailure("git init --bare workspace lock store", result);
@@ -608,6 +622,13 @@ async function runGitCommand(args, {
     cwd,
     stdinText,
     binaryStdout,
+    manageProcessTree: true,
+    // Git hooks/helpers are polled while Git is alive and receive one final
+    // marker scan after it exits. Do not add the worker-oriented 500 ms late-
+    // visibility grace to every merge-base/ref query: attribution can issue
+    // hundreds of these commands. A marked descendant found by the final scan
+    // is still terminated and drained before this call returns.
+    markerObservationGraceMs: 0,
     timeoutMs: Math.max(1, Math.min(timeoutMs, remaining)),
     killGraceMs: 1_000,
     shouldCancel: () => Boolean(cancel?.cancelled),
@@ -1249,10 +1270,8 @@ async function withWorkspaceLock(key, lockStoreRoot, fn, {
         try {
           await lease.release();
         } catch (error) {
-          // Register the exact leftover OID before releasing the local FIFO
-          // gate. This permits only this server's next local holder to repair
-          // a failed delete, including starting/running owner records.
-          lease.allowLocalRecovery();
+          // release() persisted exact-owner recovery authorization in the
+          // shared lock store before attempting deletion.
           throw error;
         }
       }
