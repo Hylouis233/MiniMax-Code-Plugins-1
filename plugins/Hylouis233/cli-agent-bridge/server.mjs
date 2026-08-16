@@ -539,7 +539,7 @@ const CONCURRENT_LEASE_STALE_MS = 30_000;
 async function gitSnapshot(worktreeRoot, options = {}) {
   const ownLockRef = typeof options.ownLockRef === "string" ? options.ownLockRef : null;
   const jobs = [
-    ["git status --short", "status", ["status", "--short"]],
+    ["git status --short", "status", ["status", "--short", "--untracked-files=all"]],
     ["git diff --stat", "diffStat", ["diff", "--stat"]],
     ["git diff --name-only -z", "diffNames", ["diff", "--name-only", "-z"]],
     ["git diff --cached --stat", "cachedDiffStat", ["diff", "--cached", "--stat"]],
@@ -766,8 +766,11 @@ async function committedDelta(worktreeRoot, before, after, options = {}) {
     // created from another divergent branch would otherwise attribute every
     // pre-existing difference between those branches to the worker.
     let base;
-    if (beforeOid) {
-      base = beforeOid;
+    const previousTarget = beforeOid
+      ? await peelCommitish(worktreeRoot, beforeOid, cache, options)
+      : null;
+    if (previousTarget) {
+      base = previousTarget;
     } else if (baselineCommits.length > 0) {
       const mergeBase = await runGitCommand(
         ["merge-base", target, ...baselineCommits.slice(0, 256)],
@@ -1336,12 +1339,10 @@ async function delegateTask(rawArgs, cancel) {
     if (!result.treeTerminated) {
       quarantinedWorkspaces.add(lockKey);
       workspaceLease.retain();
-      // Move the retained lease into the recoverable "quarantined" state. A
-      // running-state lease can never be reclaimed, which would leave the
-      // workspace locked forever even after the operator removes the marker.
-      try {
-        await workspaceLease.markWorkerQuarantined();
-      } catch { /* lease lost or interrupted: the marker file below still gates recovery */ }
+      // Persist the operator-visible marker before making the retained lease
+      // recoverable. If persistence fails, the lease remains in the
+      // unreclaimable running state instead of treating a never-created marker
+      // as one that an operator deliberately removed.
       quarantinePath = await markWorkspaceQuarantined(lockKey, {
         backend,
         workspacePath,
@@ -1349,6 +1350,9 @@ async function delegateTask(rawArgs, cancel) {
         lockRef: workspaceLease.ref,
         terminationError: result.terminationError,
       });
+      try {
+        await workspaceLease.markWorkerQuarantined();
+      } catch { /* running state remains fail-closed; the marker still explains manual recovery */ }
       // The shared marker is now authoritative and removable by an operator;
       // retain the local fallback only when writing that marker failed.
       quarantinedWorkspaces.delete(lockKey);

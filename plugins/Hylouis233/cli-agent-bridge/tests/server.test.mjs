@@ -190,6 +190,20 @@ test("Codex templates delimit option-looking task text", async () => {
   assert.match(source, /resumeArgs: \["exec", "resume", "<session>", "--", "<task>"\]/u);
 });
 
+test("dirty checks include untracked files even when Git config hides them", async (context) => {
+  const { workspace, client } = await makeHarness(context);
+  await execFileAsync("git", ["config", "status.showUntrackedFiles", "no"], { cwd: workspace });
+  await writeFile(path.join(workspace, "hidden-untracked.txt"), "pre-existing\n");
+  const response = await client.request("tools/call", taskArguments(workspace, {
+    name: "must-not-start", writeFile: "worker-output.txt",
+  }));
+  const out = response.result.structuredContent;
+  assert.equal(out.ok, false);
+  assert.match(out.error, /working tree is dirty/iu);
+  assert.ok(out.gitBefore.changedFiles.includes("hidden-untracked.txt"));
+  await assert.rejects(access(path.join(workspace, "worker-output.txt")), /ENOENT/u);
+});
+
 test("canonical Git worktree locking serializes root and symlink paths", async (context) => {
   const { tempRoot, workspace, client } = await makeHarness(context);
   const alias = path.join(tempRoot, "workspace-alias");
@@ -797,6 +811,27 @@ test("a worker ref pointing at a non-commit object is reported without failing t
   assert.ok(out.commits.refsChanged.some((item) => item.ref === "refs/tags/blobtag" && item.after),
     JSON.stringify(out.commits.refsChanged));
   assert.match(out.commits.log, /non-commit object/u);
+});
+
+test("a ref moved from a blob to a new commit uses a commit-safe diff base", async (context) => {
+  const { tempRoot, workspace, client } = await makeHarness(context);
+  const refName = "refs/tags/blob-to-commit";
+  const oldBlobPath = path.join(tempRoot, "old-blob.txt");
+  await writeFile(oldBlobPath, "old blob\n");
+  const { stdout: blobOid } = await execFileAsync(
+    "git", ["hash-object", "-w", oldBlobPath], { cwd: workspace },
+  );
+  await execFileAsync("git", ["update-ref", refName, blobOid.trim()], { cwd: workspace });
+  const response = await client.request("tools/call", taskArguments(workspace, {
+    name: "blob-to-commit", moveBlobRefToCommit: true, refName,
+    writeFile: "ref-commit.txt", commitMessage: "commit behind moved ref",
+  }));
+  assert.equal(response.result.error, undefined, "post-run attribution must not become a JSON-RPC error");
+  const out = response.result.structuredContent;
+  assert.equal(out.ok, true, JSON.stringify(out.error));
+  assert.match(out.commits.log, /commit behind moved ref/u);
+  assert.match(out.commits.diffStat, /ref-commit\.txt/u);
+  assert.doesNotMatch(out.commits.diffStat, new RegExp(blobOid.trim(), "u"));
 });
 
 test("linked worktrees sharing Git refs serialize across server processes", async (context) => {

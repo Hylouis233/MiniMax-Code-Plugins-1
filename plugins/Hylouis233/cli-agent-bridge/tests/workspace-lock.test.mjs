@@ -307,6 +307,7 @@ test("quarantined leases are reclaimable after the operator clears the marker", 
     hostIdentity: localHostIdentity(),
     ownerPid: process.pid,
     workerState: "quarantined",
+    quarantineMarkerPersisted: true,
     workerPid: 4242,
     acquiredAt: now,
     heartbeatAt: now,
@@ -326,6 +327,28 @@ test("quarantined leases are reclaimable after the operator clears the marker", 
   await reclaimed.lease.release();
 });
 
+test("a quarantined lease without proof of a durable marker fails closed", async (context) => {
+  const repo = await makeRepo(context);
+  const key = "git-worktree:" + repo;
+  const now = Date.now();
+  await installOwner(repo, workspaceLockRef(key), {
+    version: 1,
+    token: "marker-never-persisted",
+    hostIdentity: localHostIdentity(),
+    ownerPid: 12345,
+    workerState: "quarantined",
+    workerPid: 5353,
+    acquiredAt: now - 120_000,
+    heartbeatAt: now - 120_000,
+  });
+  const result = await tryAcquireGitWorkspaceLock({
+    cwd: repo, key, now, staleMs: 30_000, processProbe: () => "dead",
+    operatorCleared: () => true,
+  });
+  assert.deepEqual(result, { acquired: false, reason: "held" },
+    "an absent marker is not operator clearance unless persistence was recorded");
+});
+
 test("a quarantined lease left by a crashed owner is reclaimable after the stale window", async (context) => {
   const repo = await makeRepo(context);
   const key = "git-worktree:" + repo;
@@ -336,6 +359,7 @@ test("a quarantined lease left by a crashed owner is reclaimable after the stale
     hostIdentity: localHostIdentity(),
     ownerPid: 12345,
     workerState: "quarantined",
+    quarantineMarkerPersisted: true,
     workerPid: 5353,
     acquiredAt: now - 120_000,
     heartbeatAt: now - 120_000,

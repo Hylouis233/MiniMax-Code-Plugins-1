@@ -237,6 +237,10 @@ async function canReclaim(owner, {
   // marker is deliberately removed (or, failing that, the owner died and the
   // heartbeat went stale after a crash).
   if (owner.workerState === "quarantined") {
+    // This bit is written only after the shared marker was durably created.
+    // Older/partial records cannot distinguish "operator removed" from
+    // "marker creation failed" and therefore remain fail-closed.
+    if (owner.quarantineMarkerPersisted !== true) return false;
     if (operatorCleared) {
       try {
         if (await operatorCleared()) return true;
@@ -345,7 +349,7 @@ function createLease({ cwd, ref, oid, owner, heartbeatMs }) {
       await queueUpdate({ workerState: "idle", workerPid: null }, interrupt);
     },
     async markWorkerQuarantined() {
-      await queueUpdate({ workerState: "quarantined" });
+      await queueUpdate({ workerState: "quarantined", quarantineMarkerPersisted: true });
     },
     retain() {
       retained = true;

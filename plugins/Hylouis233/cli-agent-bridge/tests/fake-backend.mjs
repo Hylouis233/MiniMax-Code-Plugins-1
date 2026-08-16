@@ -59,6 +59,21 @@ if (spec.branchRoundTrip) {
   ).trim();
   execFileSync("git", ["update-ref", spec.refName ?? "refs/tags/blobtag", oid]);
   event("end");
+} else if (spec.moveBlobRefToCommit) {
+  // Move a pre-existing non-commit ref to a commit created during this run,
+  // without leaving another changed branch ref that could mask attribution.
+  event("start");
+  const original = execFileSync("git", ["branch", "--show-current"], { encoding: "utf8" }).trim();
+  const temporaryBranch = spec.branchName ?? "temporary-ref-commit";
+  execFileSync("git", ["checkout", "-b", temporaryBranch]);
+  writeFileSync(path.resolve(process.cwd(), spec.writeFile ?? "ref-commit.txt"), "ref commit\n");
+  execFileSync("git", ["add", spec.writeFile ?? "ref-commit.txt"]);
+  execFileSync("git", ["commit", "-m", spec.commitMessage ?? "commit behind moved ref"]);
+  const oid = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  execFileSync("git", ["checkout", original]);
+  execFileSync("git", ["branch", "-D", temporaryBranch]);
+  execFileSync("git", ["update-ref", spec.refName, oid]);
+  event("end");
 } else if (spec.mode === "descendant") {
   event("descendant-start");
   await delay(spec.delayMs ?? 1_000);
