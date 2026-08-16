@@ -48,12 +48,14 @@ inside the target git repository, and their results come back as a git diff for 
   with --permission-mode acceptEdits); treat every returned diff as untrusted until reviewed.
 - Review every change the worker produced before reporting completion. New files the worker
   created are listed under changed files even though they do not appear in git diff --stat.
+- Run independent or comparison workers in separate clean Git worktrees at the same starting
+  commit. A second run in one checkout inherits the first run's edits and is not independent.
 - Timeouts: the default is 20 minutes; adjust timeoutMs for very large tasks. A timed-out worker
-  is terminated (SIGTERM, then a forceful kill after a grace period), so a delegation call never
-  hangs past the cap.
-- Cancellation: cancelling an in-flight delegate_task call terminates the worker process and the
-  result reports cancelled=true; the workspace may still contain the edits the worker made before
-  cancellation, so still review the returned snapshot.
+  has its complete process tree terminated before the workspace lock is released.
+- Cancellation: cancelling an in-flight delegate_task call terminates the complete worker process
+  tree and the result reports cancelled=true. If tree termination cannot be confirmed, the bridge
+  quarantines the worktree and blocks another worker until restart. The workspace may still contain
+  edits made before cancellation, so still review the returned snapshot.
 
 ## Notes
 

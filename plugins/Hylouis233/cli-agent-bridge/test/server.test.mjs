@@ -205,7 +205,7 @@ test("a delegation cancelled while queued for the lock never starts its worker",
     const [r1, r2] = await Promise.all([first, second]);
     assert.equal(r1.result.structuredContent.ok, true);
     assert.equal(r2.result.structuredContent.cancelled, true);
-    assert.match(r2.result.structuredContent.error, /waiting for the workspace lock/);
+    assert.match(r2.result.structuredContent.error, /cancelled.*worker.*started/iu);
     assert.equal(r2.result.structuredContent.exitCode, null, "the cancelled worker must never have started");
     assert.equal(readFileSync(path.join(repo, "hello.txt"), "utf8"), "hello", "workspace untouched");
   });

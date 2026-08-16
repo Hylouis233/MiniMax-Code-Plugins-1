@@ -18,7 +18,8 @@ repository:
 - delegate_task: run a self-contained task with a chosen backend CLI and return its exit
   code, output tail, stderr tail, and the before/after git snapshots (staged, unstaged,
   untracked, and committed deltas) the worker produced. Runs against the same workspace are
-  serialized; dirty trees are refused unless allowDirty=true; cancellation kills the worker.
+  serialized; dirty trees are refused unless allowDirty=true; cancellation and timeout
+  terminate the complete worker process tree before the workspace lock is released.
 
 The Skill teaches MiniMax Code when and how to delegate, and to review the returned diff before
 reporting completion.
@@ -103,6 +104,8 @@ underlying real executable in backends.json.
 backends.json maps each backend to a command template. The placeholders <task> and <session>
 are substituted at run time. To use a differently named binary (for example a zcode wrapper),
 change the command field. resumeSessionId is honored only for backends whose resumeArgs is set.
+The bridge does not discover or parse session IDs from CLI output; pass resumeSessionId only when
+you already obtained a valid ID from that backend outside this Plugin.
 
 ## Limitations
 
@@ -111,10 +114,29 @@ change the command field. resumeSessionId is honored only for backends whose res
   plays that role instead.
 - The bridge delegates tasks; it does not merge code, commit, or push. The user reviews every
   diff.
+- Delegations targeting the same canonical Git worktree are serialized even when callers name a
+  subdirectory, different path casing, or symlink. Independent comparison runs still require
+  separate clean worktrees.
+- Cancellation and timeout confirm that the delegated process tree has exited before releasing
+  the workspace mutex. If termination cannot be confirmed, the bridge quarantines that worktree
+  and refuses further delegations until the server is restarted and leftover processes are
+  checked.
 - zcode and dsh backends are experimental: ZCode desktop builds have no verified headless CLI,
   and dsh needs a headless profile present under DSH_HOME/profiles.
 - Custom wrapper shims that re-bind dashed flags can misreport a backend as unavailable; point
   the backend command at the real executable to bypass the wrapper.
+
+## Verification
+
+Run the dependency-free fake-backend suites from the repository root:
+
+```text
+node --test plugins/Hylouis233/cli-agent-bridge/test/server.test.mjs
+node --test plugins/Hylouis233/cli-agent-bridge/tests/server.test.mjs
+```
+
+They cover the full MCP flow plus canonical worktree locking, queued cancellation, cancel/timeout
+process-tree termination, unborn HEAD snapshots, and Codex prompt delimiters on Windows and POSIX.
 
 ## License
 
