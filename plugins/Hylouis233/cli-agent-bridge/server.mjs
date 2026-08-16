@@ -135,7 +135,7 @@ const TOOLS = [
           minimum: MIN_TIMEOUT_MS,
           maximum: MAX_TIMEOUT_MS,
           default: DEFAULT_TIMEOUT_MS,
-          description: "Execution timeout in milliseconds. Defaults to 1200000 (20 minutes). Timeout terminates the entire worker process tree; POSIX workers receive SIGTERM then SIGKILL after a 10 second grace period, while Windows uses taskkill /T /F.",
+          description: "Overall deadline in milliseconds after the workspace lock is acquired. Covers preflight Git checks, the worker, and post-run snapshots. Defaults to 1200000 (20 minutes). Confirming safe process-tree termination may extend beyond the deadline by the kill grace period.",
         },
       },
       required: ["backend", "task", "workspacePath"],
@@ -230,6 +230,7 @@ async function runCommand(command, args, options = {}) {
     let terminationPromise = null;
     const treeState = { knownPids: new Set(Number.isInteger(child.pid) ? [child.pid] : []) };
     const timeoutMs = options.timeoutMs ?? 30_000;
+    const killGraceMs = options.killGraceMs ?? KILL_GRACE_MS;
     const settle = () => {
       if (settled) return;
       settled = true;
@@ -256,15 +257,15 @@ async function runCommand(command, args, options = {}) {
         if (manageProcessTree) await signalProcessTree(child, "SIGTERM", treeState);
         else try { child.kill("SIGTERM"); } catch { /* already gone */ }
         const exited = manageProcessTree
-          ? await waitForProcessTreeExit(child, KILL_GRACE_MS, treeState)
-          : await waitForChildExit(child, KILL_GRACE_MS);
+          ? await waitForProcessTreeExit(child, killGraceMs, treeState)
+          : await waitForChildExit(child, killGraceMs);
         if (!exited) {
           killed = true;
           if (manageProcessTree) await signalProcessTree(child, "SIGKILL", treeState);
           else try { child.kill("SIGKILL"); } catch { /* already gone */ }
           treeTerminated = manageProcessTree
-            ? await waitForProcessTreeExit(child, KILL_GRACE_MS, treeState)
-            : await waitForChildExit(child, KILL_GRACE_MS);
+            ? await waitForProcessTreeExit(child, killGraceMs, treeState)
+            : await waitForChildExit(child, killGraceMs);
           if (!treeTerminated) {
             terminationError = "process tree still appears alive after forceful termination";
           }
@@ -395,7 +396,34 @@ function snapshotFailure(label, result) {
   return "";
 }
 
-async function gitSnapshot(workspacePath) {
+class OperationCancelledError extends Error {}
+class DeadlineExceededError extends Error {}
+
+async function runGitCommand(args, { cwd, cancel = null, deadline = null, stdinText } = {}) {
+  if (cancel?.cancelled) throw new OperationCancelledError("operation cancelled by client");
+  const remaining = deadline === null ? GIT_TIMEOUT_MS : deadline - Date.now();
+  if (remaining <= 0) throw new DeadlineExceededError("delegation deadline exceeded");
+  let controller = null;
+  const result = await runCommand("git", args, {
+    cwd,
+    stdinText,
+    timeoutMs: Math.max(1, Math.min(GIT_TIMEOUT_MS, remaining)),
+    killGraceMs: 1_000,
+    shouldCancel: () => Boolean(cancel?.cancelled),
+    onChild: (current) => {
+      controller = current;
+      if (cancel) cancel.controller = current;
+    },
+  });
+  if (cancel?.controller === controller) cancel.controller = null;
+  if (cancel?.cancelled) throw new OperationCancelledError("operation cancelled by client");
+  if (deadline !== null && result.timedOut && Date.now() >= deadline) {
+    throw new DeadlineExceededError("delegation deadline exceeded");
+  }
+  return result;
+}
+
+async function gitSnapshot(worktreeRoot, options = {}) {
   const jobs = [
     ["git status --short", "status", ["status", "--short"]],
     ["git diff --stat", "diffStat", ["diff", "--stat"]],
@@ -409,7 +437,7 @@ async function gitSnapshot(workspacePath) {
   // processes can race for .git/index.lock on the same repository.
   const results = [];
   for (const job of jobs) {
-    results.push(await runCommand("git", job[2], { cwd: workspacePath, timeoutMs: GIT_TIMEOUT_MS }));
+    results.push(await runGitCommand(job[2], { cwd: worktreeRoot, ...options }));
   }
   const failures = [];
   const out = {};
@@ -445,15 +473,15 @@ async function gitSnapshot(workspacePath) {
   };
 }
 
-async function committedDelta(workspacePath, beforeHead, afterHead) {
+async function committedDelta(worktreeRoot, beforeHead, afterHead, options = {}) {
   if (!afterHead || beforeHead === afterHead) return null;
   let range;
   if (beforeHead) {
     range = beforeHead + ".." + afterHead;
   } else {
-    const emptyTree = await runCommand("git", ["mktree"], {
-      cwd: workspacePath,
-      timeoutMs: GIT_TIMEOUT_MS,
+    const emptyTree = await runGitCommand(["mktree"], {
+      cwd: worktreeRoot,
+      ...options,
       stdinText: "",
     });
     const failure = snapshotFailure("git mktree", emptyTree);
@@ -462,11 +490,11 @@ async function committedDelta(workspacePath, beforeHead, afterHead) {
     }
     range = emptyTree.stdout.trim() + ".." + afterHead;
   }
-  const log = await runCommand("git", ["log", "--oneline", beforeHead ? range : afterHead], {
-    cwd: workspacePath, timeoutMs: GIT_TIMEOUT_MS,
+  const log = await runGitCommand(["log", "--oneline", beforeHead ? range : afterHead], {
+    cwd: worktreeRoot, ...options,
   });
-  const stat = await runCommand("git", ["diff", "--stat", range], {
-    cwd: workspacePath, timeoutMs: GIT_TIMEOUT_MS,
+  const stat = await runGitCommand(["diff", "--stat", range], {
+    cwd: worktreeRoot, ...options,
   });
   const failures = [snapshotFailure("git log", log), snapshotFailure("git diff --stat", stat)].filter(Boolean);
   if (failures.length > 0) throw new Error("committed delta unreliable: " + failures.join("; "));
@@ -502,19 +530,48 @@ async function listBackends() {
 // serialized so workers cannot interleave edits or snapshot each other.
 const workspaceLocks = new Map();
 const quarantinedWorkspaces = new Set();
-async function withWorkspaceLock(key, fn) {
+async function withWorkspaceLock(key, fn, { cancel = null, onCancelled = null } = {}) {
   const prev = workspaceLocks.get(key) ?? Promise.resolve();
+  const prevDone = prev.catch(() => {});
   let release;
   const gate = new Promise((r) => { release = r; });
-  const next = prev.catch(() => {}).then(() => gate);
+  const next = prevDone.then(() => gate);
   workspaceLocks.set(key, next);
-  await prev.catch(() => {});
+  const acquired = cancel
+    ? await Promise.race([prevDone.then(() => true), cancel.promise.then(() => false)])
+    : (await prevDone, true);
+  if (!acquired) {
+    release();
+    // Keep the already-resolved gate chained behind its predecessor until the
+    // predecessor releases. Deleting the map entry now would let a third
+    // request bypass the still-running first holder.
+    void next.finally(() => {
+      if (workspaceLocks.get(key) === next) workspaceLocks.delete(key);
+    });
+    return typeof onCancelled === "function" ? onCancelled() : undefined;
+  }
   try {
     return await fn();
   } finally {
     release();
     if (workspaceLocks.get(key) === next) workspaceLocks.delete(key);
   }
+}
+
+function createCancellation() {
+  let resolve;
+  const promise = new Promise((done) => { resolve = done; });
+  return {
+    controller: null,
+    cancelled: false,
+    promise,
+    cancel() {
+      if (this.cancelled) return;
+      this.cancelled = true;
+      resolve();
+      if (this.controller) void this.controller.terminate("cancelled");
+    },
+  };
 }
 
 function cancelledDelegation({ backend, workspacePath, worktreeRoot, spec, before = null }) {
@@ -555,8 +612,12 @@ async function delegateTask(rawArgs, cancel) {
   await requireGitRepo(workspacePath);
   const worktreeRoot = await gitWorktreeRoot(workspacePath);
   const lockKey = workspaceLockKey(worktreeRoot);
+  const timeoutMs = Number.isInteger(rawArgs.timeoutMs)
+    ? Math.min(MAX_TIMEOUT_MS, Math.max(MIN_TIMEOUT_MS, rawArgs.timeoutMs))
+    : DEFAULT_TIMEOUT_MS;
 
   return await withWorkspaceLock(lockKey, async () => {
+    const deadline = Date.now() + timeoutMs;
     if (quarantinedWorkspaces.has(lockKey)) {
       return {
         ok: false,
@@ -571,7 +632,25 @@ async function delegateTask(rawArgs, cancel) {
       return cancelledDelegation({ backend, workspacePath, worktreeRoot, spec });
     }
     const allowDirty = rawArgs.allowDirty === true;
-    const before = await gitSnapshot(worktreeRoot);
+    let before;
+    try {
+      before = await gitSnapshot(worktreeRoot, { cancel, deadline });
+    } catch (error) {
+      if (error instanceof OperationCancelledError) {
+        return cancelledDelegation({ backend, workspacePath, worktreeRoot, spec });
+      }
+      if (error instanceof DeadlineExceededError) {
+        return {
+          ok: false,
+          error: "delegation timed out during the preflight git snapshot; the worker never started",
+          backend, workspacePath, worktreeRoot, exitCode: null, timedOut: true, killed: false, cancelled: false,
+          treeTerminated: true, outputTail: "", stderrTail: "",
+          gitBefore: null, git: null, commits: null,
+          experimental: Boolean(spec.experimental),
+        };
+      }
+      throw error;
+    }
     if (cancel && cancel.cancelled) {
       return cancelledDelegation({ backend, workspacePath, worktreeRoot, spec, before });
     }
@@ -604,9 +683,6 @@ async function delegateTask(rawArgs, cancel) {
       };
     }
 
-    const timeoutMs = Number.isInteger(rawArgs.timeoutMs)
-      ? Math.min(MAX_TIMEOUT_MS, Math.max(MIN_TIMEOUT_MS, rawArgs.timeoutMs))
-      : DEFAULT_TIMEOUT_MS;
     const args = substituteArgs(template, rawArgs.task.trim(), rawArgs.resumeSessionId ?? "");
 
     // Cancellation can arrive while this request waits for the mutex or while
@@ -615,22 +691,56 @@ async function delegateTask(rawArgs, cancel) {
       return cancelledDelegation({ backend, workspacePath, worktreeRoot, spec, before });
     }
 
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      return {
+        ok: false,
+        error: "delegation timed out after preflight; the worker never started",
+        backend, workspacePath, worktreeRoot, exitCode: null, timedOut: true, killed: false, cancelled: false,
+        treeTerminated: true, outputTail: "", stderrTail: "",
+        gitBefore: before, git: before, commits: null,
+        experimental: Boolean(spec.experimental),
+      };
+    }
+    let workerController = null;
     const result = await runCommand(spec.command, args, {
       cwd: workspacePath,
-      timeoutMs,
+      timeoutMs: remaining,
       manageProcessTree: true,
       shouldCancel: () => Boolean(cancel && cancel.cancelled),
-      onChild: (controller) => { if (cancel) cancel.controller = controller; },
+      onChild: (controller) => {
+        workerController = controller;
+        if (cancel) cancel.controller = controller;
+      },
     });
+    if (cancel?.controller === workerController) cancel.controller = null;
     if (!result.treeTerminated) quarantinedWorkspaces.add(lockKey);
-    const after = result.treeTerminated ? await gitSnapshot(worktreeRoot) : before;
-    const commits = result.treeTerminated ? await committedDelta(worktreeRoot, before.head, after.head) : null;
+    let after = null;
+    let commits = null;
+    let postRunDeadlineExceeded = false;
+    if (result.treeTerminated) {
+      try {
+        after = await gitSnapshot(worktreeRoot, { cancel, deadline });
+        commits = await committedDelta(worktreeRoot, before.head, after.head, { cancel, deadline });
+      } catch (error) {
+        if (error instanceof OperationCancelledError) {
+          // The worker is already stopped; report cancellation without a
+          // misleading partial snapshot assembled from interrupted Git calls.
+          after = null;
+        } else if (error instanceof DeadlineExceededError) {
+          postRunDeadlineExceeded = true;
+          after = null;
+        } else {
+          throw error;
+        }
+      }
+    }
     let error = "";
     if (!result.treeTerminated) {
       error = "backend process tree could not be confirmed terminated; the workspace is quarantined until the bridge restarts";
     } else if (cancel && cancel.cancelled) {
-      error = "delegation cancelled by client";
-    } else if (result.timedOut) {
+      error = "delegation cancelled by client; post-run snapshot may be unavailable";
+    } else if (result.timedOut || postRunDeadlineExceeded) {
       error = "backend \"" + backend + "\" timed out after " + timeoutMs + " ms" + (result.killed ? " and was force-killed" : "");
     } else if (result.orphanedProcesses) {
       error = "backend exited while descendant processes were still running; the bridge terminated the remaining process tree";
@@ -645,7 +755,7 @@ async function delegateTask(rawArgs, cancel) {
       workspacePath,
       worktreeRoot,
       exitCode: result.exitCode,
-      timedOut: result.timedOut,
+      timedOut: result.timedOut || postRunDeadlineExceeded,
       killed: result.killed,
       cancelled: Boolean(cancel && cancel.cancelled),
       orphanedProcesses: result.orphanedProcesses,
@@ -658,6 +768,9 @@ async function delegateTask(rawArgs, cancel) {
       commits,
       experimental: Boolean(spec.experimental),
     };
+  }, {
+    cancel,
+    onCancelled: () => cancelledDelegation({ backend, workspacePath, worktreeRoot, spec }),
   });
 }
 
@@ -693,6 +806,34 @@ function jsonRpcError(id, code, message) { return { jsonrpc: "2.0", id, error: {
 // notifications/cancelled can terminate the worker process.
 const activeRequests = new Map();
 
+async function terminateActiveRequests(reason = "shutdown") {
+  const waits = [];
+  for (const { cancel } of activeRequests.values()) {
+    const controller = cancel.controller;
+    cancel.cancel();
+    if (controller) waits.push(controller.terminate(reason));
+  }
+  await Promise.allSettled(waits);
+}
+
+function installShutdownHandlers(stdin) {
+  let shuttingDown = false;
+  const shutdown = (exitCode) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    void terminateActiveRequests().finally(() => process.exit(exitCode));
+  };
+  process.once("SIGTERM", () => shutdown(0));
+  process.once("SIGINT", () => shutdown(130));
+  stdin.once("end", () => shutdown(0));
+  stdin.once("close", () => shutdown(0));
+  // Last-chance best effort. On POSIX, controller.terminate signals the
+  // detached process group synchronously before its first await.
+  process.once("exit", () => {
+    for (const { cancel } of activeRequests.values()) cancel.cancel();
+  });
+}
+
 async function handleMessage(message) {
   if (!message || typeof message !== "object" || message.jsonrpc !== "2.0") {
     return jsonRpcError(null, -32600, "Invalid JSON-RPC request");
@@ -701,10 +842,7 @@ async function handleMessage(message) {
     const requestId = message.params?.requestId ?? message.params?.id;
     const entry = activeRequests.get(requestId);
     if (entry && entry.cancel) {
-      entry.cancel.cancelled = true;
-      if (entry.cancel.controller) {
-        void entry.cancel.controller.terminate("cancelled");
-      }
+      entry.cancel.cancel();
     }
     return null;
   }
@@ -749,16 +887,18 @@ async function handleMessage(message) {
           const workspacePath = await validateWorkspace(args.workspacePath);
           await requireGitRepo(workspacePath);
           const worktreeRoot = await gitWorktreeRoot(workspacePath);
-          const git = await withWorkspaceLock(workspaceLockKey(worktreeRoot), () => gitSnapshot(worktreeRoot));
-          return jsonRpcResult(message.id, {
-            content: [{ type: "text", text: textResult("Workspace Status", { workspacePath, git }) }],
-            structuredContent: { ok: true, workspacePath, worktreeRoot, git },
+          const lockKey = workspaceLockKey(worktreeRoot);
+          return await withWorkspaceLock(lockKey, async () => {
+            const git = await gitSnapshot(worktreeRoot);
+            return jsonRpcResult(message.id, {
+              content: [{ type: "text", text: textResult("Workspace Status", { workspacePath, worktreeRoot, git }) }],
+              structuredContent: { ok: true, workspacePath, worktreeRoot, git },
+            });
           });
         }
         if (params.name === "delegate_task") {
-          const cancel = { controller: null, cancelled: false };
-          const entry = { cancel };
-          activeRequests.set(message.id, entry);
+          const cancel = createCancellation();
+          activeRequests.set(message.id, { cancel });
           try {
             const out = await delegateTask(args, cancel);
             return jsonRpcResult(message.id, {
@@ -767,7 +907,7 @@ async function handleMessage(message) {
               isError: !out.ok,
             });
           } finally {
-            if (activeRequests.get(message.id) === entry) activeRequests.delete(message.id);
+            activeRequests.delete(message.id);
           }
         }
         return jsonRpcError(message.id, -32602, "Unknown tool: " + params.name);
@@ -809,4 +949,5 @@ function startStdioServer({ stdin = process.stdin, stdout = process.stdout } = {
 
 if (process.argv[1] && process.argv[1] === fileURLToPath(import.meta.url)) {
   startStdioServer();
+  installShutdownHandlers(process.stdin);
 }

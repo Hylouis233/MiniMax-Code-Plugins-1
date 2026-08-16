@@ -121,6 +121,9 @@ you already obtained a valid ID from that backend outside this Plugin.
   the workspace mutex. If termination cannot be confirmed, the bridge quarantines that worktree
   and refuses further delegations until the server is restarted and leftover processes are
   checked.
+- timeoutMs is an overall deadline that starts after the workspace lock is acquired and covers
+  preflight Git checks, the worker, and post-run snapshots. Safe process-tree termination can
+  extend beyond that deadline by the documented kill grace period.
 - zcode and dsh backends are experimental: ZCode desktop builds have no verified headless CLI,
   and dsh needs a headless profile present under DSH_HOME/profiles.
 - Custom wrapper shims that re-bind dashed flags can misreport a backend as unavailable; point

@@ -50,8 +50,10 @@ inside the target git repository, and their results come back as a git diff for 
   created are listed under changed files even though they do not appear in git diff --stat.
 - Run independent or comparison workers in separate clean Git worktrees at the same starting
   commit. A second run in one checkout inherits the first run's edits and is not independent.
-- Timeouts: the default is 20 minutes; adjust timeoutMs for very large tasks. A timed-out worker
-  has its complete process tree terminated before the workspace lock is released.
+- Timeouts: the default is 20 minutes; adjust timeoutMs for very large tasks. The deadline starts
+  after lock acquisition and covers preflight Git checks, the worker, and post-run snapshots. A
+  timed-out worker has its complete process tree terminated before the lock is released; safe
+  termination may use the additional kill grace period.
 - Cancellation: cancelling an in-flight delegate_task call terminates the complete worker process
   tree and the result reports cancelled=true. If tree termination cannot be confirmed, the bridge
   quarantines the worktree and blocks another worker until restart. The workspace may still contain
