@@ -351,8 +351,11 @@ test("worker state updates honour the delegation cancellation and deadline", asy
   await assert.rejects(execFileAsync("git", ["rev-parse", "--verify", workspaceLockRef(key)], { cwd: repo }), /Command failed/u);
 });
 
-test("initial acquisition CAS obeys cancellation while a Git hook blocks", async (context) => {
-  if (process.platform === "win32") return; // executable hook setup is POSIX-specific
+test("initial acquisition CAS obeys cancellation while a Git hook blocks", {
+  // This fixture depends on Linux's executable-hook and process interruption
+  // semantics. macOS Git installations may disable or sandbox this hook path.
+  skip: process.platform !== "linux",
+}, async (context) => {
   const repo = await makeRepo(context);
   const gitDirectory = path.resolve(repo, await git(repo, ["rev-parse", "--git-dir"]));
   const hook = path.join(gitDirectory, "hooks", "reference-transaction");

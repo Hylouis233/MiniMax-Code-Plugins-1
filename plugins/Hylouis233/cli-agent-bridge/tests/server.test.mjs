@@ -819,8 +819,11 @@ test("changedFiles preserves unusual names and scans from the worktree root", as
   assert.equal(status.result.structuredContent.worktreeRoot, await realpath(workspace));
 });
 
-test("changedFiles losslessly represents non-UTF-8 Git path bytes", async (context) => {
-  if (process.platform === "win32") return; // Windows filenames are Unicode, not arbitrary byte strings
+test("changedFiles losslessly represents non-UTF-8 Git path bytes", {
+  // Linux filesystems expose arbitrary byte names. macOS normalizes/rejects
+  // invalid UTF-8 (EILSEQ), and Windows filenames use Unicode APIs.
+  skip: process.platform !== "linux",
+}, async (context) => {
   const { workspace, client } = await makeHarness(context);
   const rawName = Buffer.from([0x62, 0x61, 0x64, 0x2d, 0x80, 0x2e, 0x74, 0x78, 0x74]);
   const rawPath = Buffer.concat([Buffer.from(workspace), Buffer.from(path.sep), rawName]);
