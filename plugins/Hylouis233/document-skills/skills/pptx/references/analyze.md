@@ -72,7 +72,7 @@ for kind, face in theme_faces.items():
 
 # 2. Per run: explicit value, else paragraph defaults, else report as inherited.
 for i, slide in enumerate(prs.slides):
-    for shape in slide.shapes:
+    for shape in iter_shapes(slide.shapes):
         if not shape.has_text_frame:
             continue
         for paragraph in shape.text_frame.paragraphs:

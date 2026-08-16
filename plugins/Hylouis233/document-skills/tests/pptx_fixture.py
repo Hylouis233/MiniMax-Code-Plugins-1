@@ -102,6 +102,7 @@ prs6 = Presentation()
 slide6 = prs6.slides.add_slide(prs6.slide_layouts[5])
 pic_holder = slide6.shapes.add_textbox(Inches(1), Inches(1), Inches(4), Inches(1))
 pic_holder.text_frame.text = "nested member"
+pic_holder.text_frame.paragraphs[0].runs[0].font.name = "Grouped Face"
 
 GRP = (
     '<p:grpSp xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" '
@@ -137,6 +138,15 @@ check(
     "top-level shapes list hides the nested member (negative control)",
     not any(getattr(sh, "text_frame", None) is not None and sh.text_frame.text == "nested member" for sh in slide6.shapes),
 )
+grouped_faces = [
+    run.font.name
+    for shape in iter_shapes(slide6.shapes)
+    if shape.has_text_frame
+    for paragraph in shape.text_frame.paragraphs
+    for run in paragraph.runs
+    if run.font.name
+]
+check("font triage reaches runs nested in groups", "Grouped Face" in grouped_faces, grouped_faces)
 
 # ---- edit.md locator: candidate collection must recurse into groups ------------
 old_w, new_w = "nested member", "renamed member"

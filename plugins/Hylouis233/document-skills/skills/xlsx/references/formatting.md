@@ -69,11 +69,12 @@ one you took:
    ws2.append(["Region", "Units", "Revenue"])
 
    def sheet_ref(sheet):
-       # Excel escapes an apostrophe inside a quoted sheet title by doubling it.
+       # Always quote: valid titles such as Q1-Data are ambiguous when left bare.
+       # Excel escapes an apostrophe inside a quoted title by doubling it.
        escaped = sheet.title.replace("'", "''")
-       return f"'{escaped}'!" if any(c in sheet.title for c in " !'") else f"{escaped}!"
+       return f"'{escaped}'!"
 
-   src = sheet_ref(ws)                              # e.g. "Sales!" or "'Raw Data'!"
+   src = sheet_ref(ws)                              # e.g. "'Sales'!" or "'Raw Data'!"
    regions = sorted({r[0] for r in ws.iter_rows(min_row=2, min_col=1, values_only=True) if r[0]})
    for i, region in enumerate(regions, start=2):
        ws2.cell(row=i, column=1, value=region)

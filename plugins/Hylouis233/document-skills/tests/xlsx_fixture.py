@@ -121,7 +121,7 @@ agg = wb_f.create_sheet("ByRegion")
 
 def sheet_ref(sheet):
     escaped = sheet.title.replace("'", "''")
-    return f"'{escaped}'!" if any(c in sheet.title for c in " !'") else f"{escaped}!"
+    return f"'{escaped}'!"
 
 
 ref = sheet_ref(src)
@@ -141,6 +141,12 @@ check(
     apostrophe_formula == "=SUM('O''Brien'!A:A)",
     apostrophe_formula,
 )
+hyphen_sheet = wb_f.create_sheet("Q1-Data")
+hyphen_sheet["A1"] = 1
+agg["B4"] = f"=SUM({sheet_ref(hyphen_sheet)}A:A)"
+wb_f.save("hyphen-agg.xlsx")
+hyphen_formula = openpyxl.load_workbook("hyphen-agg.xlsx")["ByRegion"]["B4"].value
+check("ambiguous punctuation is protected by quoting", hyphen_formula == "=SUM('Q1-Data'!A:A)", hyphen_formula)
 
 # and the edit itself still works after the warning path
 wb2 = openpyxl.load_workbook("plain.xlsx")
