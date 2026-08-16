@@ -31,10 +31,11 @@ for sheet_name in value_wb.sheetnames:
     if value_ws.max_row in (None, 0) or declared in ("A1:A1", "A1"):
         value_ws.reset_dimensions()
         formula_ws.reset_dimensions()
+        discovered = value_ws.calculate_dimension(force=True)
         print(f"--- {sheet_name} --- implausible dimension {declared!r}; reset, real extent:")
-    # reset_dimensions() makes a read-only worksheet unsized; force=True scans
-    # the stream to rebuild its bounds instead of raising "Worksheet is unsized".
-    print(f"--- {sheet_name} --- dims:", value_ws.calculate_dimension(force=True))
+    else:
+        discovered = declared
+    print(f"--- {sheet_name} --- dims:", discovered)
 
     rows = value_ws.iter_rows(values_only=True)
     header = next(rows, None)

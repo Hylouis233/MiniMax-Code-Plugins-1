@@ -236,6 +236,21 @@ def iter_shapes(shapes):
             yield shape
 
 
+def table_cells(table):
+    return [[
+        {
+            "row": row_index,
+            "column": column_index,
+            "text": None if cell.is_spanned else cell.text,
+            "is_merge_origin": cell.is_merge_origin,
+            "is_spanned": cell.is_spanned,
+            "span_width": cell.span_width,
+            "span_height": cell.span_height,
+        }
+        for column_index, cell in enumerate(row.cells)
+    ] for row_index, row in enumerate(table.rows)]
+
+
 def cached_numeric_points(source):
     if source is None:
         return None
@@ -272,13 +287,7 @@ def extract_slide_content(slide):
     shapes = list(iter_shapes(slide.shapes))
     text = [sh.text_frame.text for sh in shapes if sh.has_text_frame and sh.text_frame.text]
     tables = [
-        [[{
-            "text": cell.text,
-            "is_merge_origin": cell.is_merge_origin,
-            "is_spanned": cell.is_spanned,
-            "span_width": cell.span_width,
-            "span_height": cell.span_height,
-        } for cell in row.cells] for row in sh.table.rows]
+        table_cells(sh.table)
         for sh in shapes if sh.has_table
     ]
     charts = []
@@ -329,19 +338,35 @@ check("content inventory emits bubble x/y/size points",
       == [(0, 5.0)])
 check("content inventory emits notes text", "regional split" in content["notes"], content["notes"])
 
-merge_prs = Presentation()
-merge_slide = merge_prs.slides.add_slide(merge_prs.slide_layouts[6])
-merge_shape = merge_slide.shapes.add_table(2, 3, 0, 0, 4000000, 2000000)
-merge_origin = merge_shape.table.cell(0, 0)
-merge_origin.text = "Merged heading"
-merge_origin.merge(merge_shape.table.cell(0, 1))
-merged_inventory = extract_slide_content(merge_slide)["tables"][0][0]
+merged_prs = Presentation()
+merged_slide = merged_prs.slides.add_slide(merged_prs.slide_layouts[6])
+merged_table = merged_slide.shapes.add_table(
+    3, 3, Inches(1), Inches(1), Inches(6), Inches(3)
+).table
+merged_table.cell(0, 0).text = "Merged heading"
+merged_table.cell(0, 0).merge(merged_table.cell(1, 1))
+merged_table.cell(2, 0).text = "ordinary cell"
+merged_prs.save("merged-table.pptx")
+merged_inventory = extract_slide_content(
+    Presentation("merged-table.pptx").slides[0]
+)["tables"][0]
+merged_origin = merged_inventory[0][0]
+covered_slots = [merged_inventory[0][1], merged_inventory[1][0], merged_inventory[1][1]]
 check(
-    "table inventory preserves merge origin and span metadata",
-    merged_inventory[0]["is_merge_origin"]
-    and merged_inventory[0]["span_width"] == 2
-    and merged_inventory[0]["span_height"] == 1
-    and merged_inventory[1]["is_spanned"],
+    "table inventory records a merged origin and its row/column spans",
+    merged_origin["is_merge_origin"]
+    and not merged_origin["is_spanned"]
+    and merged_origin["span_height"] == 2
+    and merged_origin["span_width"] == 2,
+    merged_origin,
+)
+check(
+    "table inventory marks covered slots without repeating merged text",
+    all(item["is_spanned"] and item["text"] is None for item in covered_slots)
+    and sum(
+        item["text"] == "Merged heading"
+        for row in merged_inventory for item in row
+    ) == 1,
     merged_inventory,
 )
 

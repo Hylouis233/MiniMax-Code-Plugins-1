@@ -421,8 +421,9 @@ check("defined-name adapter supports openpyxl 3.0 collections",
 formula_only = openpyxl.Workbook()
 formula_only.active["A1"] = "=Data!A5"
 check("structural guard sees formulas before row insertion",
-      any(reference[0] == "cell formula"
-          for reference in structural_references(formula_only)))
+      structural_references(formula_only)
+      == [("cell formula", "Sheet!A1", "=Data!A5")],
+      structural_references(formula_only))
 
 # and the edit itself still works after the warning path
 wb2 = openpyxl.load_workbook("plain.xlsx")
@@ -611,11 +612,16 @@ check("corrupted dimension truncates streaming (negative control)",
       dim_ws_ro.max_row == 1, dim_ws_ro.max_row)
 streamed_before_reset = [row for row in dim_ws_ro.iter_rows(values_only=True)]
 dim_ws_ro.reset_dimensions()
-forced_extent = dim_ws_ro.calculate_dimension(force=True)
+try:
+    dim_ws_ro.calculate_dimension()
+    unforced_dimension_rejected = False
+except ValueError:
+    unforced_dimension_rejected = True
+forced_dimension = dim_ws_ro.calculate_dimension(force=True)
 streamed_after_reset = [row for row in dim_ws_ro.iter_rows(values_only=True)]
 dim_value.close()
-check("forced dimension calculation sizes a reset read-only sheet",
-      forced_extent == "A1:B3", forced_extent)
+check("reset dimensions require an explicit force scan before reporting extent",
+      unforced_dimension_rejected and forced_dimension == "A1:B3", forced_dimension)
 check("reset_dimensions restores the real extent",
       len(streamed_after_reset) == 3 and streamed_after_reset[2] == (3, 4),
       (len(streamed_before_reset), streamed_after_reset[-1]))

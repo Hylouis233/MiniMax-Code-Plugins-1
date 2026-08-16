@@ -15,6 +15,21 @@ def iter_shapes(shapes):
         else:
             yield shape
 
+def table_cells(table):
+    """Inventory the grid without repeating a merged cell's text in covered slots."""
+    return [[
+        {
+            "row": row_index,
+            "column": column_index,
+            "text": None if cell.is_spanned else cell.text,
+            "is_merge_origin": cell.is_merge_origin,
+            "is_spanned": cell.is_spanned,
+            "span_width": cell.span_width,
+            "span_height": cell.span_height,
+        }
+        for column_index, cell in enumerate(row.cells)
+    ] for row_index, row in enumerate(table.rows)]
+
 def cached_numeric_points(source):
     """Return indexed cached points, or None when the cache metadata is unavailable."""
     if source is None:
@@ -55,13 +70,7 @@ for i, slide in enumerate(prs.slides):
     shapes = list(iter_shapes(slide.shapes))   # flattened; groups are common in template decks
     text = [sh.text_frame.text for sh in shapes if sh.has_text_frame and sh.text_frame.text]
     tables = [
-        [[{
-            "text": cell.text,
-            "is_merge_origin": cell.is_merge_origin,
-            "is_spanned": cell.is_spanned,
-            "span_width": cell.span_width,
-            "span_height": cell.span_height,
-        } for cell in row.cells] for row in sh.table.rows]
+        table_cells(sh.table)
         for sh in shapes if sh.has_table
     ]
     charts = []
