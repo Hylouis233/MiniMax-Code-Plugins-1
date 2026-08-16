@@ -57,6 +57,36 @@ unsafe_wb = openpyxl.Workbook()
 unsafe_wb.active["A1"] = formula_looking
 check("plain assignment is proven unsafe (negative control)", unsafe_wb.active["A1"].data_type == "f")
 
+CSV_FORMULA_PREFIXES = ("=", "+", "-", "@")
+
+
+def spreadsheet_csv_field(value, *, mode="safe"):
+    if mode not in {"safe", "raw"}:
+        raise ValueError("mode must be 'safe' or 'raw'")
+    if mode == "safe" and isinstance(value, str) and value.startswith(CSV_FORMULA_PREFIXES):
+        return "'" + value
+    return value
+
+
+formula_like_fields = ["=1+1", "+SUM(A1:A2)", "-2+3", "@cmd", "plain", "-7", -7]
+with open("spreadsheet-safe.csv", "w", newline="", encoding="utf-8") as output:
+    csv.writer(output).writerow([spreadsheet_csv_field(value) for value in formula_like_fields])
+with open("spreadsheet-safe.csv", newline="", encoding="utf-8") as exported:
+    safe_fields = next(csv.reader(exported))
+check("spreadsheet-safe CSV neutralizes all four formula prefixes",
+      safe_fields[:4] == ["'=1+1", "'+SUM(A1:A2)", "'-2+3", "'@cmd"], safe_fields)
+check("safe CSV preserves benign text and numeric values",
+      safe_fields[4:] == ["plain", "'-7", "-7"], safe_fields[4:])
+check("raw CSV mode preserves exact formula-like literal strings",
+      [spreadsheet_csv_field(value, mode="raw") for value in formula_like_fields[:4]]
+      == formula_like_fields[:4])
+try:
+    spreadsheet_csv_field("=1+1", mode="unknown")
+    invalid_csv_mode_rejected = False
+except ValueError:
+    invalid_csv_mode_rejected = True
+check("CSV export rejects an ambiguous safety mode", invalid_csv_mode_rejected)
+
 # ---- edit.md snippet: round_trip_changes detects dropped parts AND stripped extensions ----
 
 wb = openpyxl.Workbook()
@@ -541,6 +571,11 @@ wb_h = openpyxl.Workbook()
 wb_h.active.title = "First"
 wb_h.active["A1"] = "=1+1"
 wb_h.active["A2"] = ArrayFormula("A2:A3", "=ROW(A2:A3)")
+wb_h.active["C1"] = "=literal"
+wb_h.active["C1"].data_type = "s"
+wb_h.active["D1"] = "+literal"
+wb_h.active["E1"] = "-literal"
+wb_h.active["F1"] = "@literal"
 second = wb_h.create_sheet("Second")
 second["A1"] = "plain"
 second["A2"] = "=2+2"
@@ -561,42 +596,34 @@ data_table_entry = next(item for item in uncached if item[:2] == ("Second", "B1"
 check("data-table formulas have stable diagnostic text",
       data_table_entry[2].startswith("DataTableFormula(ref='B1:B2', r1='C1'")
       and "0x" not in data_table_entry[2], data_table_entry)
+formula_wb.close()
+value_wb.close()
 
 # csv.md: value export uses the cached-value workbook and reports every missing cache.
-formula_wb["First"].reset_dimensions()
-value_wb["First"].reset_dimensions()
-
-def spreadsheet_safe_csv_value(value):
-    if isinstance(value, str) and value.startswith(("=", "+", "-", "@")):
-        return "'" + value
-    return value
-
-
+formula_wb = openpyxl.load_workbook("multi.xlsx", read_only=True, data_only=False)
+value_wb = openpyxl.load_workbook("multi.xlsx", read_only=True, data_only=True)
+formula_ws, value_ws = formula_wb["First"], value_wb["First"]
+formula_ws.reset_dimensions()
+value_ws.reset_dimensions()
 missing_caches = []
+export_mode = "safe"
 with open("formula-values.csv", "w", newline="", encoding="utf-8") as output:
     writer = csv.writer(output)
-    for formula_row, value_row in zip(formula_wb["First"].iter_rows(), value_wb["First"].iter_rows()):
+    for formula_row, value_row in zip(formula_ws.iter_rows(), value_ws.iter_rows()):
         for formula_cell, value_cell in zip(formula_row, value_row):
             if formula_cell.data_type == "f" and value_cell.value is None:
                 missing_caches.append(formula_cell.coordinate)
-        writer.writerow([spreadsheet_safe_csv_value(cell.value) for cell in value_row])
+        writer.writerow([
+            spreadsheet_csv_field(cell.value, mode=export_mode) for cell in value_row
+        ])
 with open("formula-values.csv", newline="", encoding="utf-8") as exported:
     exported_values = [value for row in csv.reader(exported) for value in row]
 check("XLSX-to-CSV reports formulas with no cached value", set(missing_caches) >= {"A1", "A2"}, missing_caches)
 check("XLSX-to-CSV does not leak formula strings into value output",
       not any(value.startswith("=") for value in exported_values), exported_values)
-
-formula_like_literals = ["=1+1", "+cmd", "-2+3", "@SUM(A1:A2)", -5]
-with open("formula-like-literals.csv", "w", newline="", encoding="utf-8") as output:
-    csv.writer(output).writerow([
-        spreadsheet_safe_csv_value(value) for value in formula_like_literals
-    ])
-with open("formula-like-literals.csv", newline="", encoding="utf-8") as exported:
-    safe_literals = next(csv.reader(exported))
-check("spreadsheet-targeted CSV neutralizes every formula-like text prefix",
-      safe_literals[:4] == ["'=1+1", "'+cmd", "'-2+3", "'@SUM(A1:A2)"], safe_literals)
-check("CSV neutralization leaves numeric negative values numeric",
-      safe_literals[4] == "-5", safe_literals)
+check("XLSX-to-CSV safe mode neutralizes cached literal text for spreadsheet consumers",
+      {"'=literal", "'+literal", "'-literal", "'@literal"} <= set(exported_values),
+      exported_values)
 formula_wb.close()
 value_wb.close()
 
@@ -654,12 +681,18 @@ check("prefix markers are provably blind to custom prefixes (negative control)",
       not any(marker in custom_prefix_sheet for marker in legacy_prefix_markers))
 
 # ---- formatting.md guard: header-only sheets skip conditional formatting ---------
-def add_demo_formatting(sheet):
-    last = next(
-        (row for row in range(sheet.max_row, 1, -1)
-         if any(sheet.cell(row, column).value is not None for column in range(1, 7))),
-        1,
+def last_populated_row(sheet, *, first_data_row=2, min_col=1, max_col=6):
+    populated_rows = (
+        cell.row for cell in sheet._cells.values()
+        if first_data_row <= cell.row
+        and min_col <= cell.column <= max_col
+        and cell.value is not None
     )
+    return max(populated_rows, default=first_data_row - 1)
+
+
+def add_demo_formatting(sheet):
+    last = last_populated_row(sheet)
     if last < 2:
         return 0
     sheet.conditional_formatting.add(
@@ -682,6 +715,7 @@ def add_demo_formatting(sheet):
 header_wb = openpyxl.Workbook()
 header_ws = header_wb.active
 header_ws.append(["A", "B", "C", "D", "E", "F"])
+header_ws["F100"].number_format = "0.00"  # styled empty cell inflates max_row
 try:
     header_ws.conditional_formatting.add(
         "D2:D1", CellIsRule(operator="lessThan", formula=["0"]),
@@ -690,6 +724,8 @@ try:
 except (TypeError, ValueError):
     inverted_range_rejected = True
 check("unguarded header-only range is rejected (negative control)", inverted_range_rejected)
+check("style-only ghost row inflates max_row (negative control)", header_ws.max_row == 100)
+check("populated-row scan ignores a style-only ghost row", last_populated_row(header_ws) == 1)
 check("header-only guard skips all four formatting rules", add_demo_formatting(header_ws) == 0)
 header_wb.save("header-only-formatting.xlsx")
 header_reopened = openpyxl.load_workbook("header-only-formatting.xlsx")
@@ -700,12 +736,11 @@ data_wb = openpyxl.Workbook()
 data_ws = data_wb.active
 data_ws.append(["A", "B", "C", "D", "E", "F"])
 data_ws.append([1, 2, 3, -1, 5, 6])
-data_ws["F10000"].number_format = "0.00"  # inflate max_row without adding data
+data_ws["F100"].number_format = "0.00"
 check("data rows receive all four formatting rules", add_demo_formatting(data_ws) == 4)
-formatting_ranges = [str(item.sqref) for item in data_ws.conditional_formatting]
-check("conditional formatting ignores a styled ghost row",
-      all("10000" not in item and item.endswith("2") for item in formatting_ranges),
-      formatting_ranges)
+data_ranges = {str(item.sqref) for item in data_ws.conditional_formatting}
+check("conditional formatting stops at the last populated row despite ghost styles",
+      data_ranges == {"D2", "A2:F2", "C2", "E2"}, data_ranges)
 data_wb.save("data-formatting.xlsx")
 data_reopened = openpyxl.load_workbook("data-formatting.xlsx")
 check("all four formatting rules survive save/reopen",
@@ -774,6 +809,25 @@ check("reset_dimensions restores the real extent",
       and len(streamed_after_reset) == 4
       and streamed_after_reset[2][:2] == (3, 4),
       (len(streamed_before_reset), streamed_after_reset[-1]))
+
+csv_formula_wb = openpyxl.load_workbook("dimension.xlsx", read_only=True, data_only=False)
+csv_value_wb = openpyxl.load_workbook("dimension.xlsx", read_only=True, data_only=True)
+csv_formula_ws, csv_value_ws = csv_formula_wb.active, csv_value_wb.active
+check("both CSV source streams initially trust the truncated dimension (negative control)",
+      csv_formula_ws.calculate_dimension() == "A1:B2"
+      and csv_value_ws.calculate_dimension() == "A1:B2")
+csv_formula_ws.reset_dimensions()
+csv_value_ws.reset_dimensions()
+csv_stream_rows = list(zip(csv_formula_ws.iter_rows(), csv_value_ws.iter_rows()))
+check("CSV export resets both paired streams before iterating",
+      len(csv_stream_rows) == 4
+      and len(csv_stream_rows[-1][0]) == 3
+      and len(csv_stream_rows[-1][1]) == 3
+      and csv_stream_rows[-1][0][2].data_type == "f"
+      and csv_stream_rows[-1][1][2].value is None,
+      [(len(formula_row), len(value_row)) for formula_row, value_row in csv_stream_rows])
+csv_formula_wb.close()
+csv_value_wb.close()
 
 empty_dimension_wb = openpyxl.Workbook()
 empty_dimension_wb.save("empty-dimension.xlsx")

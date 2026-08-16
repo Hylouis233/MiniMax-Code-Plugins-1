@@ -98,21 +98,29 @@ with open("encrypted.pdf", "wb") as f:
     encrypted_writer.write(f)
 probe = pypdf.PdfReader("encrypted.pdf")
 check("encrypted fixture is detected before page access", probe.is_encrypted)
-encrypted_r = pypdf.PdfReader("encrypted.pdf", password="fixture-password")
+
+
+def postcheck_reader(path, password=None):
+    reader = pypdf.PdfReader(path)
+    if reader.is_encrypted and reader.decrypt("") == 0:
+        if password is None or reader.decrypt(password) == 0:
+            raise RuntimeError(f"valid password required to postcheck {path}")
+    return reader
+
+
+encrypted_r = postcheck_reader("encrypted.pdf", "fixture-password")
 check("password-authenticated postcheck can access every page", len(encrypted_r.pages) == 2)
 
 blank_password_writer = pypdf.PdfWriter()
 blank_password_writer.append(r)
 blank_password_writer.encrypt("", owner_password="fixture-owner-password")
-with open("blank-password-encrypted.pdf", "wb") as f:
+with open("blank-user-password.pdf", "wb") as f:
     blank_password_writer.write(f)
-blank_password_reader = pypdf.PdfReader("blank-password-encrypted.pdf")
-if blank_password_reader.is_encrypted and blank_password_reader.decrypt("") == 0:
-    blank_password_opened = False
-else:
-    blank_password_opened = len(blank_password_reader.pages) == 2
-check("postcheck accepts permission encryption with an empty user password",
-      blank_password_opened)
+blank_password_probe = pypdf.PdfReader("blank-user-password.pdf")
+check("blank-user-password fixture still reports encryption", blank_password_probe.is_encrypted)
+blank_password_r = postcheck_reader("blank-user-password.pdf")
+check("postcheck tries the empty user password before requiring PDF_PASSWORD",
+      len(blank_password_r.pages) == 2)
 try:
     open_pdf("encrypted.pdf")
     transform_rejected_missing_password = False
@@ -243,28 +251,12 @@ def widget_field_name(widget):
         if object_id in seen:
             raise ValueError("cycle in AcroForm field parent chain")
         seen.add(object_id)
-        if widget.get("/T") is not None:
-            parts.append(str(widget["/T"]))
+        partial_name = widget.get("/T")
+        if partial_name is not None:
+            parts.append(str(partial_name))
         parent = widget.get("/Parent")
         widget = None if parent is None else parent.get_object()
-    return ".".join(reversed(parts)) or None
-
-
-class DirectObjectReference:
-    def __init__(self, value):
-        self.value = value
-
-    def get_object(self):
-        return self.value
-
-
-field_parent = {"/T": "application"}
-hierarchical_widget = {
-    "/T": "applicant_name",
-    "/Parent": DirectObjectReference(field_parent),
-}
-check("widget lookup resolves a fully qualified hierarchical field name",
-      widget_field_name(hierarchical_widget) == "application.applicant_name")
+    return ".".join(reversed(parts)) if parts else None
 
 
 page2_writer = PdfWriter()
@@ -292,6 +284,59 @@ check("form fill locates the widget page before updating",
       len(target_pages) == 1 and target_pages[0] is page2_writer.pages[1], len(target_pages))
 check("page-2 field value round-trips", page2_value.strip("/") == "Ada on page 2",
       repr(page2_value))
+
+# A hierarchical field stores one partial /T at each level. Build a non-terminal
+# `application` parent around the page-2 widget and address the terminal field by
+# the fully qualified name returned by get_fields().
+from pypdf.generic import ArrayObject, DictionaryObject, NameObject, TextStringObject
+
+hierarchy_writer = PdfWriter()
+hierarchy_writer.append(PdfReader("form-page2.pdf"))
+hierarchy_widget_ref = hierarchy_writer.pages[1]["/Annots"][0]
+hierarchy_widget = hierarchy_widget_ref.get_object()
+hierarchy_parent = DictionaryObject({
+    NameObject("/T"): TextStringObject("application"),
+    NameObject("/Kids"): ArrayObject([hierarchy_widget_ref]),
+})
+hierarchy_parent_ref = hierarchy_writer._add_object(hierarchy_parent)
+hierarchy_widget[NameObject("/Parent")] = hierarchy_parent_ref
+hierarchy_acroform = hierarchy_writer._root_object["/AcroForm"]
+hierarchy_acroform[NameObject("/Fields")] = ArrayObject([hierarchy_parent_ref])
+with open("hierarchical-form.pdf", "wb") as f:
+    hierarchy_writer.write(f)
+
+hierarchy_reader = PdfReader("hierarchical-form.pdf")
+hierarchical_field_name = "application.applicant_name"
+check("get_fields exposes the fully qualified hierarchical field name",
+      hierarchical_field_name in (hierarchy_reader.get_fields() or {}),
+      list((hierarchy_reader.get_fields() or {}).keys()))
+
+hierarchy_fill_writer = PdfWriter()
+hierarchy_fill_writer.append(hierarchy_reader)
+hierarchy_target_pages = [
+    page for page in hierarchy_fill_writer.pages
+    if any(
+        (widget := ref.get_object()).get("/Subtype") == "/Widget"
+        and widget_field_name(widget) == hierarchical_field_name
+        for ref in (page.get("/Annots") or [])
+    )
+]
+for target_page in hierarchy_target_pages:
+    hierarchy_fill_writer.update_page_form_field_values(
+        target_page, {hierarchical_field_name: "Ada Hierarchical"},
+    )
+with open("hierarchical-form-filled.pdf", "wb") as f:
+    hierarchy_fill_writer.write(f)
+hierarchy_value = str(
+    (PdfReader("hierarchical-form-filled.pdf").get_fields() or {})
+    .get(hierarchical_field_name, {}).get("/V", "")
+)
+check("qualified field lookup locates the hierarchical widget page",
+      len(hierarchy_target_pages) == 1
+      and hierarchy_target_pages[0] is hierarchy_fill_writer.pages[1],
+      len(hierarchy_target_pages))
+check("hierarchical field value round-trips",
+      hierarchy_value.strip("/") == "Ada Hierarchical", repr(hierarchy_value))
 
 # ---- transform.md merge imports outline navigation ----------------------------
 appendix_writer = PdfWriter()

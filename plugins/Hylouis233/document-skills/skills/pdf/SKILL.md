@@ -58,8 +58,7 @@ output_path = "output.pdf"
 password = os.environ.get("PDF_PASSWORD")
 r = pypdf.PdfReader(output_path)
 if r.is_encrypted:
-    # Permission-encrypted PDFs commonly use an empty user password and open normally.
-    # Authenticate that case before requiring an operator-supplied password.
+    # Permission-encrypted PDFs commonly have an empty user password and open normally.
     if r.decrypt("") == 0:
         if not password:
             raise RuntimeError("set PDF_PASSWORD so the encrypted output can be postchecked")

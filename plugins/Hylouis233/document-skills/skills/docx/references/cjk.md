@@ -222,10 +222,11 @@ section.left_margin, section.right_margin = Cm(2.8), Cm(2.6)
            cmap = cmaps[font_spec]
            if ord(character) not in cmap:
                missing.append((run_index, character, face))
+   # These are mandatory audit gates, so raise explicitly: `python -O` removes asserts.
    if unresolved:
-       raise RuntimeError(f"font files not resolved per run: {unresolved}")
+       raise ValueError(f"font files not resolved per run: {unresolved}")
    if missing:
-       raise RuntimeError(f"glyph missing from the run's effective font: {missing}")
+       raise ValueError(f"glyph missing from the run's effective font: {missing}")
    ```
 
    When font files cannot be located, rasterize the rendered pages with PyMuPDF and inspect

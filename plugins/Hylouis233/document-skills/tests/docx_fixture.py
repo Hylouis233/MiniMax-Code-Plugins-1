@@ -49,12 +49,12 @@ parsed = etree.fromstring(hostile_xml, parser=safe_xml_parser)
 check("DOCX XML parser leaves external entities unresolved", parsed.text is None and len(parsed) == 1)
 
 # ---- review.md health check rejects archive bombs before expanding parts -------
+MAX_ARCHIVE_BYTES = 200 * 1024 * 1024
+MAX_MEMBERS = 10_000
 MAX_XML_PART = 20 * 1024 * 1024
 MAX_ENTRY = 100 * 1024 * 1024
 MAX_TOTAL_UNCOMPRESSED = 500 * 1024 * 1024
 MAX_COMPRESSION_RATIO = 200
-MAX_COMPRESSED_FILE = 200 * 1024 * 1024
-MAX_MEMBERS = 10_000
 
 
 def require(condition, message):
@@ -63,11 +63,13 @@ def require(condition, message):
 
 
 def validate_docx_package(path):
-    require(Path(path).stat().st_size <= MAX_COMPRESSED_FILE,
-            "compressed DOCX file size above limit")
+    require(
+        Path(path).stat().st_size <= MAX_ARCHIVE_BYTES,
+        "compressed DOCX file size above limit",
+    )
     with zipfile.ZipFile(path) as archive:
         infos = archive.infolist()
-        require(len(infos) <= MAX_MEMBERS, "too many archive members")
+        require(len(infos) <= MAX_MEMBERS, "archive member count above limit")
         names = {info.filename for info in infos}
         require(len(names) == len(infos), "duplicate archive member names are unsafe")
         require(
@@ -130,18 +132,20 @@ check(
     __debug__ or archive_bomb_rejected,
 )
 
-with zipfile.ZipFile("too-many-members.docx", "w", zipfile.ZIP_STORED) as archive:
+with zipfile.ZipFile("many-members.docx", "w", zipfile.ZIP_STORED) as archive:
     archive.writestr("[Content_Types].xml", "<Types/>")
     archive.writestr("word/document.xml", "<document/>")
-    for index in range(MAX_MEMBERS - 1):
-        archive.writestr(f"custom/empty-{index}", b"")
+    for member_index in range(MAX_MEMBERS - 1):
+        archive.writestr(f"word/zero-{member_index:05d}.bin", b"")
 try:
-    validate_docx_package("too-many-members.docx")
-    excessive_member_count_rejected = False
-except ValueError:
-    excessive_member_count_rejected = True
-check("bounded package health check rejects excessive member counts",
-      excessive_member_count_rejected)
+    validate_docx_package("many-members.docx")
+    many_members_rejected = False
+except ValueError as exc:
+    many_members_rejected = str(exc) == "archive member count above limit"
+check(
+    "member-count gate rejects 10,001 distinct zero-byte archive members before traversal",
+    many_members_rejected,
+)
 
 # ---- read.md includes block/inline content controls and controlled tables -------
 def iter_part_blocks(root, parent):
@@ -304,6 +308,34 @@ per_run_missing = [(face, ch) for face, text in assigned_runs for ch in text
 check("pooled cmap is proven unsafe (negative control)", pooled_passes)
 check("per-run cmap check identifies the actual missing glyph",
       per_run_missing == [("Latin Face", "漢")], per_run_missing)
+
+
+def require_clean_cjk_glyph_audit(unresolved, missing):
+    if unresolved:
+        raise ValueError(f"font files not resolved per run: {unresolved}")
+    if missing:
+        raise ValueError(f"glyph missing from the run's effective font: {missing}")
+
+
+try:
+    require_clean_cjk_glyph_audit([(0, "漢", "Unresolved Face")], [])
+    unresolved_face_rejected = False
+except ValueError:
+    unresolved_face_rejected = True
+check(
+    "mandatory CJK audit rejects unresolved font files under optimized Python",
+    unresolved_face_rejected,
+)
+
+try:
+    require_clean_cjk_glyph_audit([], [(0, "漢", "Missing Glyph Face")])
+    missing_glyph_rejected = False
+except ValueError:
+    missing_glyph_rejected = True
+check(
+    "mandatory CJK audit rejects missing glyphs under optimized Python",
+    missing_glyph_rejected,
+)
 
 def font_slot(character):
     codepoint = ord(character)

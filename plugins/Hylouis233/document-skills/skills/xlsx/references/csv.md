@@ -36,11 +36,30 @@ with open("input.csv", newline="", encoding="utf-8-sig") as f:   # utf-8-sig str
 ```python
 import csv
 
+FORMULA_PREFIXES = ("=", "+", "-", "@")
+
+def spreadsheet_csv_field(value, *, mode="safe"):
+    if mode not in {"safe", "raw"}:
+        raise ValueError("mode must be 'safe' or 'raw'")
+    if mode == "safe" and isinstance(value, str) and value.startswith(FORMULA_PREFIXES):
+        return "'" + value
+    return value
+
 with open("output.csv", "w", newline="", encoding="utf-8") as f:
     writer = csv.writer(f)
-    writer.writerow(["Region", "Units"])
-    writer.writerow(["EU", 120])
+    rows = [["Region", "Units", "Note"], ["EU", 120, "=2+2"]]
+    writer.writerows([spreadsheet_csv_field(value) for value in row] for row in rows)
 ```
+
+Use `mode="safe"` (the default above) when the CSV will be opened in Excel, LibreOffice,
+Google Sheets, or another spreadsheet application. It neutralizes literal text beginning with
+`=`, `+`, `-`, or `@` by prefixing an apostrophe, so the application does not interpret the
+field as a formula. Numeric values, including negative numbers represented as numbers, are not
+changed. This protection deliberately changes those serialized string values.
+
+Use `mode="raw"` only when the user explicitly requires byte-for-value interchange with a
+trusted machine consumer. Raw mode preserves the exact strings and provides **no spreadsheet
+formula-injection protection**; do not present a raw export as safe to open in a spreadsheet.
 
 ## Converting
 
@@ -64,21 +83,23 @@ with open("output.csv", "w", newline="", encoding="utf-8") as f:
   import openpyxl
   from pathlib import Path
 
-  formula_wb = openpyxl.load_workbook("input.xlsx", read_only=True, data_only=False)
-  value_wb = openpyxl.load_workbook("input.xlsx", read_only=True, data_only=True)
-  formula_ws, value_ws = formula_wb["Data"], value_wb["Data"]
-  # Do not trust a producer's cached <dimension> declaration. In read-only mode a
-  # plausible-but-truncated dimension otherwise hides populated cells from iter_rows().
-  formula_ws.reset_dimensions()
-  value_ws.reset_dimensions()
+  FORMULA_PREFIXES = ("=", "+", "-", "@")
 
-  def spreadsheet_safe_csv_value(value):
-      # Spreadsheet-targeted CSV is the safe default. A leading apostrophe prevents
-      # Excel/LibreOffice from evaluating literal text as a formula when opened.
-      if isinstance(value, str) and value.startswith(("=", "+", "-", "@")):
+  def spreadsheet_csv_field(value, *, mode="safe"):
+      if mode not in {"safe", "raw"}:
+          raise ValueError("mode must be 'safe' or 'raw'")
+      if mode == "safe" and isinstance(value, str) and value.startswith(FORMULA_PREFIXES):
           return "'" + value
       return value
 
+  export_mode = "safe"  # use "raw" only for explicitly requested trusted machine interchange
+  formula_wb = openpyxl.load_workbook("input.xlsx", read_only=True, data_only=False)
+  value_wb = openpyxl.load_workbook("input.xlsx", read_only=True, data_only=True)
+  formula_ws, value_ws = formula_wb["Data"], value_wb["Data"]
+  # Producer-written <dimension> metadata can look plausible while truncating real cells.
+  # Reset both paired streams before their first iter_rows() call.
+  formula_ws.reset_dimensions()
+  value_ws.reset_dimensions()
   missing_caches = []
   output_path = Path("output.csv")
   temporary_path = output_path.with_suffix(output_path.suffix + ".tmp")
@@ -88,7 +109,9 @@ with open("output.csv", "w", newline="", encoding="utf-8") as f:
           for formula_cell, value_cell in zip(formula_row, value_row):
               if formula_cell.data_type == "f" and value_cell.value is None:
                   missing_caches.append(formula_cell.coordinate)
-          writer.writerow([spreadsheet_safe_csv_value(cell.value) for cell in value_row])
+          writer.writerow([
+              spreadsheet_csv_field(cell.value, mode=export_mode) for cell in value_row
+          ])
   formula_wb.close()
   value_wb.close()
   if missing_caches:
@@ -98,11 +121,8 @@ with open("output.csv", "w", newline="", encoding="utf-8") as f:
   ```
 
   Format numbers yourself only if the user needs a fixed display format; otherwise write raw
-  cached values and say so. The snippet neutralizes formula-like literal text because its CSV is
-  intended for spreadsheet applications. Preserve such prefixes unchanged only in an explicitly
-  requested raw-data export, and warn that opening that raw CSV in a spreadsheet is unsafe.
-  Export formula text from the `data_only=False` workbook only when the user explicitly requests
-  formulas rather than displayed values.
+  cached values and say so. Export formula text from the `data_only=False` workbook only when
+  the user explicitly requests formulas rather than displayed values.
 - Large CSV -> keep it CSV or move to SQLite/Parquet; loading it all into one sheet to
   "preserve" it usually exceeds limits and helps nobody.
 

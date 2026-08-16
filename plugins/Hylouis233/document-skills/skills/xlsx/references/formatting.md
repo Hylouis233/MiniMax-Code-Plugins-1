@@ -11,18 +11,25 @@ from openpyxl.styles import Font, PatternFill
 
 red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
 red_font = Font(color="9C0006")
-# Derive the boundary from values in the rule/table source columns. max_row can
-# include a styled or formerly cleared cell near Excel's row limit.
-last = next(
-    (row for row in range(ws.max_row, 1, -1)
-     if any(ws.cell(row, column).value is not None for column in range(1, 7))),
-    1,
-)
 
-# With only a header row (max_row == 1) every range below would be inverted
+def last_populated_row(sheet, *, first_data_row=2, min_col=1, max_col=6):
+    # Conditional formatting uses a normal in-memory Worksheet. Its sparse cell store avoids
+    # iterating/materializing every row up to an inflated max_row.
+    populated_rows = (
+        cell.row for cell in sheet._cells.values()
+        if first_data_row <= cell.row
+        and min_col <= cell.column <= max_col
+        and cell.value is not None
+    )
+    return max(populated_rows, default=first_data_row - 1)
+
+# Do not use ws.max_row: a styled but empty cell can inflate it far below the data.
+last = last_populated_row(ws)
+
+# With only a header row every range below would be inverted
 # ("D2:D1"); openpyxl rejects those ranges, so guard before building rules.
 if last < 2:
-    print(f"skipping conditional formatting: no data rows below the header (max_row={last})")
+    print("skipping conditional formatting: no populated data rows below the header")
 else:
     # value-based rule
     ws.conditional_formatting.add(
@@ -44,6 +51,10 @@ else:
     )
 ```
 
+Restrict the scan to the columns that define the data region. If the data is already a declared
+Table, its ref is authoritative instead: use
+`openpyxl.utils.cell.range_boundaries(ws.tables["TData"].ref)[3]` for `last`.
+
 - FormulaRule formulas are US-locale and relative to the range's top-left cell - `$D2` (lock
   column, free row) is what makes the whole-row pattern work.
 - Multiple rules on one range evaluate by priority; if exactly one should apply, set
@@ -56,11 +67,7 @@ A real Table gives filter UI, banded styling, and structured references:
 ```python
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
-last = next(
-    (row for row in range(ws.max_row, 1, -1)
-     if any(ws.cell(row, column).value is not None for column in range(1, 7))),
-    1,
-)
+last = last_populated_row(ws)
 if last < 2:
     raise ValueError("cannot create a data table without populated rows")
 tbl = Table(displayName="TData", ref=f"A1:F{last}")   # name has no spaces
