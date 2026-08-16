@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { appendFileSync, writeFileSync } from "node:fs";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -17,14 +17,23 @@ async function delay(milliseconds) {
   await new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-if (spec.mode === "descendant") {
+if (spec.branchRoundTrip) {
+  event("start");
+  const original = execFileSync("git", ["branch", "--show-current"], { encoding: "utf8" }).trim();
+  execFileSync("git", ["checkout", "-b", spec.branchName ?? "worker-branch"]);
+  writeFileSync(path.resolve(process.cwd(), spec.writeFile ?? "branch-work.txt"), spec.contents ?? "branch commit\n");
+  execFileSync("git", ["add", spec.writeFile ?? "branch-work.txt"]);
+  execFileSync("git", ["commit", "-m", spec.commitMessage ?? "worker branch commit"]);
+  execFileSync("git", ["checkout", original]);
+  event("end");
+} else if (spec.mode === "descendant") {
   event("descendant-start");
   await delay(spec.delayMs ?? 1_000);
   if (spec.writeFile) writeFileSync(path.resolve(process.cwd(), spec.writeFile), spec.contents ?? "descendant survived\n");
   event("descendant-end");
 } else if (spec.spawnDescendant) {
   event("parent-start");
-  spawn(process.execPath, [ownPath, JSON.stringify({
+  const descendant = spawn(process.execPath, [ownPath, JSON.stringify({
     mode: "descendant",
     name: spec.name,
     eventFile: spec.eventFile,
@@ -33,10 +42,14 @@ if (spec.mode === "descendant") {
     contents: spec.contents,
   })], {
     cwd: process.cwd(),
+    detached: spec.detachedDescendant === true,
     windowsHide: true,
-    stdio: "inherit",
+    stdio: spec.detachedDescendant === true ? "ignore" : "inherit",
   });
-  await new Promise(() => {});
+  if (spec.detachedDescendant === true) descendant.unref();
+  await delay(spec.parentDelayMs ?? 120_000);
+} else if (spec.stdoutChars) {
+  process.stdout.write("x".repeat(spec.stdoutChars));
 } else {
   event("start");
   await delay(spec.delayMs ?? 0);

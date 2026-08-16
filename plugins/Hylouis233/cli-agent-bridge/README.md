@@ -88,13 +88,15 @@ underlying real executable in backends.json.
 
 ## Data and network
 
-- This Plugin makes no network calls of its own and stores no credentials, tokens, or logs.
+- This Plugin makes no network calls of its own and stores no credentials, tokens, or session logs.
+  Per-user temporary lock records contain only process identity; if termination cannot be confirmed,
+  a quarantine marker containing the workspace path/backend/error persists until an operator removes it.
 - delegate_task passes the task text to the backend CLI you choose, which runs with your own
   local authentication and may contact that vendor or service for the requested work.
 - The task text and workspace files are processed by the chosen backend provider. Never include
   credentials, private endpoints, or personal data in a task.
-- The server captures only the command output and the resulting git diff; nothing is transmitted
-  anywhere by the server itself.
+- The server returns bounded command-output tails and Git snapshots to its MCP client; nothing is
+  transmitted elsewhere by the server itself.
 - Workers run with the permission level baked into their template (claude: acceptEdits, which
   auto-approves workspace file edits but still gates other tool classes) or with that CLI's own
   non-interactive defaults. Review the returned diff before accepting the work.
@@ -117,18 +119,24 @@ you already obtained a valid ID from that backend outside this Plugin.
 - Delegations and status snapshots targeting the same canonical Git worktree are serialized even
   when callers name a subdirectory, different path casing, or symlink, and even when separate MCP
   clients launched separate bridge server processes. Independent comparison runs still require
-  separate clean worktrees. The cross-process lock lives under the OS temporary directory; a lock
-  whose owner process exited is reclaimed before the next request starts.
+  separate clean worktrees. The cross-process lock lives in a current-user-scoped directory under
+  the OS temporary directory. Dead-owner recovery compares both PID and process-start identity;
+  an atomic reclaim claim prevents two waiters from deleting a newly acquired lock.
 - Cancellation and timeout confirm that the delegated process tree has exited before releasing
-  the workspace mutex. If termination cannot be confirmed, the bridge quarantines that worktree
-  and refuses further delegations until the server is restarted and leftover processes are
-  checked. On Linux, zombie-only process groups count as terminated; zombies cannot edit the
-  workspace and may otherwise persist when container PID 1 does not reap them.
+  the workspace mutex. A lightweight ancestry monitor records descendants that create a new POSIX
+  session/process group so cancellation still terminates them. If termination cannot be confirmed,
+  the bridge writes a shared quarantine marker and every bridge process refuses further delegation
+  until an operator checks for leftovers and deliberately removes the reported quarantinePath.
+  On Linux, zombie-only tracked trees count as terminated; zombies cannot edit the workspace and
+  may otherwise persist when container PID 1 does not reap them.
 - Cancelling a workspace_status request interrupts its queued lock wait or Git snapshot and returns
   a cancelled tool result instead of performing a stale snapshot later.
 - timeoutMs is an overall deadline that starts after the workspace lock is acquired and covers
   preflight Git checks, the worker, and post-run snapshots. Safe process-tree termination can
   extend beyond that deadline by the documented kill grace period.
+- Snapshots include all Git refs as well as HEAD, so a worker that commits on a new branch and
+  returns to the original branch still reports the created ref and commit. Any bounded Git capture
+  that truncates is rejected as an unreliable snapshot; backend output truncation is disclosed.
 - zcode and dsh backends are experimental: ZCode desktop builds have no verified headless CLI,
   and dsh needs a headless profile present under DSH_HOME/profiles.
 - Custom wrapper shims that re-bind dashed flags can misreport a backend as unavailable; point
@@ -143,10 +151,11 @@ node --test plugins/Hylouis233/cli-agent-bridge/test/server.test.mjs
 node --test plugins/Hylouis233/cli-agent-bridge/tests/server.test.mjs
 ```
 
-They cover the full MCP flow plus in-process and cross-process canonical worktree locking, queued
-delegation/status cancellation, cancel/timeout process-tree termination, zombie-only Linux groups,
-unusual Git pathnames, JSON-RPC id typing, unborn HEAD snapshots, and Codex prompt delimiters on
-Windows and POSIX.
+They cover the full MCP flow plus in-process and cross-process canonical worktree locking, atomic
+stale-lock/PID-reuse recovery, shared quarantine markers, queued and discovery-phase cancellation,
+cancel/timeout process-tree termination, escaped POSIX descendants and zombie-only Linux groups,
+unusual Git pathnames, JSON-RPC id typing, unborn HEAD and non-HEAD ref changes, capture truncation,
+and Codex prompt delimiters on Windows and POSIX.
 
 ## License
 

@@ -74,24 +74,14 @@ async function windowsProcessTreePids(rootPid, knownPids = new Set()) {
   return [...descendants];
 }
 
-// Linux keeps zombie processes in /proc until their parent (sometimes a
-// non-reaping container PID 1) collects them. This classifier is deliberately
-// tri-state: true means a live member was found, false means every matching
-// member is a zombie, and null means the result is uncertain. Callers may only
-// use the false result after a group-wide SIGKILL; while a group is still
-// running, enumerating /proc races with members that can fork.
-export async function linuxProcessGroupHasLiveMembers(
-  processGroupId,
-  procRoot = "/proc",
-  fsOps = { readdir, readFile },
-) {
+async function linuxProcessSnapshot(procRoot = "/proc", fsOps = { readdir, readFile }) {
   let entries;
   try {
     entries = await fsOps.readdir(procRoot, { withFileTypes: true });
   } catch {
     return null;
   }
-  let sawMember = false;
+  const processes = [];
   for (const entry of entries) {
     if (!entry.isDirectory() || !/^\d+$/u.test(entry.name)) continue;
     let statLine;
@@ -106,14 +96,100 @@ export async function linuxProcessGroupHasLiveMembers(
     const close = statLine.lastIndexOf(")");
     if (close === -1) return null;
     const fields = statLine.slice(close + 1).trim().split(/\s+/u);
-    const state = fields[0];
-    const group = Number(fields[2]);
-    if (!state || !Number.isInteger(group)) return null;
-    if (group !== processGroupId) continue;
-    sawMember = true;
-    if (state !== "Z" && state !== "X" && state !== "x") return true;
+    const item = {
+      pid: Number(entry.name),
+      state: fields[0],
+      parentPid: Number(fields[1]),
+      processGroupId: Number(fields[2]),
+      startIdentity: fields[19] ?? "", // field 22: start time since boot
+    };
+    if (!item.state || !Number.isInteger(item.pid) ||
+        !Number.isInteger(item.parentPid) || !Number.isInteger(item.processGroupId)) return null;
+    processes.push(item);
   }
-  return sawMember ? false : null;
+  processes.incomplete = false;
+  return processes;
+}
+
+// Linux keeps zombie processes in /proc until their parent (sometimes a
+// non-reaping container PID 1) collects them. This classifier is deliberately
+// tri-state: true means a live member was found, false means every matching
+// member is a zombie, and null means the result is uncertain. Callers may only
+// use the false result after a group-wide SIGKILL; while a group is still
+// running, enumerating /proc races with members that can fork.
+export async function linuxProcessGroupHasLiveMembers(
+  processGroupId,
+  procRoot = "/proc",
+  fsOps = { readdir, readFile },
+) {
+  const processes = await linuxProcessSnapshot(procRoot, fsOps);
+  if (processes === null) return null;
+  const members = processes.filter((item) => item.processGroupId === processGroupId);
+  if (members.length === 0) return null;
+  return members.some((item) => isLiveState(item.state));
+}
+
+async function posixProcessSnapshot({
+  platform = process.platform,
+  procRoot = "/proc",
+  fsOps = { readdir, readFile },
+} = {}) {
+  if (platform === "linux") return await linuxProcessSnapshot(procRoot, fsOps);
+  const result = await runUtility("ps", ["-axo", "pid=,ppid=,pgid=,stat="]);
+  if (result.exitCode !== 0) return null;
+  const processes = result.stdout.split(/\r?\n/u).flatMap((line) => {
+    const fields = line.trim().split(/\s+/u);
+    if (fields.length < 4) return [];
+    return [{
+      pid: Number(fields[0]),
+      parentPid: Number(fields[1]),
+      processGroupId: Number(fields[2]),
+      state: fields[3][0] ?? "",
+      startIdentity: "",
+    }];
+  }).filter((item) => Number.isInteger(item.pid));
+  processes.incomplete = false;
+  return processes;
+}
+
+function isLiveState(state) {
+  return state !== "Z" && state !== "X" && state !== "x";
+}
+
+export async function refreshProcessTree(child, treeState, options = {}) {
+  if (!Number.isInteger(child.pid)) return null;
+  const platform = options.platform ?? process.platform;
+  if (platform === "win32") {
+    await windowsProcessTreePids(child.pid, treeState.knownPids);
+    return null;
+  }
+  const processes = await posixProcessSnapshot(options);
+  if (processes === null) return null;
+  treeState.knownStarts ??= new Map();
+  const byPid = new Map(processes.map((item) => [item.pid, item]));
+  const matchesKnownIdentity = (item) => {
+    const expected = treeState.knownStarts.get(item.pid);
+    return !expected || !item.startIdentity || expected === item.startIdentity;
+  };
+  const parents = new Set([child.pid]);
+  for (const pid of treeState.knownPids) {
+    const item = byPid.get(pid);
+    if (item && matchesKnownIdentity(item)) parents.add(pid);
+  }
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const item of processes) {
+      if ((item.processGroupId === child.pid || parents.has(item.parentPid)) &&
+          !parents.has(item.pid)) {
+        parents.add(item.pid);
+        treeState.knownPids.add(item.pid);
+        if (item.startIdentity) treeState.knownStarts.set(item.pid, item.startIdentity);
+        changed = true;
+      }
+    }
+  }
+  return processes;
 }
 
 export async function isProcessTreeAlive(child, treeState, {
@@ -126,6 +202,19 @@ export async function isProcessTreeAlive(child, treeState, {
   if (!Number.isInteger(child.pid)) return false;
   if (platform === "win32") {
     return (await windowsProcessTreePids(child.pid, treeState.knownPids)).length > 0;
+  }
+  const processes = await refreshProcessTree(child, treeState, { platform, procRoot, fsOps });
+  if (processes !== null) {
+    const knownStarts = treeState.knownStarts ?? new Map();
+    const trackedLive = processes.some((item) => {
+      if (!isLiveState(item.state)) return false;
+      if (item.processGroupId === child.pid) return true;
+      if (!treeState.knownPids.has(item.pid)) return false;
+      const expected = knownStarts.get(item.pid);
+      return !expected || !item.startIdentity || expected === item.startIdentity;
+    });
+    if (trackedLive) return true;
+    if (ignoreZombieOnly && !processes.incomplete) return false;
   }
   try {
     probeProcessGroup(child.pid);
@@ -156,10 +245,21 @@ export async function signalProcessTree(child, signal, treeState) {
     }
     return;
   }
+  await refreshProcessTree(child, treeState);
   try {
     process.kill(-child.pid, signal);
   } catch (error) {
     if (error.code !== "ESRCH") throw error;
+  }
+  const processes = await posixProcessSnapshot();
+  const byPid = processes === null ? new Map() : new Map(processes.map((item) => [item.pid, item]));
+  for (const pid of [...treeState.knownPids].reverse()) {
+    if (pid === child.pid) continue;
+    const item = byPid.get(pid);
+    const expected = treeState.knownStarts?.get(pid);
+    if (item && expected && item.startIdentity && expected !== item.startIdentity) continue;
+    try { process.kill(pid, signal); }
+    catch (error) { if (error.code !== "ESRCH") throw error; }
   }
 }
 

@@ -24,7 +24,7 @@ inside the target git repository, and their results come back as a git diff for 
    Delegations to the same workspace are serialized across bridge server processes, so parallel
    runs from separate MCP clients still queue instead of interleaving edits.
 4. Review the returned result: the before and after git snapshots (status, diff stat, changed
-   files including staged and new files), the commits block when the worker committed, the
+   files including staged and new files), changed refs and the commits block when the worker committed, the
    output and stderr tails, and the exit code. A failed, timed-out, or cancelled run reports
    ok=false (and isError=true at the protocol level); never treat such a result as success.
 5. If the result is wrong, delegate a follow-up task. delegate_task results do not carry the
@@ -56,8 +56,12 @@ inside the target git repository, and their results come back as a git diff for 
   termination may use the additional kill grace period.
 - Cancellation: cancelling an in-flight delegate_task call terminates the complete worker process
   tree and the result reports cancelled=true. If tree termination cannot be confirmed, the bridge
-  quarantines the worktree and blocks another worker until restart. The workspace may still contain
-  edits made before cancellation, so still review the returned snapshot.
+  writes a shared quarantine marker that blocks every bridge process. After checking for leftover
+  processes, an operator must deliberately remove the reported quarantinePath. The workspace may
+  still contain edits made before cancellation, so still review the returned snapshot.
+- Snapshot reliability: a worker's changes to Git refs are compared as well as final HEAD, and a
+  truncated Git capture fails closed. If outputTruncated/stderrTruncated is true, treat the returned
+  backend tail as partial.
 - Cancelling workspace_status while it is queued or snapshotting returns promptly with
   cancelled=true; it does not run a delayed status snapshot after the active delegation finishes.
 

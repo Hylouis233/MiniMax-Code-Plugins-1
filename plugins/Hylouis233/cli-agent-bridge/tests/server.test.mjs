@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { access, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
@@ -16,9 +16,30 @@ const serverPath = path.join(pluginRoot, "server.mjs");
 const fakeBackendPath = path.join(testsRoot, "fake-backend.mjs");
 const requestKey = (id) => typeof id + ":" + String(id);
 
+function currentUserLockRoot() {
+  const user = os.userInfo();
+  const identity = Number.isInteger(user.uid) && user.uid >= 0
+    ? process.platform + ":uid:" + String(user.uid)
+    : process.platform + ":" + user.username + ":" + user.homedir;
+  const scope = createHash("sha256").update(identity).digest("hex").slice(0, 20);
+  return path.join(os.tmpdir(), "minimax-cli-agent-bridge-locks-" + scope);
+}
+
+function workspaceStatePaths(canonicalRoot) {
+  const normalized = path.normalize(canonicalRoot);
+  const key = "git-worktree:" + (process.platform === "win32" ? normalized.toLowerCase() : normalized);
+  const digest = createHash("sha256").update(key).digest("hex");
+  const root = currentUserLockRoot();
+  return {
+    root,
+    lockPath: path.join(root, digest + ".lock"),
+    quarantinePath: path.join(root, digest + ".quarantine"),
+  };
+}
+
 class McpClient {
-  constructor(configPath) {
-    this.child = execServer(configPath);
+  constructor(configPath, extraEnv = {}) {
+    this.child = execServer(configPath, extraEnv);
     this.pending = new Map();
     this.stderr = "";
     this.nextId = 1;
@@ -84,9 +105,9 @@ class McpClient {
   }
 }
 
-function execServer(configPath) {
+function execServer(configPath, extraEnv = {}) {
   return spawn(process.execPath, [serverPath], {
-    env: { ...process.env, CLI_AGENT_BRIDGE_BACKENDS: configPath },
+    env: { ...process.env, ...extraEnv, CLI_AGENT_BRIDGE_BACKENDS: configPath },
     windowsHide: true,
     stdio: ["pipe", "pipe", "pipe"],
   });
@@ -216,11 +237,7 @@ test("canonical worktree locking serializes independent server processes", async
 test("a workspace lock left by a dead server process is reclaimed", async (context) => {
   const { workspace, client } = await makeHarness(context);
   const canonicalRoot = await realpath(workspace);
-  const normalized = path.normalize(canonicalRoot);
-  const key = "git-worktree:" + (process.platform === "win32" ? normalized.toLowerCase() : normalized);
-  const digest = createHash("sha256").update(key).digest("hex");
-  const lockRoot = path.join(os.tmpdir(), "minimax-cli-agent-bridge-locks");
-  const lockPath = path.join(lockRoot, digest + ".lock");
+  const { root: lockRoot, lockPath } = workspaceStatePaths(canonicalRoot);
   await mkdir(lockRoot, { recursive: true });
   context.after(() => rm(lockPath, { force: true }));
   await writeFile(lockPath, JSON.stringify({
@@ -234,6 +251,74 @@ test("a workspace lock left by a dead server process is reclaimed", async (conte
   }));
   assert.equal(response.result.structuredContent.ok, true);
   await assert.rejects(access(lockPath), /ENOENT/u);
+});
+
+test("a stale lock is reclaimed when its PID was reused by another process", async (context) => {
+  const { workspace, client } = await makeHarness(context);
+  const { root, lockPath } = workspaceStatePaths(await realpath(workspace));
+  await mkdir(root, { recursive: true });
+  context.after(() => rm(lockPath, { force: true }));
+  await writeFile(lockPath, JSON.stringify({
+    pid: process.pid,
+    processIdentity: "not-the-current-process-start",
+    token: "reused-pid-fixture",
+    createdAt: Date.now() - 60_000,
+  }));
+  const response = await client.request("tools/call", taskArguments(workspace, {
+    name: "after-reused-pid", writeFile: "reused-pid-reclaimed.txt",
+  }));
+  assert.equal(response.result.structuredContent.ok, true);
+});
+
+test("concurrent stale-lock reclaimers still serialize across processes", async (context) => {
+  const { tempRoot, workspace, configPath, client } = await makeHarness(context);
+  const secondClient = new McpClient(configPath);
+  try {
+    await secondClient.initialize();
+    const { root, lockPath } = workspaceStatePaths(await realpath(workspace));
+    await mkdir(root, { recursive: true });
+    context.after(() => rm(lockPath, { force: true }));
+    await writeFile(lockPath, JSON.stringify({
+      pid: 99_999_999,
+      processIdentity: "dead-owner",
+      token: "concurrent-reclaim-fixture",
+      createdAt: Date.now() - 60_000,
+    }));
+    const eventFile = path.join(tempRoot, "reclaim-race-events.jsonl");
+    const first = client.request("tools/call", taskArguments(workspace, {
+      name: "reclaimer-one", eventFile, delayMs: 500,
+    }, { allowDirty: true }), 121);
+    const second = secondClient.request("tools/call", taskArguments(workspace, {
+      name: "reclaimer-two", eventFile, delayMs: 500,
+    }, { allowDirty: true }), 122);
+    const responses = await Promise.all([first, second]);
+    assert.ok(responses.every((response) => response.result.structuredContent.ok));
+    const sequence = (await events(eventFile)).map((item) => item.event);
+    assert.deepEqual(sequence, ["start", "end", "start", "end"]);
+  } finally {
+    await secondClient.close();
+  }
+});
+
+test("a quarantine marker blocks delegations in every server process", async (context) => {
+  const { workspace, configPath } = await makeHarness(context);
+  const secondClient = new McpClient(configPath);
+  try {
+    await secondClient.initialize();
+    const { root, quarantinePath } = workspaceStatePaths(await realpath(workspace));
+    await mkdir(root, { recursive: true });
+    context.after(() => rm(quarantinePath, { force: true }));
+    await writeFile(quarantinePath, JSON.stringify({ terminationError: "fixture" }));
+    const response = await secondClient.request("tools/call", taskArguments(workspace, {
+      name: "must-not-run", writeFile: "quarantine-bypass.txt",
+    }), 131);
+    assert.equal(response.result.structuredContent.ok, false);
+    assert.equal(response.result.structuredContent.quarantinePath, quarantinePath);
+    assert.match(response.result.structuredContent.error, /quarantined/iu);
+    await assert.rejects(access(path.join(workspace, "quarantine-bypass.txt")), /ENOENT/u);
+  } finally {
+    await secondClient.close();
+  }
 });
 
 test("a request cancelled while queued never starts its backend", async (context) => {
@@ -267,6 +352,39 @@ test("a request cancelled while queued never starts its backend", async (context
   await assert.rejects(access(path.join(workspace, "must-not-exist.txt")), /ENOENT/u);
 });
 
+test("cancellation interrupts initial Git repository discovery", {
+  skip: process.platform === "win32",
+}, async (context) => {
+  const { tempRoot, workspace, configPath } = await makeHarness(context);
+  const eventFile = path.join(tempRoot, "git-discovery-events.jsonl");
+  const wrapper = path.join(tempRoot, "git");
+  await writeFile(wrapper, [
+    "#!/usr/bin/env node",
+    "const { appendFileSync } = require('node:fs');",
+    "appendFileSync(" + JSON.stringify(eventFile) + ", JSON.stringify({event:'git-start'}) + '\\n');",
+    "setTimeout(() => {}, 60000);",
+  ].join("\n"));
+  await chmod(wrapper, 0o755);
+  const delayedClient = new McpClient(configPath, {
+    PATH: tempRoot + path.delimiter + process.env.PATH,
+  });
+  try {
+    await delayedClient.initialize();
+    const pending = delayedClient.request("tools/call", taskArguments(workspace, {
+      name: "must-not-start", writeFile: "discovery-cancelled.txt",
+    }), 111);
+    await waitFor(async () => (await events(eventFile)).some((item) => item.event === "git-start"));
+    const cancelledAt = Date.now();
+    delayedClient.notify("notifications/cancelled", { requestId: 111 });
+    const response = await pending;
+    assert.ok(Date.now() - cancelledAt < 1_500, "Git discovery cancellation should settle promptly");
+    assert.equal(response.result.structuredContent.cancelled, true);
+    await assert.rejects(access(path.join(workspace, "discovery-cancelled.txt")), /ENOENT/u);
+  } finally {
+    await delayedClient.close();
+  }
+});
+
 test("cancellation terminates descendants before returning", async (context) => {
   const { tempRoot, workspace, client } = await makeHarness(context);
   const eventFile = path.join(tempRoot, "events.jsonl");
@@ -291,6 +409,31 @@ test("cancellation terminates descendants before returning", async (context) => 
   assert.equal(followUp.result.structuredContent.ok, true);
   await new Promise((resolve) => setTimeout(resolve, 1_400));
   await assert.rejects(access(path.join(workspace, "descendant-survived.txt")), /ENOENT/u);
+});
+
+test("cancellation terminates a descendant that creates a new POSIX session", {
+  skip: process.platform === "win32",
+}, async (context) => {
+  const { tempRoot, workspace, client } = await makeHarness(context);
+  const eventFile = path.join(tempRoot, "detached-descendant-events.jsonl");
+  const delegated = client.request("tools/call", taskArguments(workspace, {
+    name: "detached-tree",
+    eventFile,
+    spawnDescendant: true,
+    detachedDescendant: true,
+    descendantDelayMs: 1_200,
+    descendantWriteFile: "detached-descendant-survived.txt",
+  }), 211);
+  await waitFor(async () => (await events(eventFile)).some((item) => item.event === "descendant-start"));
+  // Give the 25 ms ancestry monitor time to record the detached child before cancellation.
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  client.notify("notifications/cancelled", { requestId: 211 });
+
+  const response = await delegated;
+  assert.equal(response.result.structuredContent.cancelled, true);
+  assert.equal(response.result.structuredContent.treeTerminated, true);
+  await new Promise((resolve) => setTimeout(resolve, 1_400));
+  await assert.rejects(access(path.join(workspace, "detached-descendant-survived.txt")), /ENOENT/u);
 });
 
 test("timeout terminates descendants before releasing the request", async (context) => {
@@ -331,6 +474,26 @@ test("workspace status and delegation support an unborn HEAD", async (context) =
   assert.deepEqual(delegated.result.structuredContent.git.changedFiles, ["created.txt"]);
 });
 
+test("commits on a new branch are reported when the worker returns to the original HEAD", async (context) => {
+  const { workspace, client } = await makeHarness(context);
+  const response = await client.request("tools/call", taskArguments(workspace, {
+    name: "branch-round-trip",
+    branchRoundTrip: true,
+    branchName: "worker-created-branch",
+    writeFile: "branch-only.txt",
+    commitMessage: "commit outside final HEAD",
+  }));
+  const out = response.result.structuredContent;
+  assert.equal(out.ok, true, JSON.stringify(out.error));
+  assert.equal(out.gitBefore.head, out.git.head, "worker must return to the original HEAD");
+  assert.deepEqual(out.git.changedFiles, []);
+  assert.ok(out.commits, "ref changes must produce a commits block even when HEAD is unchanged");
+  assert.ok(out.commits.refsChanged.some((item) =>
+    item.ref === "refs/heads/worker-created-branch" && !item.before && item.after,
+  ), JSON.stringify(out.commits.refsChanged));
+  assert.match(out.commits.log, /commit outside final HEAD/u);
+});
+
 test("changedFiles preserves unusual names and scans from the worktree root", async (context) => {
   const { workspace, client } = await makeHarness(context);
   const nested = path.join(workspace, "nested", "deep");
@@ -356,6 +519,17 @@ test("changedFiles preserves unusual names and scans from the worktree root", as
   assert.ok(names.includes("nested/deep/café-untracked.txt"), JSON.stringify(names));
   assert.ok(names.includes("root-new.txt"), JSON.stringify(names));
   assert.equal(status.result.structuredContent.worktreeRoot, await realpath(workspace));
+});
+
+test("truncated backend capture is disclosed instead of presented as complete", async (context) => {
+  const { workspace, client } = await makeHarness(context);
+  const response = await client.request("tools/call", taskArguments(workspace, {
+    name: "large-output", stdoutChars: 5_100_000,
+  }));
+  const out = response.result.structuredContent;
+  assert.equal(out.ok, true);
+  assert.equal(out.outputTruncated, true);
+  assert.ok(out.outputTail.length <= 60_000);
 });
 
 test("numeric and string JSON-RPC request IDs remain distinct", async (context) => {
