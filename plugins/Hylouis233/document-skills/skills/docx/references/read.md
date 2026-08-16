@@ -31,6 +31,30 @@ def iter_body_blocks(parent, document):
             if content is not None:
                 yield from iter_body_blocks(content, document)
 
+def table_matrix(table):
+    """Rows of cell text with merge structure preserved.
+
+    python-docx's row.cells repeats a merge-origin cell across every grid
+    position it spans, which hides the real structure. Walk the actual w:tc
+    elements and annotate gridSpan/vMerge instead.
+    """
+    rows = []
+    for row in table.rows:
+        cells = []
+        for tc in row._tr.tc_lst:
+            tc_pr = tc.find(qn("w:tcPr"))
+            grid_span = tc_pr.find(qn("w:gridSpan")) if tc_pr is not None else None
+            v_merge = tc_pr.find(qn("w:vMerge")) if tc_pr is not None else None
+            note = ""
+            if grid_span is not None:
+                note += "(span {})".format(grid_span.get(qn("w:val")))
+            if v_merge is not None:
+                note += "(vmerge start)" if v_merge.get(qn("w:val")) == "restart" else "(vmerge cont.)"
+            text = "".join(node.text or "" for node in tc.iter(qn("w:t")))
+            cells.append(text + note if note else text)
+        rows.append(cells)
+    return rows
+
 doc = Document("input.docx")
 content_controls = list(doc.element.body.iter(qn("w:sdt")))
 print("block content controls:", len(content_controls))
@@ -38,8 +62,7 @@ for kind, block in iter_body_blocks(doc.element.body, doc):
     if kind == "p":
         print("p", block.style.name, "|", block.text)
     else:
-        print("table", len(block.rows), "x", len(block.columns),
-              [[cell.text for cell in row.cells] for row in block.rows])
+        print("table", len(block.rows), "x", len(block.columns), table_matrix(block))
 ```
 
 Notes:

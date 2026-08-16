@@ -13,24 +13,29 @@ red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="soli
 red_font = Font(color="9C0006")
 last = ws.max_row                                  # real data boundary, not the column
 
-# value-based rule
-ws.conditional_formatting.add(
-    f"D2:D{last}",
-    CellIsRule(operator="lessThan", formula=["0"], fill=red_fill, font=red_font),
-)
+# With only a header row (max_row == 1) every range below would be inverted
+# ("D2:D1"); openpyxl rejects those ranges, so guard before building rules.
+if last < 2:
+    print(f"skipping conditional formatting: no data rows below the header (max_row={last})")
+else:
+    # value-based rule
+    ws.conditional_formatting.add(
+        f"D2:D{last}",
+        CellIsRule(operator="lessThan", formula=["0"], fill=red_fill, font=red_font),
+    )
 
-# whole-row highlight: FormulaRule anchored with $ on the key column
-ws.conditional_formatting.add(f"A2:F{last}", FormulaRule(formula=["$D2<0"], fill=red_fill))
+    # whole-row highlight: FormulaRule anchored with $ on the key column
+    ws.conditional_formatting.add(f"A2:F{last}", FormulaRule(formula=["$D2<0"], fill=red_fill))
 
-# gradient and data bars for magnitude scanning
-ws.conditional_formatting.add(
-    f"C2:C{last}",
-    ColorScaleRule(start_type="min", start_color="FFFFFF", end_type="max", end_color="63BE7B"),
-)
-ws.conditional_formatting.add(
-    f"E2:E{last}",
-    DataBarRule(start_type="min", end_type="max", color="638EC6"),
-)
+    # gradient and data bars for magnitude scanning
+    ws.conditional_formatting.add(
+        f"C2:C{last}",
+        ColorScaleRule(start_type="min", start_color="FFFFFF", end_type="max", end_color="63BE7B"),
+    )
+    ws.conditional_formatting.add(
+        f"E2:E{last}",
+        DataBarRule(start_type="min", end_type="max", color="638EC6"),
+    )
 ```
 
 - FormulaRule formulas are US-locale and relative to the range's top-left cell - `$D2` (lock

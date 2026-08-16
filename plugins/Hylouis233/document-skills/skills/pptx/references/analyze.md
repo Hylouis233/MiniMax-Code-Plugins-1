@@ -5,6 +5,7 @@
 ```python
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
+from pptx.oxml.ns import qn
 
 def iter_shapes(shapes):
     """Walk shapes recursively so content nested inside group shapes is counted too."""
@@ -14,11 +15,17 @@ def iter_shapes(shapes):
         else:
             yield shape
 
-def cached_numeric_values(series, element_name):
-    """Read the cached numeric points python-pptx does not expose for XY/bubble axes."""
+def cached_numeric_points(series, element_name):
+    """Read cached numeric points python-pptx does not expose for XY/bubble axes.
+
+    Returns (idx, value) pairs: a series with blank points omits those <c:pt>
+    entries while later points keep their original idx, so values extracted
+    without their indices cannot be paired across the x/y/bubble axes.
+    """
     return [
-        node.text for node in
-        series._element.xpath(f"./c:{element_name}//c:pt/c:v")
+        (int(pt.get("idx")), pt.find(qn("c:v")).text)
+        for pt in series._element.xpath(f"./c:{element_name}//c:pt")
+        if pt.get("idx") is not None and pt.find(qn("c:v")) is not None
     ]
 
 prs = Presentation("input.pptx")
@@ -50,11 +57,13 @@ for i, slide in enumerate(prs.slides):
                 for item in plot.series:
                     values = {
                         "name": item.name,
-                        "x_values": cached_numeric_values(item, "xVal"),
-                        "y_values": cached_numeric_values(item, "yVal"),
+                        # Pair x/y/bubble entries by idx; a missing idx marks a
+                        # blank point and must not shift the pairing.
+                        "x_points": cached_numeric_points(item, "xVal"),
+                        "y_points": cached_numeric_points(item, "yVal"),
                     }
                     if plot_kind == "BubblePlot":
-                        values["bubble_sizes"] = cached_numeric_values(item, "bubbleSize")
+                        values["bubble_points"] = cached_numeric_points(item, "bubbleSize")
                     series.append(values)
                 plots.append({"kind": plot_kind, "series": series})
             else:

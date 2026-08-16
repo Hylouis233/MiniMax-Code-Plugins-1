@@ -103,10 +103,13 @@ wb.save("input-edited.xlsx")
   import zipfile
   from tempfile import TemporaryFile
 
+  # XML prefixes are arbitrary - a valid workbook may bind the x14 namespace to
+  # "sx" or the markup-compatibility namespace to anything. Match the namespace
+  # URIs (and the prefix-independent local name extLst), never prefixes.
   EXTENSION_MARKERS = {
-      "extLst": b"<extLst",
-      "x14": b"x14:",
-      "AlternateContent": b"mc:AlternateContent",
+      "extLst": b"extLst",
+      "x14 namespace": b"http://schemas.microsoft.com/office/spreadsheetml/2009/9/main",
+      "markup compatibility": b"http://schemas.openxmlformats.org/markup-compatibility/2006",
   }
 
   def scan_extension_markers(archive, info):

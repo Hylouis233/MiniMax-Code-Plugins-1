@@ -38,6 +38,8 @@ with open("output.pdf", "wb") as f:
 Watermark / stamp by merging a stamp page onto each page:
 
 ```python
+from pypdf import Transformation
+
 stamp = open_pdf("watermark.pdf").pages[0]
 stamp_text = (stamp.extract_text() or "").strip()
 reader = open_pdf("input.pdf")
@@ -45,8 +47,19 @@ expected_sizes = [tuple(float(value) for value in page.mediabox) for page in rea
 expected_fields = reader.get_fields() or {}
 writer = PdfWriter()
 writer.append(reader)                 # clone pages plus catalog entries such as /AcroForm
+
+# A plain merge_page() overlays the stamp in its own coordinates, so on a page
+# with different dimensions, origin, or rotation the stamp can be clipped or
+# land entirely off-page. Scale each copy to fit its destination and center it.
+sw, sh = float(stamp.mediabox.width), float(stamp.mediabox.height)
 for page in writer.pages:
-    page.merge_page(stamp)          # stamp content on top; use merge_transformed_page to place
+    dw, dh = float(page.mediabox.width), float(page.mediabox.height)
+    scale = min(dw / sw, dh / sh)
+    tx = (dw - sw * scale) / 2 - float(stamp.mediabox.left) * scale
+    ty = (dh - sh * scale) / 2 - float(stamp.mediabox.bottom) * scale
+    page.merge_transformed_page(stamp, Transformation().scale(scale).translate(tx, ty))
+# Rotated destination pages (/Rotate != 0) apply the transformation in
+# unrotated page space: verify rotated pages visually after stamping.
 
 with open("watermarked.pdf", "wb") as f:
     writer.write(f)

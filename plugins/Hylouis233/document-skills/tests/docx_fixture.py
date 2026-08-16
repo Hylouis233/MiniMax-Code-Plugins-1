@@ -447,5 +447,65 @@ pages_with_labels = [
 ]
 check("rendered signature table stays on one page", len(pages_with_labels) == 1, pages_with_labels)
 
+
+# ---- read.md snippet: merged-cell spans survive extraction -----------------------
+def table_matrix(table):
+    rows = []
+    for row in table.rows:
+        cells = []
+        for tc in row._tr.tc_lst:
+            tc_pr = tc.find(qn("w:tcPr"))
+            grid_span = tc_pr.find(qn("w:gridSpan")) if tc_pr is not None else None
+            v_merge = tc_pr.find(qn("w:vMerge")) if tc_pr is not None else None
+            note = ""
+            if grid_span is not None:
+                note += "(span {})".format(grid_span.get(qn("w:val")))
+            if v_merge is not None:
+                note += "(vmerge start)" if v_merge.get(qn("w:val")) == "restart" else "(vmerge cont.)"
+            text = "".join(node.text or "" for node in tc.iter(qn("w:t")))
+            cells.append(text + note if note else text)
+        rows.append(cells)
+    return rows
+
+merge_doc = Document()
+merge_table = merge_doc.add_table(rows=3, cols=3)
+merge_table.cell(0, 0).text = "HEAD"  # set only the origin; merging concatenates texts
+merge_table.cell(0, 0).merge(merge_table.cell(0, 1))
+merge_table.cell(1, 2).text = "TOP"
+merge_table.cell(2, 2).text = "BOTTOM"
+merge_table.cell(1, 2).merge(merge_table.cell(2, 2))
+merge_doc.save("merged-cells.docx")
+merged_reopened = Document("merged-cells.docx")
+merged_table = merged_reopened.tables[0]
+naive_lengths = [len(row.cells) for row in merged_table.rows]
+naive_row0 = [cell.text for cell in merged_table.rows[0].cells]
+matrix = table_matrix(merged_table)
+check("naive row.cells expands merges to full grid width (negative control)",
+      naive_lengths == [3, 3, 3] and naive_row0[0] == naive_row0[1] == "HEAD",
+      (naive_lengths, naive_row0))
+check("matrix keeps one entry per real tc",
+      [len(row) for row in matrix] == [2, 3, 3], matrix)
+check("horizontal merge is annotated", "(span 2)" in matrix[0][0], matrix[0])
+check("vertical merge start and continuation are annotated",
+      any("(vmerge start)" in cell for cell in matrix[1]) and
+      any("(vmerge cont.)" in cell for cell in matrix[2]), matrix)
+
+# ---- cjk.md snippet: Hangul routes through the East Asian slot -------------------
+def font_slot(character):
+    codepoint = ord(character)
+    return "eastAsia" if (
+        0x1100 <= codepoint <= 0x11FF or 0x2E80 <= codepoint <= 0x9FFF
+        or 0x3130 <= codepoint <= 0x318F or 0xA960 <= codepoint <= 0xA97F
+        or 0xAC00 <= codepoint <= 0xD7FF or 0xF900 <= codepoint <= 0xFAFF
+        or 0x20000 <= codepoint <= 0x3134F
+    ) else ("ascii" if codepoint < 128 else "hAnsi")
+
+check("Hangul syllables use the East Asian slot", font_slot("한") == "eastAsia")
+check("Hangul jamo use the East Asian slot", font_slot("ᄀ") == "eastAsia")
+check("compatibility jamo use the East Asian slot", font_slot("ㄱ") == "eastAsia")
+check("Latin stays in the ascii slot", font_slot("A") == "ascii")
+check("non-CJK fullwidth-range-adjacent Latin-1 stays hAnsi", font_slot("é") == "hAnsi")
+
+
 print("\n" + ("ALL DOCX FIXTURES PASSED" if not failures else f"{len(failures)} FAILURES: {failures}"))
 sys.exit(0 if not failures else 1)

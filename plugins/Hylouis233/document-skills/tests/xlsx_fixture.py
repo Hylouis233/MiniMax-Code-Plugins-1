@@ -218,7 +218,7 @@ check(
 
 # ---- edit.md structural audit includes non-cell dependencies ------------------
 from openpyxl.chart import BarChart, Reference
-from openpyxl.formatting.rule import FormulaRule
+from openpyxl.formatting.rule import CellIsRule, FormulaRule
 from openpyxl.workbook.defined_name import DefinedName
 from openpyxl.worksheet.datavalidation import DataValidation
 from openpyxl.worksheet.table import Table
@@ -393,6 +393,41 @@ check("manual calc mode survives save/reload",
 check("reloaded formula cell still holds the formula string",
       calc_reopened.active["A3"].value == "=SUM(A1:A2)", calc_reopened.active["A3"].value)
 calc_reopened.close()
+
+
+# ---- edit.md snippet: extension detection is prefix-independent ------------------
+X14_URI = b"http://schemas.microsoft.com/office/spreadsheetml/2009/9/main"
+MC_URI = b"http://schemas.openxmlformats.org/markup-compatibility/2006"
+EXTENSION_MARKERS = {
+    "extLst": b"extLst",
+    "x14 namespace": X14_URI,
+    "markup compatibility": MC_URI,
+}
+
+def markers_in(data):
+    return {label for label, marker in EXTENSION_MARKERS.items() if marker in data}
+
+custom_prefix_sheet = (
+    b'<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+    b'xmlns:sx="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main" '
+    b'xmlns:ooo="http://schemas.openxmlformats.org/markup-compatibility/2006">'
+    b'<ooo:AlternateContent><sx:extLst/></ooo:AlternateContent></worksheet>'
+)
+found = markers_in(custom_prefix_sheet)
+check("namespace markers detect custom-prefix x14 extensions", "x14 namespace" in found, found)
+check("namespace markers detect custom-prefix markup compatibility", "markup compatibility" in found, found)
+check("local-name marker detects any-prefix extLst", "extLst" in found, found)
+legacy_prefix_markers = {b"x14:", b"mc:AlternateContent"}
+check("prefix markers are provably blind to custom prefixes (negative control)",
+      not any(marker in custom_prefix_sheet for marker in legacy_prefix_markers))
+
+# ---- formatting.md guard: header-only sheets skip conditional formatting ---------
+header_wb = openpyxl.Workbook()
+header_ws = header_wb.active
+header_ws.append(["Qty", "Note"])
+guard_last = header_ws.max_row
+if guard_last < 2:
+    pass  # guarded route: skip building rules
 
 print("\n" + ("ALL XLSX FIXTURES PASSED" if not failures else f"{len(failures)} FAILURES: {failures}"))
 sys.exit(0 if not failures else 1)

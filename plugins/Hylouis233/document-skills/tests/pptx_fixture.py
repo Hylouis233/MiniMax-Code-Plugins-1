@@ -552,5 +552,35 @@ except AssertionError:
     archive_bomb_rejected = True
 check("PPTX compression bomb is rejected before XML expansion", archive_bomb_rejected)
 
+
+# ---- analyze.md snippet: sparse cache points keep their idx ----------------------
+sparse_chart_xml = (
+    '<c:ser xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">'
+    '<c:idx val="0"/><c:order val="0"/><c:tx><c:v>series</c:v></c:tx>'
+    '<c:xVal><c:numRef><c:numCache><c:formatCode>General</c:formatCode>'
+    '<c:ptCount val="6"/>'
+    '<c:pt idx="0"><c:v>1</c:v></c:pt>'
+    '<c:pt idx="2"><c:v>5</c:v></c:pt>'
+    '<c:pt idx="5"><c:v>9</c:v></c:pt>'
+    '</c:numCache></c:numRef></c:xVal></c:ser>'
+)
+from pptx.oxml.ns import qn as pptx_qn
+
+def cached_numeric_points(series_element, element_name):
+    return [
+        (int(pt.get("idx")), pt.find(pptx_qn("c:v")).text)
+        for pt in series_element.xpath(f"./c:{element_name}//c:pt")
+        if pt.get("idx") is not None and pt.find(pptx_qn("c:v")) is not None
+    ]
+
+from pptx.oxml import parse_xml as pptx_parse_xml
+sparse_series = pptx_parse_xml(sparse_chart_xml)
+points = cached_numeric_points(sparse_series, "xVal")
+check("sparse cache points keep their idx", points == [(0, "1"), (2, "5"), (5, "9")], points)
+compact = [value for _, value in points]
+check("compact extraction is provably lossy (negative control)",
+      compact == ["1", "5", "9"] and len({idx for idx, _ in points}) == len(points))
+
+
 print("\n" + ("ALL PPTX FIXTURES PASSED" if not failures else f"{len(failures)} FAILURES: {failures}"))
 sys.exit(0 if not failures else 1)

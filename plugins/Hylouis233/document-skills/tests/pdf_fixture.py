@@ -285,5 +285,67 @@ if detected.tables:
     check("find_tables extracts the header row", extracted_rows[0] == ["Region", "Sales"], extracted_rows)
     check("find_tables extracts data rows", extracted_rows[2] == ["South", "340"], extracted_rows)
 
+
+# ---- transform.md: stamps are scaled to each destination page --------------------
+from pypdf import Transformation
+
+mixed_writer = PdfWriter()
+mixed_writer.append(open_pdf("form.pdf"))
+small_source = PdfWriter()
+small_source.add_blank_page(width=200, height=300)
+mixed_writer.append(small_source)
+with open("mixed.pdf", "wb") as f:
+    mixed_writer.write(f)
+
+# Negative control: a plain merge keeps the A4 stamp's coordinates, so the text
+# lands outside the small page and cannot be extracted.
+plain_writer = PdfWriter()
+plain_writer.append(open_pdf("mixed.pdf"))
+for page in plain_writer.pages:
+    page.merge_page(R2("stamp.pdf").pages[0])
+with open("plain-stamped.pdf", "wb") as f:
+    plain_writer.write(f)
+
+def stamp_bboxes(path, page_number):
+    doc = fitz.open(path)
+    spans = []
+    for block in doc[page_number].get_text("dict")["blocks"]:
+        for line in block.get("lines", []):
+            for span in line["spans"]:
+                if "DRAFT" in span["text"]:
+                    spans.append(span["bbox"])
+    return spans
+
+# The plain merge keeps the A4 stamp's coordinates, so on the 200x300 page the
+# stamp is far outside the box: PyMuPDF's positioned extraction sees no span at
+# all, while pypdf's plain extractor still returns the text - proof that text
+# extraction alone cannot validate visual placement.
+plain_spans = stamp_bboxes("plain-stamped.pdf", 2)
+check("plain merge pushes the stamp outside the small page (negative control)",
+      plain_spans == [] and "DRAFT" in (R2("plain-stamped.pdf").pages[2].extract_text() or ""),
+      plain_spans)
+
+scaled_writer = PdfWriter()
+scaled_writer.append(open_pdf("mixed.pdf"))
+stamp_page = R2("stamp.pdf").pages[0]
+sw2, sh2 = float(stamp_page.mediabox.width), float(stamp_page.mediabox.height)
+for page in scaled_writer.pages:
+    dw, dh = float(page.mediabox.width), float(page.mediabox.height)
+    scale = min(dw / sw2, dh / sh2)
+    tx = (dw - sw2 * scale) / 2 - float(stamp_page.mediabox.left) * scale
+    ty = (dh - sh2 * scale) / 2 - float(stamp_page.mediabox.bottom) * scale
+    page.merge_transformed_page(stamp_page, Transformation().scale(scale).translate(tx, ty))
+with open("scaled-stamped.pdf", "wb") as f:
+    scaled_writer.write(f)
+scaled_check = R2("scaled-stamped.pdf")
+check("scaled stamp is present on the A4 pages",
+      all("DRAFT" in (p.extract_text() or "") for p in scaled_check.pages[:2]))
+scaled_spans = stamp_bboxes("scaled-stamped.pdf", 2)
+check("scaled stamp lands inside the mixed-size small page",
+      bool(scaled_spans) and all(bbox[1] < 300 and bbox[3] <= 300.5 for bbox in scaled_spans),
+      scaled_spans)
+check("mixed-size pages keep their original dimensions",
+      [round(float(p.mediabox.width)) for p in scaled_check.pages] == [595, 595, 200])
+
 print("\n" + ("ALL PDF FIXTURES PASSED" if not failures else f"{len(failures)} FAILURES: {failures}"))
 sys.exit(0 if not failures else 1)

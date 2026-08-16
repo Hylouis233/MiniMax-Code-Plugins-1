@@ -141,8 +141,12 @@ section.left_margin, section.right_margin = Cm(2.8), Cm(2.6)
 
    def font_slot(character):
        codepoint = ord(character)
+       # Word renders Korean through the East Asian slot as well: Hangul Jamo,
+       # compatibility Jamo, extended-A, and the syllable blocks.
        return "eastAsia" if (
-           0x2E80 <= codepoint <= 0x9FFF or 0xF900 <= codepoint <= 0xFAFF
+           0x1100 <= codepoint <= 0x11FF or 0x2E80 <= codepoint <= 0x9FFF
+           or 0x3130 <= codepoint <= 0x318F or 0xA960 <= codepoint <= 0xA97F
+           or 0xAC00 <= codepoint <= 0xD7FF or 0xF900 <= codepoint <= 0xFAFF
            or 0x20000 <= codepoint <= 0x3134F
        ) else ("ascii" if codepoint < 128 else "hAnsi")
 
