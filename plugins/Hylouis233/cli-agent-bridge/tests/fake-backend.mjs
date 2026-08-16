@@ -37,6 +37,29 @@ if (spec.branchRoundTrip) {
   writeFileSync(path.resolve(process.cwd(), spec.writeFile ?? "current.txt"), spec.contents ?? "current\n");
   execFileSync("git", ["add", spec.writeFile ?? "current.txt"]);
   execFileSync("git", ["commit", "-m", spec.commitMessage ?? "worker commit on current branch"]);
+  if (spec.refName) {
+    const oid = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    execFileSync("git", ["update-ref", spec.refName, oid]);
+  }
+  event("end");
+} else if (spec.fetchAndCommit) {
+  // Simulate a fetch that adds external history, followed by one local worker
+  // commit based on the fetched tip.
+  event("start");
+  const original = execFileSync("git", ["branch", "--show-current"], { encoding: "utf8" }).trim();
+  execFileSync("git", ["checkout", "-b", "fixture-upstream"]);
+  writeFileSync(path.resolve(process.cwd(), "upstream.txt"), "external upstream history\n");
+  execFileSync("git", ["add", "upstream.txt"]);
+  execFileSync("git", ["commit", "-m", "fetched upstream commit"]);
+  const upstreamOid = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  execFileSync("git", ["checkout", original]);
+  execFileSync("git", ["branch", "-D", "fixture-upstream"]);
+  execFileSync("git", ["update-ref", "refs/remotes/origin/main", upstreamOid]);
+  execFileSync("git", ["checkout", "-b", spec.branchName ?? "fetched-work", upstreamOid]);
+  writeFileSync(path.resolve(process.cwd(), spec.writeFile ?? "worker-after-fetch.txt"), "worker\n");
+  execFileSync("git", ["add", spec.writeFile ?? "worker-after-fetch.txt"]);
+  execFileSync("git", ["commit", "-m", spec.commitMessage ?? "worker commit after fetch"]);
+  execFileSync("git", ["checkout", original]);
   event("end");
 } else if (spec.newBranchFromExisting) {
   // Fork a new branch from a pre-existing divergent branch, commit, and return.

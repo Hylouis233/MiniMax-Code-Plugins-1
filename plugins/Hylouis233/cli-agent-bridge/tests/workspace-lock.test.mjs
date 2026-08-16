@@ -104,6 +104,36 @@ test("a stale lock with a live owner is never stolen", async (context) => {
   assert.equal(await git(repo, ["rev-parse", ref]), oldOid);
 });
 
+test("a stale owner PID reused by another process does not pin an idle lease", async (context) => {
+  const repo = await makeRepo(context);
+  const key = "git-worktree:" + repo;
+  const ref = workspaceLockRef(key);
+  const now = Date.now();
+  await installOwner(repo, ref, {
+    version: 1,
+    token: "reused-owner-pid",
+    hostIdentity: localHostIdentity(),
+    ownerPid: 12345,
+    ownerIdentity: "original-start",
+    workerState: "idle",
+    workerPid: null,
+    acquiredAt: now - 60_000,
+    heartbeatAt: now - 60_000,
+  });
+  const result = await tryAcquireGitWorkspaceLock({
+    cwd: repo,
+    key,
+    now,
+    staleMs: 1_000,
+    heartbeatMs: 60_000,
+    processProbe: () => "alive",
+    processIdentityProbe: () => "reused-start",
+  });
+  assert.equal(result.acquired, true,
+    "a live but differently-started PID is not the original stale owner");
+  await result.lease.release();
+});
+
 test("uncertain worker liveness fails closed during stale-owner recovery", async (context) => {
   const repo = await makeRepo(context);
   const key = "git-worktree:" + repo;
@@ -197,6 +227,31 @@ test("a failed release can be recovered by the next local holder in every comple
     assert.equal(second.acquired, true, "the next local holder should replace the " + state + " ref");
     await second.lease.release();
   }
+});
+
+test("a failed release in one linked worktree is recoverable from another", async (context) => {
+  const repo = await makeRepo(context);
+  await git(repo, ["config", "user.email", "fixture@example.com"]);
+  await git(repo, ["config", "user.name", "Fixture"]);
+  await git(repo, ["commit", "--allow-empty", "-m", "baseline"]);
+  const linked = path.join(path.dirname(repo), "linked");
+  await git(repo, ["worktree", "add", "-b", "linked", linked]);
+  const key = "git-common-dir:shared-fixture";
+  const first = await tryAcquireGitWorkspaceLock({ cwd: repo, key, heartbeatMs: 60_000 });
+  assert.equal(first.acquired, true);
+  const commonDirectory = path.resolve(repo, await git(repo, ["rev-parse", "--git-common-dir"]));
+  const refPath = path.join(commonDirectory, ...first.lease.ref.split("/"));
+  await mkdir(path.dirname(refPath), { recursive: true });
+  const blocker = refPath + ".lock";
+  await writeFile(blocker, "intentional linked-worktree release failure\n");
+  await assert.rejects(first.lease.release(), /cannot delete workspace lock ref/iu);
+  first.lease.allowLocalRecovery();
+  await rm(blocker, { force: true });
+
+  const second = await tryAcquireGitWorkspaceLock({ cwd: linked, key, heartbeatMs: 60_000 });
+  assert.equal(second.acquired, true,
+    "the repository-scoped abandoned OID is visible from every linked worktree");
+  await second.lease.release();
 });
 
 test("post-CAS cancellation remains recoverable when its compensating delete fails", async (context) => {
@@ -347,6 +402,29 @@ test("a quarantined lease without proof of a durable marker fails closed", async
   });
   assert.deepEqual(result, { acquired: false, reason: "held" },
     "an absent marker is not operator clearance unless persistence was recorded");
+});
+
+test("a different OS user cannot clear another user's quarantined lease", async (context) => {
+  const repo = await makeRepo(context);
+  const key = "git-worktree:" + repo;
+  const now = Date.now();
+  await installOwner(repo, workspaceLockRef(key), {
+    version: 1,
+    token: "other-user-quarantine",
+    hostIdentity: localHostIdentity() + ":other-user",
+    ownerPid: 12345,
+    ownerIdentity: "other-user-process",
+    workerState: "quarantined",
+    quarantineMarkerPersisted: true,
+    workerPid: 5353,
+    acquiredAt: now - 120_000,
+    heartbeatAt: now - 120_000,
+  });
+  const result = await tryAcquireGitWorkspaceLock({
+    cwd: repo, key, now, staleMs: 30_000, processProbe: () => "dead",
+    operatorCleared: () => true,
+  });
+  assert.deepEqual(result, { acquired: false, reason: "held" });
 });
 
 test("a quarantined lease left by a crashed owner is reclaimable after the stale window", async (context) => {

@@ -7,11 +7,25 @@ import test from "node:test";
 import {
   isProcessTreeAlive,
   linuxProcessGroupHasLiveMembers,
+  parsePosixProcessLine,
   refreshProcessTree,
   signalProcessTree,
   waitForProcessTreeExit,
   windowsProcessTreePids,
 } from "../process-tree.mjs";
+
+test("BSD ps snapshots retain process start identity for PID-reuse checks", () => {
+  assert.deepEqual(
+    parsePosixProcessLine(" 432  1  432 S  Sun Aug 16 12:34:56 2026"),
+    {
+      pid: 432,
+      parentPid: 1,
+      processGroupId: 432,
+      state: "S",
+      startIdentity: "Sun Aug 16 12:34:56 2026",
+    },
+  );
+});
 
 async function writeProcStat(root, pid, {
   state, group, parent = 1, startIdentity = pid, command = "worker",
@@ -28,6 +42,13 @@ async function writeTaskChildren(root, pid, children) {
   const taskDirectory = path.join(root, String(pid), "task", String(pid));
   await mkdir(taskDirectory, { recursive: true });
   await writeFile(path.join(taskDirectory, "children"), children.join(" ") + "\n");
+}
+
+async function writeRunMarker(root, pid, marker) {
+  await writeFile(
+    path.join(root, String(pid), "environ"),
+    `PATH=/fixture\0CLI_AGENT_BRIDGE_RUN_ID=${marker}\0`,
+  );
 }
 
 test("Linux ancestry refresh follows task children without scanning all of procfs", async (context) => {
@@ -52,6 +73,27 @@ test("Linux ancestry refresh follows task children without scanning all of procf
   });
   assert.deepEqual(new Set(snapshot.map((item) => item.pid)), new Set([601, 602]));
   assert.equal(treeState.knownStarts.get(602), "11");
+});
+
+test("Linux refresh recovers a marked detached child after its parent exits", async (context) => {
+  const procRoot = await mkdtemp(path.join(os.tmpdir(), "cli-agent-bridge-proc-"));
+  context.after(() => rm(procRoot, { recursive: true, force: true }));
+  await writeProcStat(procRoot, 702, {
+    state: "S", group: 702, parent: 1, startIdentity: 22,
+  });
+  await writeTaskChildren(procRoot, 702, []);
+  await writeRunMarker(procRoot, 702, "fixture-run");
+  const treeState = {
+    knownPids: new Set([701]),
+    knownStarts: new Map(),
+    runMarker: "fixture-run",
+  };
+  const snapshot = await refreshProcessTree({ pid: 701 }, treeState, {
+    platform: "linux", procRoot, fsOps: { readdir, readFile },
+  });
+  assert.deepEqual(snapshot.map((item) => item.pid), [702]);
+  assert.ok(treeState.knownPids.has(702),
+    "the inherited run marker preserves containment after orphan reparenting");
 });
 
 test("Linux liveness ignores zombie-only process groups", async (context) => {

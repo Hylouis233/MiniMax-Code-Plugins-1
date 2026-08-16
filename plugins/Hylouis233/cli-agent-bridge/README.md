@@ -119,7 +119,10 @@ you already obtained a valid ID from that backend outside this Plugin.
   when separate MCP clients launched separate bridge server processes. Use separate clean clones
   for parallel comparison runs. The cross-process lock is an owner blob referenced by an atomic Git-ref
   compare-and-swap. A stale idle lock is reclaimed only when its same-host owner is positively
-  confirmed dead; malformed, foreign-host, starting, running, or uncertain records fail closed.
+  confirmed dead; owner records include the bridge process start identity so a reused PID cannot
+  pin the queue. The host identity also includes the OS user, so another user cannot interpret a
+  user-scoped quarantine marker as cleared. Malformed, foreign-user/host, starting, running, or
+  uncertain records fail closed.
   A crashed bridge cannot reconstruct descendants that escaped into another POSIX session from the
   recorded worker PID alone, so inspect leftover processes and clear those hidden refs manually.
 - Linked worktrees share refs and therefore intentionally share one repository lock. The
@@ -136,7 +139,10 @@ you already obtained a valid ID from that backend outside this Plugin.
   session/process group so cancellation still terminates them; tracked PIDs are matched against
   their recorded start identity (process start time on POSIX, creation time on Windows) so a
   reused PID is never signaled, and a POSIX process group is only signaled while its original
-  leader identity still matches. If termination cannot be confirmed, the bridge writes a shared
+  leader identity still matches. On Linux, descendants also inherit a per-run environment marker;
+  if the parent exits before ancestry polling, the close path performs one marker scan to recover
+  reparented children without continuously scanning all of `/proc`. If termination cannot be
+  confirmed, the bridge writes a shared
   quarantine marker, moves its lease into the recoverable `quarantined` state, and every bridge
   process refuses further delegation until an operator checks for leftovers and deliberately
   removes the reported quarantinePath - removing that marker also authorizes the next delegation
@@ -156,7 +162,10 @@ you already obtained a valid ID from that backend outside this Plugin.
   returns to the original branch still reports the created ref and commit. Commits are attributed
   to the worker only when they are not reachable from any pre-delegation ref, so checking out an
   existing divergent branch is reported as a HEAD move with no new commits, and refs pointing at
-  non-commit objects (for example a blob tag) are reported without failing the delegation. Any
+  non-commit objects (for example a blob tag) are reported without failing the delegation. A commit
+  reached through multiple moved refs is counted and logged once with all contributing labels;
+  remote-tracking updates are treated as externally sourced fetch history and excluded from worker
+  attribution, including when a local worker commit builds on the fetched tip. Any
   bounded Git capture that truncates is rejected as an unreliable snapshot; backend output
   truncation is disclosed.
 - zcode and dsh backends are experimental: ZCode desktop builds have no verified headless CLI,
@@ -182,7 +191,8 @@ process-tree termination, escaped POSIX descendants and zombie-only Linux groups
 identity checks before signaling, unusual Git pathnames (including a trailing-space worktree
 root), JSON-RPC id typing, unborn HEAD and non-HEAD ref changes, checkout-only HEAD moves,
 single-count attribution for commits on the checked-out branch, fork-point diff baselines for
-new branches, non-commit refs, repository-wide serialization between linked worktrees,
+new branches, non-commit refs, fetched-history exclusion, repository-wide serialization and
+failed-release recovery between linked worktrees,
 capture truncation, and Codex prompt delimiters on Windows and POSIX.
 
 ## License

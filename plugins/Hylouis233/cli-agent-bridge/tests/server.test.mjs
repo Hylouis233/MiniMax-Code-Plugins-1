@@ -588,6 +588,28 @@ test("cancellation terminates a descendant that creates a new POSIX session", {
   await assert.rejects(access(path.join(workspace, "detached-descendant-survived.txt")), /ENOENT/u);
 });
 
+test("a detached child remains contained when its parent exits before ancestry polling", {
+  skip: process.platform !== "linux",
+}, async (context) => {
+  const { tempRoot, workspace, client } = await makeHarness(context);
+  const eventFile = path.join(tempRoot, "fast-parent-events.jsonl");
+  const response = await client.request("tools/call", taskArguments(workspace, {
+    name: "fast-parent",
+    eventFile,
+    spawnDescendant: true,
+    detachedDescendant: true,
+    parentDelayMs: 0,
+    descendantDelayMs: 1_200,
+    descendantWriteFile: "fast-parent-descendant-survived.txt",
+  }));
+  const out = response.result.structuredContent;
+  assert.equal(out.treeTerminated, true, JSON.stringify(out));
+  assert.equal(out.orphanedProcesses, true,
+    "the close path discovers the reparented child through its inherited run marker");
+  await new Promise((resolve) => setTimeout(resolve, 1_400));
+  await assert.rejects(access(path.join(workspace, "fast-parent-descendant-survived.txt")), /ENOENT/u);
+});
+
 test("timeout terminates descendants before releasing the request", async (context) => {
   const { tempRoot, workspace, client } = await makeHarness(context);
   const eventFile = path.join(tempRoot, "events.jsonl");
@@ -887,6 +909,24 @@ test("a commit on the checked-out branch is reported exactly once", async (conte
     "the deduplicated target carries both labels");
 });
 
+test("one commit reached through a branch and tag is counted and logged once", async (context) => {
+  const { workspace, client } = await makeHarness(context);
+  const response = await client.request("tools/call", taskArguments(workspace, {
+    name: "current-commit-with-tag", commitCurrent: true,
+    writeFile: "tagged-current.txt", commitMessage: "single tagged worker commit",
+    refName: "refs/tags/worker-tag",
+  }));
+  const out = response.result.structuredContent;
+  assert.equal(out.ok, true, JSON.stringify(out.error));
+  assert.equal(out.commits.newCommitCount, 1);
+  assert.equal(out.commits.log.split("single tagged worker commit").length - 1, 1,
+    out.commits.log);
+  assert.match(out.commits.log, /HEAD, refs\/heads\/main, refs\/tags\/worker-tag/u,
+    "the unique commit retains every contributing ref label");
+  assert.match(out.commits.diffStat, /HEAD, refs\/heads\/main, refs\/tags\/worker-tag/u,
+    "the identical commit range is emitted once with every contributing ref label");
+});
+
 test("a new branch forked from a divergent branch diffs only its own commits", async (context) => {
   const { workspace, client } = await makeHarness(context);
   await execFileAsync("git", ["checkout", "-b", "divergent"], { cwd: workspace });
@@ -907,6 +947,24 @@ test("a new branch forked from a divergent branch diffs only its own commits", a
   assert.doesNotMatch(out.commits.diffStat, /divergent\.txt/u,
     "the diff base is the fork point, not the original HEAD");
   assert.match(out.commits.diffStat, /fork\.txt/u);
+});
+
+test("fetched remote history is excluded from worker-created commits", async (context) => {
+  const { workspace, client } = await makeHarness(context);
+  const response = await client.request("tools/call", taskArguments(workspace, {
+    name: "fetch-then-work", fetchAndCommit: true,
+    branchName: "fetched-work", writeFile: "worker-after-fetch.txt",
+    commitMessage: "worker commit after fetch",
+  }));
+  const out = response.result.structuredContent;
+  assert.equal(out.ok, true, JSON.stringify(out.error));
+  assert.equal(out.commits.newCommitCount, 1, out.commits.log);
+  assert.match(out.commits.log, /worker commit after fetch/u);
+  assert.doesNotMatch(out.commits.log, /fetched upstream commit/u);
+  assert.match(out.commits.log, /refs\/remotes\/origin\/main moved to externally sourced history/u);
+  assert.doesNotMatch(out.commits.diffStat, /upstream\.txt/u,
+    "external fetched content is part of the attribution baseline");
+  assert.match(out.commits.diffStat, /worker-after-fetch\.txt/u);
 });
 
 test("list_backends can be cancelled while a version probe hangs", async (context) => {
@@ -937,6 +995,31 @@ test("list_backends can be cancelled while a version probe hangs", async (contex
   const elapsed = Date.now() - started;
   assert.ok(elapsed < 12_000, "cancellation must terminate the probe well before the 15s timeout");
   assert.ok(Array.isArray(response.result.structuredContent.backends));
+});
+
+test("backend spawn failures report the launch error", {
+  skip: process.platform === "win32",
+}, async (context) => {
+  const { workspace, configPath, client } = await makeHarness(context);
+  await writeFile(configPath, JSON.stringify({
+    backends: {
+      missing: {
+        label: "Missing backend",
+        command: "cli-agent-bridge-command-that-does-not-exist",
+        buildArgs: ["<task>"],
+        resumeArgs: null,
+        experimental: false,
+      },
+    },
+  }));
+  const response = await client.request("tools/call", {
+    name: "delegate_task",
+    arguments: { backend: "missing", task: "run", workspacePath: workspace },
+  });
+  const out = response.result.structuredContent;
+  assert.equal(out.ok, false);
+  assert.match(out.error, /failed to start.*ENOENT/iu);
+  assert.doesNotMatch(out.error, /exited with code null/iu);
 });
 
 test("PowerShell shim runner fails closed for a missing backend", {

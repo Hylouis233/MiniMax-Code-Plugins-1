@@ -16,13 +16,24 @@ const RELEASE_ATTEMPTS = 3;
 // A failed release may leave this process's exact owner blob installed. The
 // server registers that OID while its in-process FIFO gate is still held, so
 // only the next local holder may replace it after the failed request unwinds.
+// The ref already includes the repository-scoped key; do not add a worktree
+// cwd, because linked worktrees share this same lease.
 const locallyAbandonedRefs = new Map();
 
 export class WorkspaceLockCancelledError extends Error {}
 export class WorkspaceLockDeadlineError extends Error {}
 
 export function localHostIdentity() {
-  return `${process.platform}:${os.hostname().toLowerCase()}`;
+  let userIdentity;
+  try {
+    const user = os.userInfo();
+    userIdentity = Number.isInteger(user.uid) && user.uid >= 0
+      ? "uid:" + String(user.uid)
+      : "user:" + user.username + ":" + user.homedir;
+  } catch {
+    userIdentity = "user:" + (process.env.USERNAME ?? process.env.USER ?? "unknown");
+  }
+  return `${process.platform}:${os.hostname().toLowerCase()}:${userIdentity}`;
 }
 
 export function workspaceLockRef(key) {
@@ -228,6 +239,7 @@ async function canReclaim(owner, {
   staleMs,
   hostIdentity,
   processProbe,
+  processIdentityProbe = null,
   operatorCleared = null,
 }) {
   if (!owner || owner.version !== 1 || owner.hostIdentity !== hostIdentity) return false;
@@ -246,10 +258,11 @@ async function canReclaim(owner, {
         if (await operatorCleared()) return true;
       } catch { /* treat a failed check as not cleared */ }
     }
-    return now - owner.heartbeatAt >= staleMs && await processProbe(owner.ownerPid) === "dead";
+    return now - owner.heartbeatAt >= staleMs &&
+      await originalOwnerStatus(owner, processProbe, processIdentityProbe) === "dead";
   }
   if (now - owner.heartbeatAt < staleMs) return false;
-  if (await processProbe(owner.ownerPid) !== "dead") return false;
+  if (await originalOwnerStatus(owner, processProbe, processIdentityProbe) !== "dead") return false;
   if (owner.workerState === "idle" && owner.workerPid === null) return true;
   // Starting/running records always fail closed. The live bridge tracks
   // descendants that escape into new POSIX sessions, but that in-memory tree
@@ -257,12 +270,25 @@ async function canReclaim(owner, {
   return false;
 }
 
-function makeOwner({ hostIdentity, ownerPid, now }) {
+async function originalOwnerStatus(owner, processProbe, processIdentityProbe) {
+  const status = await processProbe(owner.ownerPid);
+  if (status !== "alive" || !owner.ownerIdentity || !processIdentityProbe) return status;
+  try {
+    const observed = await processIdentityProbe(owner.ownerPid);
+    if (typeof observed === "string" && observed) {
+      return observed === owner.ownerIdentity ? "alive" : "dead";
+    }
+  } catch { /* identity uncertainty fails closed */ }
+  return "unknown";
+}
+
+function makeOwner({ hostIdentity, ownerPid, ownerIdentity, now }) {
   return {
     version: 1,
     token: randomUUID(),
     hostIdentity,
     ownerPid,
+    ownerIdentity,
     workerState: "idle",
     workerPid: null,
     acquiredAt: now,
@@ -271,7 +297,7 @@ function makeOwner({ hostIdentity, ownerPid, now }) {
 }
 
 function createLease({ cwd, ref, oid, owner, heartbeatMs }) {
-  const localRefKey = cwd + "\0" + ref;
+  const localRefKey = ref;
   const ownerToken = owner.token;
   let currentOid = oid;
   let currentOwner = owner;
@@ -416,23 +442,25 @@ export async function tryAcquireGitWorkspaceLock({
   heartbeatMs = DEFAULT_HEARTBEAT_MS,
   hostIdentity = localHostIdentity(),
   ownerPid = process.pid,
+  ownerIdentity = null,
   now = Date.now(),
   processProbe = probeProcess,
+  processIdentityProbe = null,
   operatorCleared = null,
 } = {}) {
   checkInterrupted(cancel, deadline);
   const ref = workspaceLockRef(key);
-  const localRefKey = cwd + "\0" + ref;
+  const localRefKey = ref;
   const current = await readCurrentOwner(cwd, ref, { cancel, deadline });
   const abandonedOid = locallyAbandonedRefs.get(localRefKey);
   const locallyAbandoned = Boolean(current && abandonedOid === current.oid);
   if (!current || (abandonedOid && !locallyAbandoned)) locallyAbandonedRefs.delete(localRefKey);
   if (current && !locallyAbandoned && !await canReclaim(current.owner, {
-    now, staleMs, hostIdentity, processProbe, operatorCleared,
+    now, staleMs, hostIdentity, processProbe, processIdentityProbe, operatorCleared,
   })) {
     return { acquired: false, reason: "held" };
   }
-  const owner = makeOwner({ hostIdentity, ownerPid, now });
+  const owner = makeOwner({ hostIdentity, ownerPid, ownerIdentity, now });
   const newOid = await writeOwnerBlob(cwd, owner, { cancel, deadline });
   let acquired = false;
   if (!current) {

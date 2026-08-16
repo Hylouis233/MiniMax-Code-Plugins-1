@@ -235,17 +235,23 @@ async function runCommand(command, args, options = {}) {
       return;
     }
     const manageProcessTree = options.manageProcessTree === true;
+    const linuxRunMarker = manageProcessTree && process.platform === "linux"
+      ? randomUUID()
+      : null;
+    const childEnvironment = linuxRunMarker
+      ? { ...process.env, CLI_AGENT_BRIDGE_RUN_ID: linuxRunMarker }
+      : process.env;
     const child = shellArgs
       ? spawn(shellArgs[0], shellArgs.slice(1), {
           cwd: options.cwd,
-          env: process.env,
+          env: childEnvironment,
           detached: manageProcessTree && process.platform !== "win32",
           windowsHide: true,
           stdio: [options.stdinText === undefined ? "ignore" : "pipe", "pipe", "pipe"],
         })
       : spawn(command, argv, {
           cwd: options.cwd,
-          env: process.env,
+          env: childEnvironment,
           detached: manageProcessTree && process.platform !== "win32",
           windowsHide: true,
           stdio: [options.stdinText === undefined ? "ignore" : "pipe", "pipe", "pipe"],
@@ -264,6 +270,7 @@ async function runCommand(command, args, options = {}) {
     const treeState = {
       knownPids: new Set(Number.isInteger(child.pid) ? [child.pid] : []),
       knownStarts: new Map(),
+      runMarker: linuxRunMarker,
     };
     let treeRefreshPromise = null;
     let treeRefreshTimer = null;
@@ -698,6 +705,13 @@ async function committedDelta(worktreeRoot, before, after, options = {}) {
   ])) {
     await addBaseline(oid);
   }
+  // Commits introduced by fetch live under remote-tracking refs and were
+  // created outside this worker. Add their after-state tips to the exclusion
+  // baseline before attributing any local branch/tag that builds on them.
+  const externalRefChanges = refsChanged.filter((change) =>
+    change.ref.startsWith("refs/remotes/"),
+  );
+  for (const change of externalRefChanges) await addBaseline(change.after);
 
   // A worker committing on the checked-out branch moves HEAD and its branch ref
   // across the same object pair; deduplicate by that pair so the log, diff, and
@@ -716,12 +730,16 @@ async function committedDelta(worktreeRoot, before, after, options = {}) {
   }
   addTarget("HEAD", before.head, after.head);
   for (const change of refsChanged) {
+    if (change.ref.startsWith("refs/remotes/")) continue;
     addTarget(change.ref, change.before, change.after);
   }
 
-  const logs = [];
-  const stats = [];
-  let newCommitCount = 0;
+  const movementLogs = externalRefChanges.map((change) =>
+    change.ref + " moved to externally sourced history; excluded from worker-created commits",
+  );
+  const statNotes = [];
+  const statRanges = new Map();
+  const attributedCommits = new Map();
   for (const { labels, beforeOid, afterOid } of targets) {
     if (!afterOid || beforeOid === afterOid) continue;
     const label = labels.join(", ");
@@ -729,8 +747,8 @@ async function committedDelta(worktreeRoot, before, after, options = {}) {
     if (!target) {
       // Legal non-commit ref (for example a tag pointing at a blob): report the
       // movement, never build a commit range from it.
-      logs.push(label + " -> " + afterOid + " (non-commit object; no commit log)");
-      stats.push(label + ": (non-commit ref target)");
+      movementLogs.push(label + " -> " + afterOid + " (non-commit object; no commit log)");
+      statNotes.push(label + ": (non-commit ref target)");
       continue;
     }
     // Everything reachable from the pre-delegation state is excluded, so only
@@ -738,8 +756,8 @@ async function committedDelta(worktreeRoot, before, after, options = {}) {
     const exclusions = baselineCommits;
     const revList = await runGitCommand(
       exclusions.length > 0
-        ? ["log", "--oneline", target, "--stdin"]
-        : ["log", "--oneline", target],
+        ? ["log", "--format=%H%x09%s", target, "--stdin"]
+        : ["log", "--format=%H%x09%s", target],
       {
         cwd: worktreeRoot,
         ...options,
@@ -756,11 +774,21 @@ async function committedDelta(worktreeRoot, before, after, options = {}) {
         ? "HEAD moved from " + beforeOid.slice(0, 12) + " to " + afterOid.slice(0, 12) +
           " without creating commits (branch checkout or reset); the target history predates the delegation"
         : label + " now points to pre-existing history; no new commits";
-      logs.push(label + ": " + note);
-      stats.push(label + ": (no new commits)");
+      movementLogs.push(label + ": " + note);
+      statNotes.push(label + ": (no new commits)");
       continue;
     }
-    newCommitCount += newCommits.split("\n").length;
+    for (const line of newCommits.split("\n")) {
+      const separator = line.indexOf("\t");
+      const oid = separator === -1 ? line : line.slice(0, separator);
+      const subject = separator === -1 ? "" : line.slice(separator + 1);
+      const existing = attributedCommits.get(oid);
+      if (existing) {
+        for (const item of labels) existing.labels.add(item);
+      } else {
+        attributedCommits.set(oid, { oid, subject, labels: new Set(labels) });
+      }
+    }
     // For a ref that did not exist before, diff from its best common ancestor
     // with the pre-delegation state, not from the original HEAD: a new branch
     // created from another divergent branch would otherwise attribute every
@@ -788,13 +816,34 @@ async function committedDelta(worktreeRoot, before, after, options = {}) {
     });
     const diffFailure = snapshotFailure("git diff --stat " + range, diff);
     if (diffFailure) throw new Error("committed delta unreliable: " + diffFailure);
-    logs.push(label + " [" + range + "]\n" + newCommits);
-    stats.push(label + " [" + range + "]\n" + (String(diff.stdout ?? "").trim() || "(empty)"));
+    const existingRange = statRanges.get(range);
+    if (existingRange) {
+      for (const item of labels) existingRange.labels.add(item);
+    } else {
+      statRanges.set(range, {
+        labels: new Set(labels),
+        text: String(diff.stdout ?? "").trim() || "(empty)",
+      });
+    }
   }
+  const commitLogs = [...attributedCommits.values()].map((commit) =>
+    [...commit.labels].join(", ") + ": " + commit.oid.slice(0, 12) +
+      (commit.subject ? " " + commit.subject : ""),
+  );
+  const logs = [...movementLogs];
+  if (commitLogs.length > 0) {
+    logs.push("worker-created commits (deduplicated across moved refs)\n" + commitLogs.join("\n"));
+  }
+  const stats = [
+    ...statNotes,
+    ...[...statRanges.entries()].map(([range, entry]) =>
+      [...entry.labels].join(", ") + " [" + range + "]\n" + entry.text,
+    ),
+  ];
   return {
     range: logs.length > 0 ? "attribution: new commits only (pre-existing history excluded)" : "",
     refsChanged,
-    newCommitCount,
+    newCommitCount: attributedCommits.size,
     log: logs.join("\n\n") || "(no ref or HEAD movements)",
     diffStat: stats.join("\n\n") || "(empty)",
   };
@@ -900,8 +949,8 @@ async function processStartIdentity(pid) {
       if (error.code === "ENOENT") return null;
     }
   } else if (process.platform === "win32") {
-    const script = "$p=Get-CimInstance Win32_Process -Filter 'ProcessId = " + String(pid) +
-      "'; if ($null -ne $p) { $p.CreationDate.ToUniversalTime().Ticks }";
+    const script = "$p=Get-Process -Id " + String(pid) +
+      " -ErrorAction SilentlyContinue; if ($null -ne $p) { $p.StartTime.ToUniversalTime().Ticks }";
     const result = await runCommand("powershell.exe", [
       "-NoProfile", "-NonInteractive", "-Command", script,
     ], { timeoutMs: 5_000 });
@@ -925,6 +974,17 @@ async function cachedProcessStartIdentity(pid) {
   const value = await processStartIdentity(pid);
   processIdentityCache.set(pid, { value, expiresAt: Date.now() + 1_000 });
   return value;
+}
+
+let serverProcessIdentityPromise = null;
+async function serverProcessStartIdentity() {
+  serverProcessIdentityPromise ??= processStartIdentity(process.pid);
+  const identity = await serverProcessIdentityPromise;
+  if (!identity) {
+    serverProcessIdentityPromise = null;
+    throw new Error("cannot establish the bridge process start identity for workspace locking");
+  }
+  return identity;
 }
 
 // The in-memory queue preserves FIFO order within this server. A Git-ref CAS
@@ -976,7 +1036,15 @@ async function withWorkspaceLock(key, worktreeRoot, fn, {
       return typeof onUnavailable === "function" ? onUnavailable() : undefined;
     }
     try {
-      lease = await acquireGitWorkspaceLock({ cwd: worktreeRoot, key, cancel, deadline, operatorCleared });
+      lease = await acquireGitWorkspaceLock({
+        cwd: worktreeRoot,
+        key,
+        cancel,
+        deadline,
+        operatorCleared,
+        ownerIdentity: await serverProcessStartIdentity(),
+        processIdentityProbe: processStartIdentity,
+      });
     } catch (error) {
       if (error instanceof WorkspaceLockCancelledError) {
         return typeof onCancelled === "function" ? onCancelled() : undefined;
@@ -1414,6 +1482,8 @@ async function delegateTask(rawArgs, cancel) {
       error = "backend \"" + backend + "\" timed out after " + timeoutMs + " ms" + (result.killed ? " and was force-killed" : "");
     } else if (result.orphanedProcesses) {
       error = "backend exited while descendant processes were still running; the bridge terminated the remaining process tree";
+    } else if (result.errorMessage) {
+      error = "backend \"" + backend + "\" failed to start: " + result.errorMessage;
     } else if (result.exitCode !== 0) {
       error = "backend \"" + backend + "\" exited with code " + String(result.exitCode);
     }

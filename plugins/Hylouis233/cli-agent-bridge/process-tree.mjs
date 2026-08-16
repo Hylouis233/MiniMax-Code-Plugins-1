@@ -221,6 +221,32 @@ export async function linuxProcessGroupHasLiveMembers(
   return members.some((item) => isLiveState(item.state));
 }
 
+async function linuxMarkedProcessPids(marker, procRoot, fsOps) {
+  let entries;
+  try {
+    entries = await fsOps.readdir(procRoot, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+  const expected = "CLI_AGENT_BRIDGE_RUN_ID=" + marker;
+  const matches = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !/^\d+$/u.test(entry.name)) continue;
+    try {
+      const environment = await fsOps.readFile(`${procRoot}/${entry.name}/environ`);
+      const values = Buffer.isBuffer(environment)
+        ? environment.toString("utf8").split("\0")
+        : String(environment).split("\0");
+      if (values.includes(expected)) matches.push(Number(entry.name));
+    } catch (error) {
+      // Processes may exit or belong to another user while /proc is scanned.
+      // Neither case invalidates positive matches from this bridge's marker.
+      if (!["ENOENT", "EACCES", "EPERM"].includes(error.code)) return null;
+    }
+  }
+  return matches;
+}
+
 // Follow only PIDs already owned by this worker and the kernel-maintained child
 // lists for their tasks. This keeps the short escape-detection interval without
 // rescanning every process on the host for the lifetime of a delegation.
@@ -237,7 +263,18 @@ async function linuxTrackedProcessSnapshot(rootPid, treeState, procRoot, fsOps) 
     } catch {
       return null;
     }
-    if (item === undefined) continue;
+    if (item === undefined) {
+      if (pid === rootPid && treeState.runMarker) {
+        const markedPids = await linuxMarkedProcessPids(treeState.runMarker, procRoot, fsOps);
+        if (markedPids === null) return null;
+        for (const markedPid of markedPids) {
+          if (queued.has(markedPid)) continue;
+          queued.add(markedPid);
+          queue.push(markedPid);
+        }
+      }
+      continue;
+    }
     if (item === null) return null;
     const expected = treeState.knownStarts.get(pid);
     if (expected && item.startIdentity && expected !== item.startIdentity) continue;
@@ -282,21 +319,30 @@ async function posixProcessSnapshot({
   fsOps = { readdir, readFile },
 } = {}) {
   if (platform === "linux") return await linuxProcessSnapshot(procRoot, fsOps);
-  const result = await runUtility("ps", ["-axo", "pid=,ppid=,pgid=,stat="]);
+  const result = await runUtility("ps", ["-axo", "pid=,ppid=,pgid=,stat=,lstart="]);
   if (result.exitCode !== 0) return null;
-  const processes = result.stdout.split(/\r?\n/u).flatMap((line) => {
-    const fields = line.trim().split(/\s+/u);
-    if (fields.length < 4) return [];
-    return [{
-      pid: Number(fields[0]),
-      parentPid: Number(fields[1]),
-      processGroupId: Number(fields[2]),
-      state: fields[3][0] ?? "",
-      startIdentity: "",
-    }];
-  }).filter((item) => Number.isInteger(item.pid));
+  const processes = result.stdout.split(/\r?\n/u)
+    .map(parsePosixProcessLine)
+    .filter(Boolean);
   processes.incomplete = false;
   return processes;
+}
+
+export function parsePosixProcessLine(line) {
+  const fields = line.trim().split(/\s+/u);
+  if (fields.length < 9) return null;
+  const item = {
+    pid: Number(fields[0]),
+    parentPid: Number(fields[1]),
+    processGroupId: Number(fields[2]),
+    state: fields[3][0] ?? "",
+    // BSD/macOS ps lstart: "Mon Aug 16 12:34:56 2026". Keeping the
+    // complete timestamp lets later snapshots reject a reused PID.
+    startIdentity: fields.slice(4).join(" "),
+  };
+  return Number.isInteger(item.pid) && Number.isInteger(item.parentPid) &&
+    Number.isInteger(item.processGroupId) && item.state && item.startIdentity
+    ? item : null;
 }
 
 function isLiveState(state) {
