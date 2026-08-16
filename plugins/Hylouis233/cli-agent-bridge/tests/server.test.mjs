@@ -1002,6 +1002,23 @@ test("fetched remote history is excluded from worker-created commits", async (co
   assert.match(out.commits.diffStat, /worker-after-fetch\.txt/u);
 });
 
+test("a fetched tag tip is an external baseline for later worker commits", async (context) => {
+  const { workspace, client } = await makeHarness(context);
+  const response = await client.request("tools/call", taskArguments(workspace, {
+    name: "fetch-tag-then-work", fetchAndCommit: true, fetchTagOnly: true,
+    branchName: "fetched-tag-work", writeFile: "worker-after-tag.txt",
+    commitMessage: "worker commit after fetched tag",
+  }));
+  const out = response.result.structuredContent;
+  assert.equal(out.ok, true, JSON.stringify(out.error));
+  assert.equal(out.commits.newCommitCount, 1, out.commits.log);
+  assert.match(out.commits.log, /worker commit after fetched tag/u);
+  assert.doesNotMatch(out.commits.log, /fetched upstream commit/u);
+  assert.match(out.commits.log, /refs\/tags\/fetched-tag moved to externally sourced history/u);
+  assert.doesNotMatch(out.commits.diffStat, /upstream\.txt/u);
+  assert.match(out.commits.diffStat, /worker-after-tag\.txt/u);
+});
+
 test("list_backends can be cancelled while a version probe hangs", async (context) => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), "cli-agent-bridge-test-"));
   context.after(async () => { await rm(tempRoot, { recursive: true, force: true }); });

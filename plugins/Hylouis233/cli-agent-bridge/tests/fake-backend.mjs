@@ -54,7 +54,11 @@ if (spec.branchRoundTrip) {
   const upstreamOid = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
   execFileSync("git", ["checkout", original]);
   execFileSync("git", ["branch", "-D", "fixture-upstream"]);
-  execFileSync("git", ["update-ref", "refs/remotes/origin/main", upstreamOid]);
+  if (spec.fetchTagOnly) {
+    execFileSync("git", ["update-ref", "refs/tags/fetched-tag", upstreamOid]);
+  } else {
+    execFileSync("git", ["update-ref", "refs/remotes/origin/main", upstreamOid]);
+  }
   execFileSync("git", ["checkout", "-b", spec.branchName ?? "fetched-work", upstreamOid]);
   writeFileSync(path.resolve(process.cwd(), spec.writeFile ?? "worker-after-fetch.txt"), "worker\n");
   execFileSync("git", ["add", spec.writeFile ?? "worker-after-fetch.txt"]);

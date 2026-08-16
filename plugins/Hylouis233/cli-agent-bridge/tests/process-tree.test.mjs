@@ -96,6 +96,34 @@ test("Linux refresh recovers a marked detached child after its parent exits", as
     "the inherited run marker preserves containment after orphan reparenting");
 });
 
+test("Linux liveness observes briefly for a late-visible marked child", async (context) => {
+  const procRoot = await mkdtemp(path.join(os.tmpdir(), "cli-agent-bridge-proc-"));
+  context.after(() => rm(procRoot, { recursive: true, force: true }));
+  await writeProcStat(procRoot, 802, {
+    state: "S", group: 802, parent: 1, startIdentity: 33,
+  });
+  await writeTaskChildren(procRoot, 802, []);
+  await writeRunMarker(procRoot, 802, "late-run");
+  let markerScans = 0;
+  const fsOps = {
+    readdir: async (target, options) => {
+      if (target === procRoot && ++markerScans < 3) return [];
+      return await readdir(target, options);
+    },
+    readFile,
+  };
+  const treeState = {
+    knownPids: new Set([801]), knownStarts: new Map(), runMarker: "late-run",
+  };
+  const alive = await isProcessTreeAlive({ pid: 801 }, treeState, {
+    platform: "linux", procRoot, fsOps,
+    probeProcessGroup: () => { const error = new Error("gone"); error.code = "ESRCH"; throw error; },
+  });
+  assert.equal(alive, true);
+  assert.ok(markerScans >= 3, "the empty first scan must not release containment");
+  assert.ok(treeState.knownPids.has(802));
+});
+
 test("Linux liveness ignores zombie-only process groups", async (context) => {
   const procRoot = await mkdtemp(path.join(os.tmpdir(), "cli-agent-bridge-proc-"));
   context.after(() => rm(procRoot, { recursive: true, force: true }));

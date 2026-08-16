@@ -140,8 +140,9 @@ you already obtained a valid ID from that backend outside this Plugin.
   their recorded start identity (process start time on POSIX, creation time on Windows) so a
   reused PID is never signaled, and a POSIX process group is only signaled while its original
   leader identity still matches. On Linux, descendants also inherit a per-run environment marker;
-  if the parent exits before ancestry polling, the close path performs one marker scan to recover
-  reparented children without continuously scanning all of `/proc`. If termination cannot be
+  if the parent exits before ancestry polling, the close path uses a bounded observation grace and
+  marker scans to recover children that become visible just after the leader exits, without
+  continuously scanning all of `/proc`. If termination cannot be
   confirmed, the bridge writes a shared
   quarantine marker, moves its lease into the recoverable `quarantined` state, and every bridge
   process refuses further delegation until an operator checks for leftovers and deliberately
@@ -164,8 +165,9 @@ you already obtained a valid ID from that backend outside this Plugin.
   existing divergent branch is reported as a HEAD move with no new commits, and refs pointing at
   non-commit objects (for example a blob tag) are reported without failing the delegation. A commit
   reached through multiple moved refs is counted and logged once with all contributing labels;
-  remote-tracking updates are treated as externally sourced fetch history and excluded from worker
-  attribution, including when a local worker commit builds on the fetched tip. Any
+  remote-tracking updates and fetched tag-only tips are treated as externally sourced history and
+  excluded from worker attribution, including when a local worker commit builds on the fetched
+  tip. Any
   bounded Git capture that truncates is rejected as an unreliable snapshot; backend output
   truncation is disclosed.
 - zcode and dsh backends are experimental: ZCode desktop builds have no verified headless CLI,

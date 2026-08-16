@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { readdir, readFile } from "node:fs/promises";
 
 const UTILITY_CAPTURE_CHARS = 1_000_000;
+const MARKER_OBSERVATION_GRACE_MS = 500;
 
 function appendBounded(current, chunk) {
   const combined = current + chunk;
@@ -412,11 +413,11 @@ export async function isProcessTreeAlive(child, treeState, {
     await treeState.initialRefresh;
     return (await windowsProcessTreePids(child.pid, treeState)).length > 0;
   }
-  const processes = await refreshProcessTree(child, treeState, { platform, procRoot, fsOps });
-  if (processes !== null) {
+  let processes = await refreshProcessTree(child, treeState, { platform, procRoot, fsOps });
+  const snapshotHasTrackedLive = (snapshot) => {
     const knownStarts = treeState.knownStarts ?? new Map();
     const leaderStart = knownStarts.get(child.pid);
-    const trackedLive = processes.some((item) => {
+    return snapshot.some((item) => {
       if (!isLiveState(item.state)) return false;
       if (item.processGroupId === child.pid) {
         // A reused PID leading an unrelated group must not count as our tree.
@@ -426,8 +427,25 @@ export async function isProcessTreeAlive(child, treeState, {
       const expected = knownStarts.get(item.pid);
       return !expected || !item.startIdentity || expected === item.startIdentity;
     });
-    if (trackedLive) return true;
-    if (ignoreZombieOnly && !processes.incomplete) return false;
+  };
+  if (processes !== null) {
+    if (snapshotHasTrackedLive(processes)) return true;
+    // A detached child can inherit the run marker slightly after its very
+    // short-lived parent disappears from /proc. Observe for a bounded grace
+    // instead of making one empty scan authoritative and releasing the lock.
+    if (platform === "linux" && treeState.runMarker &&
+        !processes.some((item) => item.pid === child.pid) &&
+        treeState.markerObservationComplete !== true) {
+      const observationDeadline = Date.now() + MARKER_OBSERVATION_GRACE_MS;
+      while (Date.now() < observationDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        processes = await refreshProcessTree(child, treeState, { platform, procRoot, fsOps });
+        if (processes === null) break;
+        if (snapshotHasTrackedLive(processes)) return true;
+      }
+      treeState.markerObservationComplete = true;
+    }
+    if (processes !== null && ignoreZombieOnly && !processes.incomplete) return false;
   }
   try {
     probeProcessGroup(child.pid);

@@ -764,10 +764,27 @@ async function committedDelta(worktreeRoot, before, after, options = {}) {
   // Commits introduced by fetch live under remote-tracking refs and were
   // created outside this worker. Add their after-state tips to the exclusion
   // baseline before attributing any local branch/tag that builds on them.
-  const externalRefChanges = refsChanged.filter((change) =>
-    change.ref.startsWith("refs/remotes/"),
-  );
+  const movedLocalTargets = new Set([
+    before.head === after.head ? "" : after.head,
+    ...refsChanged
+      .filter((change) => change.ref.startsWith("refs/heads/"))
+      .map((change) => change.after),
+  ].filter(Boolean));
+  const externalRefChanges = [];
+  for (const change of refsChanged) {
+    if (change.ref.startsWith("refs/remotes/")) {
+      externalRefChanges.push(change);
+      continue;
+    }
+    if (!change.ref.startsWith("refs/tags/") || !change.after) continue;
+    const tagCommit = await peelCommitish(worktreeRoot, change.after, cache, options);
+    // A tag arriving without a moved local HEAD/branch at the same commit is
+    // conservatively treated as fetch-sourced. A tag attached to the worker's
+    // exact new local tip remains a contributing attribution label.
+    if (tagCommit && !movedLocalTargets.has(tagCommit)) externalRefChanges.push(change);
+  }
   for (const change of externalRefChanges) await addBaseline(change.after);
+  const externalRefNames = new Set(externalRefChanges.map((change) => change.ref));
 
   // A worker committing on the checked-out branch moves HEAD and its branch ref
   // across the same object pair; deduplicate by that pair so the log, diff, and
@@ -786,7 +803,7 @@ async function committedDelta(worktreeRoot, before, after, options = {}) {
   }
   addTarget("HEAD", before.head, after.head);
   for (const change of refsChanged) {
-    if (change.ref.startsWith("refs/remotes/")) continue;
+    if (externalRefNames.has(change.ref)) continue;
     addTarget(change.ref, change.before, change.after);
   }
 
