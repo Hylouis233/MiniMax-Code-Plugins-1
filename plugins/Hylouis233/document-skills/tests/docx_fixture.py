@@ -287,6 +287,24 @@ inline_paragraph_reopened = next(
 check("inline content-control runs are included in glyph traversal",
       any(run.text == "inline한" for run in iter_paragraph_runs(inline_paragraph_reopened)))
 
+hyperlink_paragraph = font_doc.add_paragraph()
+hyperlink = OxmlElement("w:hyperlink")
+hyperlink.set(qn("w:anchor"), "fixture-target")
+hyperlink_run = OxmlElement("w:r")
+hyperlink_text = OxmlElement("w:t")
+hyperlink_text.text = "链接漢"
+hyperlink_run.append(hyperlink_text)
+hyperlink.append(hyperlink_run)
+hyperlink_paragraph._p.append(hyperlink)
+walked_hyperlink_runs = list(iter_paragraph_runs(hyperlink_paragraph))
+check("Paragraph.runs omits hyperlink runs (negative control)",
+      all(run.text != "链接漢" for run in hyperlink_paragraph.runs))
+check("glyph traversal includes CJK text nested in a hyperlink",
+      [run.text for run in walked_hyperlink_runs] == ["链接漢"],
+      [run.text for run in walked_hyperlink_runs])
+check("hyperlink CJK text resolves through the east-Asian font slot",
+      effective_face(walked_hyperlink_runs[0], "eastAsia") == "CJK Face")
+
 # ---- edit.md guarded cross-run replacement ------------------------------------
 SAFE_RUN_CHILDREN = {
     qn("w:rPr"), qn("w:t"), qn("w:tab"), qn("w:cr"),

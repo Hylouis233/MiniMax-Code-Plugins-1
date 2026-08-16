@@ -2,6 +2,7 @@
 
 ```python
 import openpyxl
+from openpyxl.utils import get_column_letter
 
 formula_wb = openpyxl.load_workbook("input.xlsx", read_only=True, data_only=False)
 value_wb = openpyxl.load_workbook("input.xlsx", read_only=True, data_only=True)
@@ -19,22 +20,44 @@ def formula_text(value):
     )
     return f"{type(value).__name__}({details})"
 
+def discover_dimension(worksheet):
+    """Scan an untrusted read-only stream without relying on its <dimension>."""
+    worksheet.reset_dimensions()
+    min_row = min_column = max_row = max_column = None
+    for row in worksheet.iter_rows():
+        for cell in row:
+            row_index = getattr(cell, "row", None)       # EmptyCell has no coordinates
+            column_index = getattr(cell, "column", None)
+            if row_index is None or column_index is None:
+                continue
+            min_row = row_index if min_row is None else min(min_row, row_index)
+            min_column = column_index if min_column is None else min(min_column, column_index)
+            max_row = row_index if max_row is None else max(max_row, row_index)
+            max_column = column_index if max_column is None else max(max_column, column_index)
+    if max_row is None:
+        return "A1:A1"
+    return (
+        f"{get_column_letter(min_column)}{min_row}:"
+        f"{get_column_letter(max_column)}{max_row}"
+    )
+
 # Profile EVERY sheet by default; only narrow when the task names a specific sheet.
 for sheet_name in value_wb.sheetnames:
     formula_ws = formula_wb[sheet_name]
     value_ws = value_wb[sheet_name]
-    # Read-only iteration is bounded by the sheet's <dimension> metadata.
-    # Non-Excel producers write wrong dimensions, which silently truncates the
-    # stream; when the declared extent looks implausible, reset it and let
-    # openpyxl discover the real used range.
+    # Read-only iteration is bounded by the sheet's <dimension> metadata. A
+    # non-Excel producer can declare a plausible but truncated range (for
+    # example A1:B2 while data continues below it), so treat that metadata as
+    # untrusted: reset both streams and discover the real bounds before reading.
     declared = value_ws.calculate_dimension()
-    if value_ws.max_row in (None, 0) or declared in ("A1:A1", "A1"):
-        value_ws.reset_dimensions()
-        formula_ws.reset_dimensions()
-        discovered = value_ws.calculate_dimension(force=True)
-        print(f"--- {sheet_name} --- implausible dimension {declared!r}; reset, real extent:")
-    else:
-        discovered = declared
+    discovered = discover_dimension(value_ws)
+    formula_discovered = discover_dimension(formula_ws)
+    if formula_discovered != discovered:
+        raise ValueError(
+            f"formula/value stream dimensions disagree: {formula_discovered} != {discovered}"
+        )
+    if discovered != declared:
+        print(f"--- {sheet_name} --- declared {declared!r}; discovered real extent:")
     print(f"--- {sheet_name} --- dims:", discovered)
 
     rows = value_ws.iter_rows(values_only=True)

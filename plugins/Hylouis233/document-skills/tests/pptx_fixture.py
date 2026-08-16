@@ -166,11 +166,11 @@ for i, s in enumerate(prs.slides):
     for shape in s.shapes:
         if shape.has_text_frame and old in shape.text_frame.text:
             candidates.append((i, shape.name, shape))
-assert len(candidates) == 1
+require(len(candidates) == 1, "expected exactly one text target")
 _, _, target_shape = candidates[0]
 tf = target_shape.text_frame
 run_hits = [run for par in tf.paragraphs for run in par.runs if old in run.text]
-assert len(run_hits) == 1
+require(len(run_hits) == 1, "target is duplicated or split across runs")
 run_hits[0].text = run_hits[0].text.replace(old, new, 1)
 
 edited_link = [run for par in tf.paragraphs for run in par.runs if run.hyperlink.address]
@@ -185,7 +185,7 @@ old_cell, new_cell = "old cell text", "new cell text"
 tbl = next(sh for sh in prs2.slides[0].shapes if sh.has_table).table
 cell = tbl.cell(0, 1)
 hits = [run for par in cell.text_frame.paragraphs for run in par.runs if old_cell in run.text]
-assert len(hits) == 1, "target is duplicated or split across runs in this cell"
+require(len(hits) == 1, "target is duplicated or split across runs in this cell")
 hits[0].text = hits[0].text.replace(old_cell, new_cell, 1)
 
 prs2.save("cell-edited.pptx")
@@ -479,6 +479,37 @@ def iter_text_targets(path, shape):
                 yield f"{path}/table[{row_index},{column_index}]", cell.text_frame
 
 
+def iter_postcheck_text_frames(shapes, path=""):
+    for shape in shapes:
+        here = f"{path}/{shape.name}" if path else shape.name
+        if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
+            yield from iter_postcheck_text_frames(shape.shapes, here)
+            continue
+        if shape.has_text_frame:
+            yield here, shape.text_frame
+        if shape.has_table:
+            for row_index, row in enumerate(shape.table.rows):
+                for column_index, cell in enumerate(row.cells):
+                    if not cell.is_spanned:
+                        yield f"{here}/table[{row_index},{column_index}]", cell.text_frame
+
+
+group_postcheck = {
+    location: frame.text for location, frame in iter_postcheck_text_frames(slide6.shapes)
+}
+table_postcheck = {
+    location: frame.text
+    for location, frame in iter_postcheck_text_frames(Presentation("input.pptx").slides[0].shapes)
+}
+check("mandatory postcheck reaches grouped text",
+      "nested member" in group_postcheck.values(), group_postcheck)
+check("mandatory postcheck reaches table-cell text",
+      "old cell text" in table_postcheck.values(), table_postcheck)
+check("mandatory postcheck inventories unexpected empty table cells",
+      any(location.endswith("/table[0,0]") and not text.strip()
+          for location, text in table_postcheck.items()), table_postcheck)
+
+
 candidates = [
     (i, location, text_frame)
     for i, s in enumerate(prs6.slides)
@@ -524,6 +555,44 @@ selected_table_candidates = [
 check("duplicate table text requires a location selector", len(all_table_candidates) == 2)
 check("table location selector chooses one row/column",
       len(selected_table_candidates) == 1, [item[1] for item in all_table_candidates])
+try:
+    require(len(all_table_candidates) == 1, "target is not unique")
+    optimized_duplicate_guard_rejected = False
+except ValueError:
+    optimized_duplicate_guard_rejected = True
+check("explicit uniqueness guard rejects duplicates even under python -O",
+      optimized_duplicate_guard_rejected)
+
+split_prs = Presentation()
+split_slide = split_prs.slides.add_slide(split_prs.slide_layouts[6])
+split_frame = split_slide.shapes.add_textbox(
+    Inches(1), Inches(1), Inches(4), Inches(1)
+).text_frame
+split_frame.paragraphs[0].add_run().text = "old "
+split_frame.paragraphs[0].add_run().text = "wording"
+split_hits = [
+    run for paragraph in split_frame.paragraphs for run in paragraph.runs
+    if old in run.text
+]
+try:
+    require(len(split_hits) == 1 and split_hits[0].text.count(old) == 1,
+            "target is split across runs")
+    optimized_run_guard_rejected = False
+except ValueError:
+    optimized_run_guard_rejected = True
+check("explicit run-boundary guard survives python -O", optimized_run_guard_rejected)
+
+repeated_frame = split_slide.shapes.add_textbox(
+    Inches(1), Inches(2), Inches(4), Inches(1)
+).text_frame
+repeated_frame.text = f"{old} / {old}"
+try:
+    require(repeated_frame.text.count(old) == 1,
+            "target occurs more than once in the selected shape")
+    optimized_repeated_guard_rejected = False
+except ValueError:
+    optimized_repeated_guard_rejected = True
+check("explicit repeated-text guard survives python -O", optimized_repeated_guard_rejected)
 
 # ---- analyze.md snippet: per-master, script-aware theme font resolution --------
 
@@ -762,6 +831,17 @@ token_ea = OxmlElement("a:ea")
 token_ea.set("typeface", "+mj-ea")
 token_run._r.get_or_add_rPr().append(token_ea)
 
+partial_box = prs7.slides[0].shapes.add_textbox(Inches(5), Inches(4), Inches(4), Inches(1))
+partial_paragraph = partial_box.text_frame.paragraphs[0]
+latin_only_run = partial_paragraph.add_run()
+latin_only_run.text = "A汉"
+latin_only_run.font.name = "Latin Only"
+east_only_run = partial_paragraph.add_run()
+east_only_run.text = "A汉"
+east_only = OxmlElement("a:ea")
+east_only.set("typeface", "East Only")
+east_only_run._r.get_or_add_rPr().append(east_only)
+
 token_fallback_fonts = {
     "major": {"latin": "Major Latin", "eastAsia": "", "complexScript": "",
               "scripts": {"Hans": "Major Hans"}},
@@ -773,6 +853,8 @@ detected_faces = {
     run.text: font_candidates(run, font_paragraph, script_fonts, "minor")
     for run in font_paragraph.runs
 }
+latin_only_faces = font_candidates(latin_only_run, partial_paragraph, script_fonts, "minor")
+east_only_faces = font_candidates(east_only_run, partial_paragraph, script_fonts, "minor")
 check("font triage reports the run face and source",
       ("latin", "Run Face", "run") in detected_faces["run override"], detected_faces)
 check(
@@ -792,6 +874,14 @@ check("explicit Latin/East-Asian/complex-script slots resolve independently",
       {(slot, face) for slot, face, _ in detected_faces["A汉ก"]}
       == {("latin", "Latin Explicit"), ("eastAsia", "East Explicit"),
           ("complexScript", "Complex Explicit")}, detected_faces["A汉ก"])
+check("mixed run combines direct Latin with inherited east-Asian faces",
+      {("latin", "Latin Only"), ("eastAsia", "East Asian Theme")}
+      <= {(slot, face) for slot, face, _ in latin_only_faces},
+      latin_only_faces)
+check("mixed run combines inherited Latin with a direct east-Asian face",
+      {("latin", "Latin Body"), ("eastAsia", "East Only")}
+      <= {(slot, face) for slot, face, _ in east_only_faces},
+      east_only_faces)
 check("empty +mj-ea generic face falls back to the major script mapping",
       ("eastAsia", "Major Hans", "major theme script Hans")
       in font_candidates(token_run, font_paragraph, token_fallback_fonts, "minor"),

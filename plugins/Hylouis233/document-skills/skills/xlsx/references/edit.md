@@ -101,7 +101,9 @@ def formula_may_intersect_rows(owner_sheet, formula, shifted_sheet, start_row):
             if "[" in qualifier or ":" in qualifier:  # external or 3-D reference
                 return True
             target_sheet = qualifier.strip("'").replace("''", "'")
-        if target_sheet != shifted_sheet:
+        # Excel worksheet names are case-insensitive even though their spelling
+        # is preserved in formulas and workbook metadata.
+        if target_sheet.casefold() != shifted_sheet.casefold():
             continue
         try:
             _, min_row, _, max_row = range_boundaries(reference.replace("$", ""))

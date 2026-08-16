@@ -425,6 +425,44 @@ check("structural guard sees formulas before row insertion",
       == [("cell formula", "Sheet!A1", "=Data!A5")],
       structural_references(formula_only))
 
+audited_wb = openpyxl.Workbook()
+audited_ws = audited_wb.active
+audited_ws.title = "Data"
+audited_ws["B2"] = "=A2*2"
+audited_ws["A5"] = "shift me"
+audited_references_before = structural_references(audited_wb)
+audited_unchanged = {("cell formula", "Data!B2", "=A2*2")}
+unaudited_references = [
+    reference for reference in audited_references_before
+    if reference not in audited_unchanged
+]
+if not unaudited_references:
+    audited_ws.insert_rows(5)
+    audited_ws["D2"] = "=C2*1.08"
+    audited_wb.save("audited-edit.xlsx")
+audited_reopened = openpyxl.load_workbook("audited-edit.xlsx", data_only=False)
+check("exact dependency allowlist lets an audited edit reach save",
+      audited_references_before == [("cell formula", "Data!B2", "=A2*2")]
+      and unaudited_references == []
+      and audited_reopened["Data"]["A6"].value == "shift me"
+      and audited_reopened["Data"]["B2"].value == "=A2*2"
+      and audited_reopened["Data"]["D2"].value == "=C2*1.08")
+
+unsafe_wb = openpyxl.Workbook()
+unsafe_ws = unsafe_wb.active
+unsafe_ws.title = "Data"
+unsafe_ws["A5"], unsafe_ws["A6"] = 10, 20
+unsafe_ws["B1"] = "=SUM(A5:A6)"
+unsafe_dependencies = [
+    reference for reference in structural_references(unsafe_wb)
+    if reference not in audited_unchanged
+]
+unsafe_blocked_before_insert = bool(unsafe_dependencies)
+check("intersecting formula not on the exact allowlist is blocked before insertion",
+      unsafe_blocked_before_insert
+      and unsafe_ws["A5"].value == 10 and unsafe_ws["A6"].value == 20,
+      unsafe_dependencies)
+
 # and the edit itself still works after the warning path
 wb2 = openpyxl.load_workbook("plain.xlsx")
 wb2["Data"]["B2"] = "=B2*1"  # formula stays a formula
@@ -594,37 +632,69 @@ dim_ws = dim_wb.active
 dim_ws.append(["h1", "h2"])
 dim_ws.append([1, 2])
 dim_ws.append([3, 4])
+dim_ws["C4"] = "=SUM(A2:B3)"
 dim_wb.save("dimension.xlsx")
 # Corrupt the sheet's dimension metadata the way non-Excel producers do.
 import zipfile as dim_zip
 with dim_zip.ZipFile("dimension.xlsx") as archive:
     members = {name: archive.read(name) for name in archive.namelist()}
 members["xl/worksheets/sheet1.xml"] = members["xl/worksheets/sheet1.xml"].replace(
-    b"<dimension ref=\"A1:B3\"/>", b"<dimension ref=\"A1:A1\"/>"
+    b"<dimension ref=\"A1:C4\"/>", b"<dimension ref=\"A1:B2\"/>"
 )
 with dim_zip.ZipFile("dimension.xlsx", "w") as archive:
     for name, data in members.items():
         archive.writestr(name, data)
 
+from openpyxl.utils import get_column_letter
+
+
+def discover_dimension(worksheet):
+    worksheet.reset_dimensions()
+    min_row = min_column = max_row = max_column = None
+    for row in worksheet.iter_rows():
+        for cell in row:
+            row_index = getattr(cell, "row", None)
+            column_index = getattr(cell, "column", None)
+            if row_index is None or column_index is None:
+                continue
+            min_row = row_index if min_row is None else min(min_row, row_index)
+            min_column = column_index if min_column is None else min(min_column, column_index)
+            max_row = row_index if max_row is None else max(max_row, row_index)
+            max_column = column_index if max_column is None else max(max_column, column_index)
+    if max_row is None:
+        return "A1:A1"
+    return (f"{get_column_letter(min_column)}{min_row}:"
+            f"{get_column_letter(max_column)}{max_row}")
+
+
 dim_value = openpyxl.load_workbook("dimension.xlsx", read_only=True, data_only=True)
+dim_formula = openpyxl.load_workbook("dimension.xlsx", read_only=True, data_only=False)
 dim_ws_ro = dim_value.active
-check("corrupted dimension truncates streaming (negative control)",
-      dim_ws_ro.max_row == 1, dim_ws_ro.max_row)
+check("plausible but truncated dimension limits streaming (negative control)",
+      dim_ws_ro.calculate_dimension() == "A1:B2" and dim_ws_ro.max_row == 2,
+      (dim_ws_ro.calculate_dimension(), dim_ws_ro.max_row))
 streamed_before_reset = [row for row in dim_ws_ro.iter_rows(values_only=True)]
-dim_ws_ro.reset_dimensions()
-try:
-    dim_ws_ro.calculate_dimension()
-    unforced_dimension_rejected = False
-except ValueError:
-    unforced_dimension_rejected = True
-forced_dimension = dim_ws_ro.calculate_dimension(force=True)
+discovered_value_dimension = discover_dimension(dim_ws_ro)
+discovered_formula_dimension = discover_dimension(dim_formula.active)
 streamed_after_reset = [row for row in dim_ws_ro.iter_rows(values_only=True)]
 dim_value.close()
-check("reset dimensions require an explicit force scan before reporting extent",
-      unforced_dimension_rejected and forced_dimension == "A1:B3", forced_dimension)
+dim_formula.close()
+check("dimension scan recovers plausible row/column truncation in both workbook views",
+      discovered_value_dimension == "A1:C4"
+      and discovered_formula_dimension == "A1:C4",
+      (discovered_value_dimension, discovered_formula_dimension))
 check("reset_dimensions restores the real extent",
-      len(streamed_after_reset) == 3 and streamed_after_reset[2] == (3, 4),
+      len(streamed_before_reset) == 2
+      and len(streamed_after_reset) == 4
+      and streamed_after_reset[2][:2] == (3, 4),
       (len(streamed_before_reset), streamed_after_reset[-1]))
+
+empty_dimension_wb = openpyxl.Workbook()
+empty_dimension_wb.save("empty-dimension.xlsx")
+empty_dimension_ro = openpyxl.load_workbook("empty-dimension.xlsx", read_only=True)
+check("dimension scan handles an actually empty worksheet",
+      discover_dimension(empty_dimension_ro.active) == "A1:A1")
+empty_dimension_ro.close()
 
 
 print("\n" + ("ALL XLSX FIXTURES PASSED" if not failures else f"{len(failures)} FAILURES: {failures}"))

@@ -100,12 +100,28 @@ Encryption and forms:
   writer = PdfWriter()
   writer.append(reader)   # clones every page AND the catalog /AcroForm into the writer
 
-  # update fields on the writer's page copies; a field widget can sit on any page,
-  # so pass the writer page that actually carries the field you are filling
-  writer.update_page_form_field_values(
-      writer.pages[0],
-      {"applicant_name": "Ada Byron"},
-  )
+  def widget_field_name(widget):
+      """Resolve /T on a widget or its parent field dictionary."""
+      while widget is not None:
+          if widget.get("/T") is not None:
+              return str(widget["/T"])
+          parent = widget.get("/Parent")
+          widget = None if parent is None else parent.get_object()
+      return None
+
+  field_name = "applicant_name"
+  target_pages = [
+      page for page in writer.pages
+      if any(
+          (widget := ref.get_object()).get("/Subtype") == "/Widget"
+          and widget_field_name(widget) == field_name
+          for ref in (page.get("/Annots") or [])
+      )
+  ]
+  if not target_pages:
+      raise KeyError(f"no widget page found for field {field_name!r}")
+  for page in target_pages:
+      writer.update_page_form_field_values(page, {field_name: "Ada Byron"})
 
   with open("filled.pdf", "wb") as f:
       writer.write(f)

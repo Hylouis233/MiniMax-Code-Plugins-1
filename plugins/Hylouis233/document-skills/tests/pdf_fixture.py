@@ -159,6 +159,67 @@ check("filled file keeps both pages", len(check_r.pages) == 2, len(check_r.pages
 value = str((check_r.get_fields() or {}).get("applicant_name", {}).get("/V", ""))
 check("field value round-trips", value.strip("/") == "Ada Byron", repr(value))
 
+# A widget can live on any page; locate its annotation instead of assuming page 1.
+page2_form = canvas.Canvas("form-page2.pdf", pagesize=A4)
+page2_form.drawString(72, 780, "Cover page")
+page2_form.showPage()
+page2_form.drawString(72, 780, "Form page")
+page2_form.acroForm.textfield(
+    name="applicant_name", x=72, y=740, width=260, height=20, borderWidth=0,
+)
+page2_form.showPage()
+page2_form.save()
+
+wrong_page_writer = PdfWriter()
+wrong_page_writer.append(PdfReader("form-page2.pdf"))
+wrong_page_writer.update_page_form_field_values(
+    wrong_page_writer.pages[0], {"applicant_name": "Wrong page"},
+)
+with open("form-page2-wrong.pdf", "wb") as f:
+    wrong_page_writer.write(f)
+wrong_value = str(
+    (PdfReader("form-page2-wrong.pdf").get_fields() or {})
+    .get("applicant_name", {}).get("/V", "")
+)
+check("hard-coded first-page form fill misses a page-2 widget (negative control)",
+      wrong_value.strip("/") != "Wrong page", repr(wrong_value))
+
+
+def widget_field_name(widget):
+    while widget is not None:
+        if widget.get("/T") is not None:
+            return str(widget["/T"])
+        parent = widget.get("/Parent")
+        widget = None if parent is None else parent.get_object()
+    return None
+
+
+page2_writer = PdfWriter()
+page2_writer.append(PdfReader("form-page2.pdf"))
+field_name = "applicant_name"
+target_pages = [
+    page for page in page2_writer.pages
+    if any(
+        (widget := ref.get_object()).get("/Subtype") == "/Widget"
+        and widget_field_name(widget) == field_name
+        for ref in (page.get("/Annots") or [])
+    )
+]
+for target_page in target_pages:
+    page2_writer.update_page_form_field_values(
+        target_page, {field_name: "Ada on page 2"},
+    )
+with open("form-page2-filled.pdf", "wb") as f:
+    page2_writer.write(f)
+page2_value = str(
+    (PdfReader("form-page2-filled.pdf").get_fields() or {})
+    .get(field_name, {}).get("/V", "")
+)
+check("form fill locates the widget page before updating",
+      len(target_pages) == 1 and target_pages[0] is page2_writer.pages[1], len(target_pages))
+check("page-2 field value round-trips", page2_value.strip("/") == "Ada on page 2",
+      repr(page2_value))
+
 # ---- transform.md merge imports outline navigation ----------------------------
 appendix_writer = PdfWriter()
 appendix_writer.add_blank_page(width=200, height=300)
@@ -351,6 +412,9 @@ offset_page.cropbox.lower_left = (100, 200)
 offset_page.cropbox.upper_right = (300, 500)
 rotated_page = small_source.add_blank_page(width=240, height=160)
 rotated_page.rotate(90)
+cropped_page = small_source.add_blank_page(width=400, height=500)
+cropped_page.cropbox.lower_left = (250, 300)
+cropped_page.cropbox.upper_right = (390, 480)
 mixed_writer.append(small_source)
 with open("mixed.pdf", "wb") as f:
     mixed_writer.write(f)
@@ -383,6 +447,28 @@ check("plain merge pushes the stamp outside the small page (negative control)",
       plain_spans == [] and "DRAFT" in (R2("plain-stamped.pdf").pages[2].extract_text() or ""),
       plain_spans)
 
+# Negative control for crop-box fitting: media-box centering puts the stamp
+# outside this page's small, offset visible region.
+media_fit_writer = PdfWriter()
+media_fit_writer.append(open_pdf("mixed.pdf"), pages=(5, 6))
+media_fit_page = media_fit_writer.pages[0]
+media_destination = media_fit_page.mediabox
+media_scale = min(float(media_destination.width) / float(stamp_box.width),
+                  float(media_destination.height) / float(stamp_box.height))
+media_tx = (float(media_destination.left)
+            + (float(media_destination.width) - float(stamp_box.width) * media_scale) / 2
+            - float(stamp_box.left) * media_scale)
+media_ty = (float(media_destination.bottom)
+            + (float(media_destination.height) - float(stamp_box.height) * media_scale) / 2
+            - float(stamp_box.bottom) * media_scale)
+media_fit_page.merge_transformed_page(
+    stamp, Transformation().scale(media_scale).translate(media_tx, media_ty),
+)
+with open("media-fit-cropped.pdf", "wb") as f:
+    media_fit_writer.write(f)
+check("media-box fitting misses an offset crop region (negative control)",
+      stamp_bboxes("media-fit-cropped.pdf", 0) == [])
+
 scaled_writer = PdfWriter()
 scaled_writer.append(open_pdf("mixed.pdf"))
 stamp_page = R2("stamp.pdf").pages[0]
@@ -408,12 +494,22 @@ check("scaled stamp lands inside the mixed-size small page",
       scaled_spans)
 offset_spans = stamp_bboxes("scaled-stamped.pdf", 3)
 rotated_spans = stamp_bboxes("scaled-stamped.pdf", 4)
+cropped_spans = stamp_bboxes("scaled-stamped.pdf", 5)
 check("scaled stamp lands inside the non-zero-origin page", bool(offset_spans), offset_spans)
 check("scaled stamp lands inside the normalized 90-degree page", bool(rotated_spans), rotated_spans)
+cropped_rect = fitz.open("scaled-stamped.pdf")[5].rect
+check("scaled stamp lands inside the offset visible crop box",
+      bool(cropped_spans)
+      and all(
+          bbox[0] >= -0.5 and bbox[1] >= -0.5
+          and bbox[2] <= cropped_rect.width + 0.5
+          and bbox[3] <= cropped_rect.height + 0.5
+          for bbox in cropped_spans
+      ), cropped_spans)
 check("mixed-size pages keep their visible dimensions after rotation normalization",
       [(round(float(p.mediabox.width)), round(float(p.mediabox.height)))
        for p in scaled_check.pages]
-      == [(595, 842), (595, 842), (200, 300), (200, 300), (160, 240)])
+      == [(595, 842), (595, 842), (200, 300), (200, 300), (160, 240), (400, 500)])
 
 
 # ---- SKILL.md overflow check: off-page text is a defect -------------------------
@@ -427,6 +523,17 @@ overflow_bad.setFont("Helvetica", 16)
 overflow_bad.drawString(72, -200, "drawn far below the page box")
 overflow_bad.showPage()
 overflow_bad.save()
+
+rotated_source = canvas.Canvas("overflow-rotated-source.pdf", pagesize=A4)
+rotated_source.setFont("Helvetica", 16)
+rotated_source.drawString(72, 30, "valid near the unrotated page bottom")
+rotated_source.showPage()
+rotated_source.save()
+rotated_writer = PdfWriter()
+rotated_writer.append(R2("overflow-rotated-source.pdf"))
+rotated_writer.pages[0].rotate(90)
+with open("overflow-rotated.pdf", "wb") as f:
+    rotated_writer.write(f)
 
 def overflow_pages(path):
     doc = fitz.open(path)
@@ -447,14 +554,20 @@ def overflow_pages(path):
     return pages
 
 check("in-bounds PDF reports no overflow pages", overflow_pages("overflow.pdf") == [])
-rotated_doc = fitz.open("overflow.pdf")
-rotated_doc[0].set_rotation(90)
-rotated_doc.save("overflow-rotated.pdf")
-rotated_doc.close()
-check("rotated in-bounds text uses the unrotated crop-box coordinate space",
-      overflow_pages("overflow-rotated.pdf") == [])
 check("off-page text is detected by the overflow check (negative control)",
       overflow_pages("overflow-bad.pdf") == [1])
+rotated_probe = fitz.open("overflow-rotated.pdf")[0]
+rotated_blocks = rotated_probe.get_text(
+    "blocks", clip=fitz.Rect(-2000, -2000, 2000, 3000),
+)
+rotation_blind_flag = any(
+    block[2] > rotated_probe.rect.width + 0.5
+    or block[3] > rotated_probe.rect.height + 0.5
+    for block in rotated_blocks if block[6] == 0
+)
+check("rotated rect comparison falsely flags valid text (negative control)", rotation_blind_flag)
+check("overflow check compares rotated pages in unrotated coordinates",
+      overflow_pages("overflow-rotated.pdf") == [])
 check("off-page text still extracts, so extraction alone cannot catch it",
       "drawn far below" in (pypdf.PdfReader("overflow-bad.pdf").pages[0].extract_text() or ""))
 
