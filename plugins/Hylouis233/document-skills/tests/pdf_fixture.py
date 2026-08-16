@@ -461,16 +461,44 @@ form_only_doc = fitz.open("form-only.pdf")
 form_only_page = form_only_doc[0]
 form_only_widgets = list(form_only_page.widgets() or ())
 form_only_annotations = list(form_only_page.annots() or ())
-form_only_is_blank = (
-    not form_only_page.get_text().strip()
-    and not form_only_page.get_images()
-    and not form_only_page.get_drawings()
-    and not form_only_page.get_links()
-    and not form_only_widgets
-    and not form_only_annotations
-)
+
+
+def inspected_page_is_blank(page):
+    image_blocks = [
+        block for block in page.get_text("dict")["blocks"]
+        if block["type"] == 1
+    ]
+    return not (
+        page.get_text().strip() or page.get_images() or image_blocks
+        or page.get_drawings() or list(page.widgets() or ())
+        or list(page.annots() or ()) or page.get_links()
+    )
+
+
+form_only_is_blank = inspected_page_is_blank(form_only_page)
 check("form-only page exposes a widget", len(form_only_widgets) == 1)
 check("form-only page is not classified as blank", not form_only_is_blank)
+
+# ReportLab's drawInlineImage emits BI/ID/EI content rather than an image XObject.
+inline_source = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 12, 12))
+inline_source.clear_with(96)
+inline_source.save("inline-only-source.png")
+inline_canvas = canvas.Canvas("inline-only.pdf", pagesize=A4)
+inline_canvas.drawInlineImage("inline-only-source.png", 72, 700, width=80, height=80)
+inline_canvas.showPage()
+inline_canvas.save()
+inline_doc = fitz.open("inline-only.pdf")
+inline_page = inline_doc[0]
+inline_blocks = [
+    block for block in inline_page.get_text("dict")["blocks"]
+    if block["type"] == 1
+]
+check("inline-only image is absent from the XObject inventory",
+      inline_page.get_images() == [], inline_page.get_images())
+check("inline-only image appears as a type-1 text-dictionary block",
+      len(inline_blocks) == 1, inline_blocks)
+check("inline-only image page is not classified as blank",
+      not inspected_page_is_blank(inline_page))
 
 # ---- extract.md CMYK conversion snippet ---------------------------------------
 pix = fitz.Pixmap(fitz.csCMYK, fitz.IRect(0, 0, 24, 24))  # CMYK pixmap like a CMYK PDF image
@@ -733,7 +761,7 @@ check("watermarking preserves the rotated link's visible hit rectangle",
       mixed_link_after == mixed_link_before, (mixed_link_before, mixed_link_after))
 
 
-# ---- SKILL.md overflow check: off-page text is a defect -------------------------
+# ---- SKILL.md overflow check: off-page text and graphics are defects ------------
 overflow_ok = canvas.Canvas("overflow.pdf", pagesize=A4)
 overflow_ok.setFont("Helvetica", 16)
 overflow_ok.drawString(72, 780, "fits on page")
@@ -756,6 +784,51 @@ rotated_writer.pages[0].rotate(90)
 with open("overflow-rotated.pdf", "wb") as f:
     rotated_writer.write(f)
 
+graphics_ok = canvas.Canvas("overflow-graphics-ok.pdf", pagesize=A4)
+graphics_ok.drawInlineImage("inline-only-source.png", 72, 700, width=80, height=80)
+graphics_ok.setLineWidth(2)
+graphics_ok.rect(72, 600, 100, 50, stroke=1, fill=0)
+graphics_ok.showPage()
+graphics_ok.save()
+
+image_bad = canvas.Canvas("overflow-image-bad.pdf", pagesize=A4)
+image_bad.drawInlineImage("inline-only-source.png", 560, 700, width=80, height=80)
+image_bad.showPage()
+image_bad.save()
+
+drawing_bad = canvas.Canvas("overflow-drawing-bad.pdf", pagesize=A4)
+drawing_bad.setLineWidth(2)
+drawing_bad.rect(560, 600, 80, 50, stroke=1, fill=0)
+drawing_bad.showPage()
+drawing_bad.save()
+
+rotated_graphics_source = canvas.Canvas("overflow-graphics-rotated-source.pdf", pagesize=A4)
+rotated_graphics_source.drawInlineImage(
+    "inline-only-source.png", 500, 700, width=80, height=80,
+)
+rotated_graphics_source.setLineWidth(2)
+rotated_graphics_source.rect(20, 20, 80, 40, stroke=1, fill=0)
+rotated_graphics_source.showPage()
+rotated_graphics_source.save()
+rotated_graphics_writer = PdfWriter()
+rotated_graphics_writer.append(R2("overflow-graphics-rotated-source.pdf"))
+rotated_graphics_writer.pages[0].rotate(90)
+with open("overflow-graphics-rotated.pdf", "wb") as f:
+    rotated_graphics_writer.write(f)
+
+
+def drawing_bounds(drawing):
+    rect = fitz.Rect(drawing["rect"])
+    stroke_pad = (
+        float(drawing.get("width") or 0) / 2
+        if "s" in drawing.get("type", "") else 0
+    )
+    return fitz.Rect(
+        rect.x0 - stroke_pad, rect.y0 - stroke_pad,
+        rect.x1 + stroke_pad, rect.y1 + stroke_pad,
+    )
+
+
 def overflow_pages(path):
     doc = fitz.open(path)
     pages = []
@@ -766,10 +839,19 @@ def overflow_pages(path):
             page_box.x0 - 2000, page_box.y0 - 2000,
             page_box.x1 + 2000, page_box.y1 + 2000,
         )
-        blocks = [b for b in page.get_text("blocks", clip=clip) if b[6] == 0]
-        if any(b[0] < page_box.x0 - 0.5 or b[1] < page_box.y0 - 0.5
-               or b[2] > page_box.x1 + 0.5 or b[3] > page_box.y1 + 0.5
-               for b in blocks):
+        text_rects = [
+            fitz.Rect(block[:4])
+            for block in page.get_text("blocks", clip=clip)
+            if block[6] == 0
+        ]
+        image_rects = [
+            fitz.Rect(0, 0, 1, 1) * fitz.Matrix(*image["transform"])
+            for image in page.get_image_info()
+        ]
+        drawing_rects = [drawing_bounds(drawing) for drawing in page.get_drawings()]
+        if any(rect.x0 < page_box.x0 - 0.5 or rect.y0 < page_box.y0 - 0.5
+               or rect.x1 > page_box.x1 + 0.5 or rect.y1 > page_box.y1 + 0.5
+               for rect in text_rects + image_rects + drawing_rects):
             pages.append(page.number + 1)
     doc.close()
     return pages
@@ -777,6 +859,12 @@ def overflow_pages(path):
 check("in-bounds PDF reports no overflow pages", overflow_pages("overflow.pdf") == [])
 check("off-page text is detected by the overflow check (negative control)",
       overflow_pages("overflow-bad.pdf") == [1])
+check("in-bounds image and vector drawing pass the overflow check",
+      overflow_pages("overflow-graphics-ok.pdf") == [])
+check("out-of-bounds image placement is detected",
+      overflow_pages("overflow-image-bad.pdf") == [1])
+check("out-of-bounds vector drawing is detected",
+      overflow_pages("overflow-drawing-bad.pdf") == [1])
 rotated_probe = fitz.open("overflow-rotated.pdf")[0]
 rotated_blocks = rotated_probe.get_text(
     "blocks", clip=fitz.Rect(-2000, -2000, 2000, 3000),
@@ -789,6 +877,21 @@ rotation_blind_flag = any(
 check("rotated rect comparison falsely flags valid text (negative control)", rotation_blind_flag)
 check("overflow check compares rotated pages in unrotated coordinates",
       overflow_pages("overflow-rotated.pdf") == [])
+rotated_graphics_probe = fitz.open("overflow-graphics-rotated.pdf")[0]
+rotated_graphic_rects = (
+    [fitz.Rect(0, 0, 1, 1) * fitz.Matrix(*image["transform"])
+     for image in rotated_graphics_probe.get_image_info()]
+    + [drawing_bounds(drawing) for drawing in rotated_graphics_probe.get_drawings()]
+)
+rotation_blind_graphics_flag = any(
+    rect.x1 > rotated_graphics_probe.rect.width + 0.5
+    or rect.y1 > rotated_graphics_probe.rect.height + 0.5
+    for rect in rotated_graphic_rects
+)
+check("rotated rect comparison falsely flags valid graphics (negative control)",
+      rotation_blind_graphics_flag, rotated_graphic_rects)
+check("graphic overflow check preserves rotated coordinate correctness",
+      overflow_pages("overflow-graphics-rotated.pdf") == [])
 check("off-page text still extracts, so extraction alone cannot catch it",
       "drawn far below" in (pypdf.PdfReader("overflow-bad.pdf").pages[0].extract_text() or ""))
 

@@ -84,12 +84,23 @@ doc.save("report.docx")
       clone = copy.deepcopy(source)
       new_id = max(int(n.get(qn("w:numId"))) for n in numbering.findall(qn("w:num"))) + 1
       clone.set(qn("w:numId"), str(new_id))
-      override = OxmlElement("w:lvlOverride")
-      override.set(qn("w:ilvl"), "0")
+      level_zero_overrides = [
+          item for item in clone.findall(qn("w:lvlOverride"))
+          if item.get(qn("w:ilvl")) == "0"
+      ]
+      if len(level_zero_overrides) > 1:
+          raise ValueError("base numbering has duplicate level-zero overrides")
+      if level_zero_overrides:
+          override = level_zero_overrides[0]
+          for old_start in override.findall(qn("w:startOverride")):
+              override.remove(old_start)
+      else:
+          override = OxmlElement("w:lvlOverride")
+          override.set(qn("w:ilvl"), "0")
+          clone.append(override)
       start = OxmlElement("w:startOverride")
       start.set(qn("w:val"), "1")
-      override.append(start)
-      clone.append(override)
+      override.insert(0, start)  # startOverride precedes an optional embedded w:lvl
       numbering.append(clone)
       return new_id
 

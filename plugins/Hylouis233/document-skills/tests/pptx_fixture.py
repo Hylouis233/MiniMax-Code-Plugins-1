@@ -10,6 +10,7 @@ import copy
 import sys
 import xml.etree.ElementTree as ET
 import zipfile
+from pathlib import Path
 
 from lxml import etree
 from pptx import Presentation
@@ -91,7 +92,91 @@ slide.notes_slide.notes_text_frame.text = "Speaker note: explain the regional sp
 
 prs.save("input.pptx")
 
+# ---- create.md skeleton: explicit placeholder selection and populated table ----
+def placeholder_of_type(slide, *types):
+    matches = [
+        ph for ph in slide.placeholders
+        if ph.placeholder_format.type in types
+    ]
+    if len(matches) != 1:
+        available = [
+            f"{ph.name} ({ph.placeholder_format.type})"
+            for ph in slide.placeholders
+        ]
+        raise ValueError(
+            f"expected exactly one placeholder of {types}, found {len(matches)}; "
+            f"available placeholders: {available or 'none'}"
+        )
+    return matches[0]
+
+
+selector_prs = Presentation()
+no_object_slide = selector_prs.slides.add_slide(selector_prs.slide_layouts[6])
+try:
+    placeholder_of_type(no_object_slide, PP_PLACEHOLDER.OBJECT)
+    missing_placeholder_message = None
+except ValueError as exc:
+    missing_placeholder_message = str(exc)
+check(
+    "placeholder selector explicitly rejects zero matches",
+    missing_placeholder_message is not None
+    and "found 0" in missing_placeholder_message
+    and "available placeholders: none" in missing_placeholder_message,
+    missing_placeholder_message,
+)
+
+two_object_slide = selector_prs.slides.add_slide(selector_prs.slide_layouts[3])
+try:
+    placeholder_of_type(two_object_slide, PP_PLACEHOLDER.OBJECT)
+    ambiguous_placeholder_message = None
+except ValueError as exc:
+    ambiguous_placeholder_message = str(exc)
+check(
+    "placeholder selector explicitly rejects multiple matches",
+    ambiguous_placeholder_message is not None
+    and "found 2" in ambiguous_placeholder_message
+    and "Content Placeholder 2" in ambiguous_placeholder_message
+    and "Content Placeholder 3" in ambiguous_placeholder_message,
+    ambiguous_placeholder_message,
+)
+
+skeleton_prs = Presentation()
+skeleton_slide = skeleton_prs.slides.add_slide(skeleton_prs.slide_layouts[5])
+skeleton_slide.shapes.title.text = "Regional service health"
+skeleton_headers = ["Region", "Error rate", "P99 latency"]
+skeleton_body = [
+    ["Americas", "0.08%", "182 ms"],
+    ["Europe", "0.05%", "164 ms"],
+    ["Asia Pacific", "0.11%", "213 ms"],
+]
+skeleton_table = skeleton_slide.shapes.add_table(
+    1 + len(skeleton_body), len(skeleton_headers),
+    Inches(0.5), Inches(1.5), Inches(9), Inches(3.5),
+).table
+for column_index, text in enumerate(skeleton_headers):
+    skeleton_table.cell(0, column_index).text = text
+for row_index, row in enumerate(skeleton_body, start=1):
+    for column_index, text in enumerate(row):
+        skeleton_table.cell(row_index, column_index).text = text
+skeleton_prs.save("create-skeleton.pptx")
+skeleton_reopened = Presentation("create-skeleton.pptx")
+skeleton_reopened_table = next(
+    shape.table for shape in skeleton_reopened.slides[0].shapes if shape.has_table
+)
+skeleton_values = [
+    [cell.text.strip() for cell in row.cells]
+    for row in skeleton_reopened_table.rows
+]
+check(
+    "creation skeleton table has no unexpected empty cells",
+    skeleton_values == [skeleton_headers, *skeleton_body]
+    and all(text for row in skeleton_values for text in row),
+    skeleton_values,
+)
+
 # ---- analyze.md bounded package check rejects archive bombs before expansion ---
+MAX_ARCHIVE_BYTES = 200 * 1024 * 1024
+MAX_MEMBERS = 10_000
 MAX_XML_PART = 20 * 1024 * 1024
 MAX_ENTRY = 100 * 1024 * 1024
 MAX_TOTAL_UNCOMPRESSED = 500 * 1024 * 1024
@@ -111,8 +196,13 @@ def require(condition, message):
 
 
 def validate_pptx_package(path):
+    require(
+        Path(path).stat().st_size <= MAX_ARCHIVE_BYTES,
+        "compressed PPTX file size above limit",
+    )
     with zipfile.ZipFile(path) as archive:
         infos = archive.infolist()
+        require(len(infos) <= MAX_MEMBERS, "archive member count above limit")
         names = {info.filename for info in infos}
         require(len(names) == len(infos), "duplicate archive member names are unsafe")
         require("[Content_Types].xml" in names and "ppt/presentation.xml" in names,
@@ -150,6 +240,37 @@ try:
 except Exception:
     healthy_pptx_passed = False
 check("bounded PPTX check accepts an ordinary deck", healthy_pptx_passed)
+
+Path("oversized-before-open.pptx").write_bytes(b"not a ZIP package")
+original_archive_limit = MAX_ARCHIVE_BYTES
+MAX_ARCHIVE_BYTES = 0
+try:
+    validate_pptx_package("oversized-before-open.pptx")
+    compressed_size_rejected_before_open = False
+except ValueError as exc:
+    compressed_size_rejected_before_open = (
+        str(exc) == "compressed PPTX file size above limit"
+    )
+finally:
+    MAX_ARCHIVE_BYTES = original_archive_limit
+check(
+    "compressed PPTX size is bounded before ZipFile opens the package",
+    compressed_size_rejected_before_open,
+)
+
+with zipfile.ZipFile("too-many-members.pptx", "w", zipfile.ZIP_STORED) as archive:
+    for member_index in range(MAX_MEMBERS + 1):
+        archive.writestr(f"zero-{member_index:05d}.bin", b"")
+try:
+    validate_pptx_package("too-many-members.pptx")
+    many_members_rejected = False
+except ValueError as exc:
+    many_members_rejected = str(exc) == "archive member count above limit"
+check(
+    "member-count gate rejects 10,001 zero-byte members before traversal",
+    many_members_rejected,
+)
+
 with zipfile.ZipFile("compressed-bomb.pptx", "w", zipfile.ZIP_DEFLATED) as archive:
     archive.writestr("[Content_Types].xml", "<Types/>")
     archive.writestr(

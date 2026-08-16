@@ -193,81 +193,102 @@ wb.save("input-edited.xlsx")
 - Before editing an unknown workbook, detect what an openpyxl load/save round trip silently
   changes. Dropped parts (slicers, pivot caches, power-query connections) are only half the
   risk: features stored *inside* a retained part, such as `x14` extension lists in
-  `xl/worksheets/sheet1.xml`, can be stripped while the archive member name stays. Compare
-  part contents too, not just names, and report both lists before overwriting the file:
+  `xl/worksheets/sheet1.xml`, can be stripped while the archive member name stays. Inventory
+  every worksheet extension record separately; a per-part set of coarse markers cannot detect
+  one lost `<ext>` when another record keeps the same URI/namespace markers alive:
 
   ```python
   import zipfile
+  from collections import Counter
   from tempfile import TemporaryFile
+  from xml.etree import ElementTree as ET
 
-  # XML prefixes are arbitrary - a valid workbook may bind the x14 namespace to
-  # "sx" or the markup-compatibility namespace to anything. Match the namespace
-  # URIs (and the prefix-independent local name extLst), never prefixes.
-  EXTENSION_MARKERS = {
-      "extLst": b"extLst",
-      "x14 namespace": b"http://schemas.microsoft.com/office/spreadsheetml/2009/9/main",
-      "markup compatibility": b"http://schemas.openxmlformats.org/markup-compatibility/2006",
-  }
+  SHEET_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+  EXT_TAG = f"{{{SHEET_NS}}}ext"
 
-  def scan_extension_markers(archive, info):
-      """Stream one XML part and retain marker names only, never the full payload."""
-      found = set()
-      overlap = max(len(marker) for marker in EXTENSION_MARKERS.values()) - 1
-      tail = b""
+  def normalized_text(value):
+      return (value or "").strip()
+
+  def normalized_element(element):
+      """Prefix/attribute-order independent, but sensitive to child values and order."""
+      return (
+          element.tag,                              # ElementTree expands prefixes to URI names
+          tuple(sorted(element.attrib.items())),
+          normalized_text(element.text),
+          tuple((normalized_element(child), normalized_text(child.tail))
+                for child in element),
+      )
+
+  def worksheet_extension_records(archive, info):
+      """Return a multiset of (ext URI, normalized child content) for one worksheet."""
+      records = Counter()
+      extension_depth = 0
       with archive.open(info) as stream:
-          while chunk := stream.read(64 * 1024):
-              window = tail + chunk
-              found.update(
-                  label for label, marker in EXTENSION_MARKERS.items() if marker in window
-              )
-              if len(found) == len(EXTENSION_MARKERS):
-                  break
-              tail = window[-overlap:]
-      return found
+          for event, element in ET.iterparse(stream, events=("start", "end")):
+              if event == "start":
+                  if extension_depth:
+                      extension_depth += 1
+                  elif element.tag == EXT_TAG:
+                      extension_depth = 1
+              elif extension_depth:
+                  if extension_depth == 1:
+                      children = tuple(
+                          (normalized_element(child), normalized_text(child.tail))
+                          for child in element
+                      )
+                      records[(element.attrib.get("uri", ""), children)] += 1
+                      element.clear()
+                      extension_depth = 0
+                  else:
+                      extension_depth -= 1
+              else:
+                  element.clear()                   # keep large non-extension sheets streaming
+      return records
 
   def archive_inventory(source):
       with zipfile.ZipFile(source) as archive:
           names = set(archive.namelist())
-          markers = {}
+          extensions = {}
           for info in archive.infolist():
-              if info.filename.endswith((".xml", ".rels")):
-                  found = scan_extension_markers(archive, info)
-                  if found:
-                      markers[info.filename] = found
-          return names, markers
+              if (info.filename.startswith("xl/worksheets/")
+                      and info.filename.endswith(".xml")):
+                  extensions[info.filename] = worksheet_extension_records(archive, info)
+          return names, extensions
 
-  def stripped_extension_markers(before, after, common_names):
-      """Return every (part, marker) that was present before and absent after."""
-      return sorted(
-          (name, label)
-          for name in common_names
-          for label in before.get(name, set()) - after.get(name, set())
-      )
+  def stripped_extension_records(before, after, common_names):
+      """Return each lost (worksheet, URI, normalized children), including duplicates."""
+      stripped = []
+      for name in sorted(common_names):
+          for (uri, children), count in (before.get(name, Counter())
+                                         - after.get(name, Counter())).items():
+              stripped.extend((name, uri, children) for _ in range(count))
+      return sorted(stripped, key=repr)
 
   def round_trip_changes(path, **load_options):
-      before_names, before_markers = archive_inventory(path)
+      before_names, before_extensions = archive_inventory(path)
       wb = openpyxl.load_workbook(path, **load_options)  # same options as the real edit
       with TemporaryFile() as output:
           wb.save(output)
           output.seek(0)
-          after_names, after_markers = archive_inventory(output)
+          after_names, after_extensions = archive_inventory(output)
       wb.close()
       dropped = sorted(before_names - after_names)
-      stripped_extensions = stripped_extension_markers(
-          before_markers, after_markers, before_names & after_names
+      stripped_extensions = stripped_extension_records(
+          before_extensions, after_extensions, before_names & after_names
       )
       return dropped, stripped_extensions
 
   dropped, stripped = round_trip_changes("input.xlsx")
   if dropped or stripped:
       print("WARNING: saving with openpyxl will drop:", dropped)
-      print("WARNING: saving with openpyxl will strip (part, marker):", stripped)
+      print("WARNING: saving with openpyxl will strip (worksheet, URI, content):", stripped)
       # report to the user and get confirmation before the first save
   ```
 
   (openpyxl re-serializes every sheet it touches, so byte-identity of sheets is not a
-  meaningful check; comparing each marker independently is what catches partial loss when, for
-  example, `<extLst>` survives but its `x14:` content does not.)
+  meaningful check. Expanded XML names normalize arbitrary prefixes, sorted attributes normalize
+  serialization order, and the per-worksheet multiset still detects one missing record when an
+  identical URI or even an identical duplicate record survives.)
 
 ## Rules
 

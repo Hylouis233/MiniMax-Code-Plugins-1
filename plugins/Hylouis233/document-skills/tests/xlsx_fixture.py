@@ -88,12 +88,15 @@ except ValueError:
 check("CSV export rejects an ambiguous safety mode", invalid_csv_mode_rejected)
 
 # ---- edit.md snippet: round_trip_changes detects dropped parts AND stripped extensions ----
+from collections import Counter
+from xml.etree import ElementTree as ET
 
 wb = openpyxl.Workbook()
 ws = wb.active
 ws.title = "Data"
 ws.append(["Region", "Units"])
 ws.append(["EU", 120])
+wb.create_sheet("Keep")["A1"] = "keep"
 wb.save("plain.xlsx")
 
 with zipfile.ZipFile("plain.xlsx") as zin:
@@ -103,89 +106,152 @@ with zipfile.ZipFile("plain.xlsx") as zin:
 payload["xl/slicers/slicer1.xml"] = b"<slicer xmlns='stub'/>"
 payload["xl/media/large.bin"] = b"x14:" * 32_768  # binary payload must never be marker-scanned
 
-# simulate an in-part x14 extension that openpyxl will strip while keeping the part name
-EXT = (b"<extLst><ext uri='{00000000-0000-0000-0000-000000000000}' "
-       b"xmlns:x14='http://schemas.microsoft.com/office/spreadsheetml/2009/9/main'>"
-       b"<x14:stub/></ext></extLst>")
+# Two records deliberately share a URI/namespace but carry different child content. A coarse
+# presence set cannot see one disappear while the other survives.
+SHEET_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+X14_NS = "http://schemas.microsoft.com/office/spreadsheetml/2009/9/main"
+EXT_URI = "{00000000-0000-0000-0000-000000000000}"
+KEEP_EXT = (
+    f'<ext uri="{EXT_URI}" xmlns:x14="{X14_NS}"><x14:stub id="keep"/></ext>'
+).encode()
+KEEP_EXT_ALT_PREFIX = (
+    f'<ext uri="{EXT_URI}" xmlns:alt="{X14_NS}"><alt:stub id="keep"/></ext>'
+).encode()
+DROP_EXT = (
+    f'<ext uri="{EXT_URI}" xmlns:sx="{X14_NS}"><sx:stub id="drop"/></ext>'
+).encode()
+EXT_LIST_BOTH = b"<extLst>" + KEEP_EXT + DROP_EXT + b"</extLst>"
+EXT_LIST_KEEP = b"<extLst>" + KEEP_EXT_ALT_PREFIX + b"</extLst>"
+EXT_LIST_DROP = b"<extLst>" + DROP_EXT + b"</extLst>"
 payload["xl/worksheets/sheet1.xml"] = payload["xl/worksheets/sheet1.xml"].replace(
-    b"</worksheet>", EXT + b"</worksheet>")
+    b"</worksheet>", EXT_LIST_BOTH + b"</worksheet>")
+payload["xl/worksheets/sheet2.xml"] = payload["xl/worksheets/sheet2.xml"].replace(
+    b"</worksheet>", EXT_LIST_DROP + b"</worksheet>")
 
 with zipfile.ZipFile("extended.xlsx", "w", zipfile.ZIP_DEFLATED) as zout:
     for name, data in payload.items():
         zout.writestr(name, data)
 
-EXTENSION_MARKERS = {
-    "extLst": b"<extLst",
-    "x14": b"x14:",
-    "AlternateContent": b"mc:AlternateContent",
-}
+partial_payload = dict(payload)
+partial_payload["xl/worksheets/sheet1.xml"] = partial_payload[
+    "xl/worksheets/sheet1.xml"
+].replace(EXT_LIST_BOTH, EXT_LIST_KEEP)
+with zipfile.ZipFile("partial-extension.xlsx", "w", zipfile.ZIP_DEFLATED) as zout:
+    for name, data in partial_payload.items():
+        zout.writestr(name, data)
+
+EXT_TAG = f"{{{SHEET_NS}}}ext"
 
 
-def scan_extension_markers(archive, info):
-    found = set()
-    overlap = max(len(marker) for marker in EXTENSION_MARKERS.values()) - 1
-    tail = b""
+def normalized_text(value):
+    return (value or "").strip()
+
+
+def normalized_element(element):
+    return (
+        element.tag,
+        tuple(sorted(element.attrib.items())),
+        normalized_text(element.text),
+        tuple((normalized_element(child), normalized_text(child.tail)) for child in element),
+    )
+
+
+def worksheet_extension_records(archive, info):
+    records = Counter()
+    extension_depth = 0
     with archive.open(info) as stream:
-        while chunk := stream.read(64 * 1024):
-            window = tail + chunk
-            found.update(label for label, marker in EXTENSION_MARKERS.items() if marker in window)
-            if len(found) == len(EXTENSION_MARKERS):
-                break
-            tail = window[-overlap:]
-    return found
+        for event, element in ET.iterparse(stream, events=("start", "end")):
+            if event == "start":
+                if extension_depth:
+                    extension_depth += 1
+                elif element.tag == EXT_TAG:
+                    extension_depth = 1
+            elif extension_depth:
+                if extension_depth == 1:
+                    children = tuple(
+                        (normalized_element(child), normalized_text(child.tail))
+                        for child in element
+                    )
+                    records[(element.attrib.get("uri", ""), children)] += 1
+                    element.clear()
+                    extension_depth = 0
+                else:
+                    extension_depth -= 1
+            else:
+                element.clear()
+    return records
 
 
 def archive_inventory(source):
     with zipfile.ZipFile(source) as archive:
         names = set(archive.namelist())
-        markers = {}
+        extensions = {}
         for info in archive.infolist():
-            if info.filename.endswith((".xml", ".rels")):
-                found = scan_extension_markers(archive, info)
-                if found:
-                    markers[info.filename] = found
-        return names, markers
+            if (info.filename.startswith("xl/worksheets/")
+                    and info.filename.endswith(".xml")):
+                extensions[info.filename] = worksheet_extension_records(archive, info)
+        return names, extensions
 
 
-def stripped_extension_markers(before, after, common_names):
-    return sorted(
-        (name, label)
-        for name in common_names
-        for label in before.get(name, set()) - after.get(name, set())
-    )
+def stripped_extension_records(before, after, common_names):
+    stripped = []
+    for name in sorted(common_names):
+        for (uri, children), count in (before.get(name, Counter())
+                                       - after.get(name, Counter())).items():
+            stripped.extend((name, uri, children) for _ in range(count))
+    return sorted(stripped, key=repr)
 
 
 def round_trip_changes(path, **load_options):
-    before_names, before_markers = archive_inventory(path)
+    before_names, before_extensions = archive_inventory(path)
     wb = openpyxl.load_workbook(path, **load_options)  # same options as the real edit
     with TemporaryFile() as output:
         wb.save(output)
         output.seek(0)
-        after_names, after_markers = archive_inventory(output)
+        after_names, after_extensions = archive_inventory(output)
     wb.close()
     dropped = sorted(before_names - after_names)
-    stripped_extensions = stripped_extension_markers(
-        before_markers, after_markers, before_names & after_names
+    stripped_extensions = stripped_extension_records(
+        before_extensions, after_extensions, before_names & after_names
     )
     return dropped, stripped_extensions
 
 
 dropped, stripped = round_trip_changes("extended.xlsx")
 check("injected slicer-like part is detected as dropped", "xl/slicers/slicer1.xml" in dropped, dropped)
-check("in-part x14 extension strip is detected (same part name)",
-      ("xl/worksheets/sheet1.xml", "x14") in stripped, stripped)
+check("each stripped worksheet extension record is reported with worksheet and URI",
+      sum(item[0] == "xl/worksheets/sheet1.xml" and item[1] == EXT_URI
+          for item in stripped) == 2,
+      stripped)
 check("clean workbook reports nothing", round_trip_changes("plain.xlsx") == ([], []))
-inventory_names, inventory_markers = archive_inventory("extended.xlsx")
+inventory_names, inventory_extensions = archive_inventory("extended.xlsx")
 check("binary archive parts are named but never marker-scanned",
-      "xl/media/large.bin" in inventory_names and "xl/media/large.bin" not in inventory_markers)
-partial_before = {"xl/worksheets/sheet1.xml": {"extLst", "x14"}}
-partial_after = {"xl/worksheets/sheet1.xml": {"extLst"}}
-check(
-    "marker comparison catches x14 loss while extLst survives",
-    stripped_extension_markers(partial_before, partial_after, set(partial_before))
-    == [("xl/worksheets/sheet1.xml", "x14")],
-    stripped_extension_markers(partial_before, partial_after, set(partial_before)),
+      "xl/media/large.bin" in inventory_names
+      and "xl/media/large.bin" not in inventory_extensions)
+
+partial_names, partial_extensions = archive_inventory("partial-extension.xlsx")
+coarse_needles = (b"extLst", X14_NS.encode(), EXT_URI.encode())
+coarse_before = {needle for needle in coarse_needles
+                 if needle in payload["xl/worksheets/sheet1.xml"]}
+coarse_after = {needle for needle in coarse_needles
+                if needle in partial_payload["xl/worksheets/sheet1.xml"]}
+check("coarse marker presence misses one removed extension record (negative control)",
+      coarse_before == coarse_after == set(coarse_needles),
+      (coarse_before, coarse_after))
+partial_loss = stripped_extension_records(
+    inventory_extensions, partial_extensions, inventory_names & partial_names
 )
+check("granular extension inventory detects only the removed child-content record",
+      len(partial_loss) == 1
+      and partial_loss[0][0] == "xl/worksheets/sheet1.xml"
+      and partial_loss[0][1] == EXT_URI
+      and "drop" in repr(partial_loss[0][2]),
+      partial_loss)
+check("extension inventory keeps records separated by worksheet identity",
+      inventory_extensions["xl/worksheets/sheet2.xml"]
+      == partial_extensions["xl/worksheets/sheet2.xml"]
+      and bool(partial_extensions["xl/worksheets/sheet2.xml"]),
+      partial_extensions)
 
 # ---- formatting.md snippet: sheet references built from the real sheet title -------
 wb_f = openpyxl.Workbook()

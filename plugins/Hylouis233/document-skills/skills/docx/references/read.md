@@ -51,8 +51,22 @@ def iter_paragraph_runs(paragraph):
                 yield from walk(child)
     yield from walk(paragraph._p)
 
+def legacy_symbol_record(symbol):
+    """Report font-specific w:sym content without guessing at a Unicode mapping."""
+    font = symbol.get(qn("w:font"))
+    character = symbol.get(qn("w:char"))
+    return f"[unreadable legacy symbol font={font!r} char={character!r}]"
+
+def run_text(run):
+    pieces = []
+    for child in run._r.xpath(
+        "w:br | w:cr | w:noBreakHyphen | w:ptab | w:t | w:tab | w:sym"
+    ):
+        pieces.append(legacy_symbol_record(child) if child.tag == qn("w:sym") else str(child))
+    return "".join(pieces)
+
 def paragraph_text(paragraph):
-    return "".join(run.text for run in iter_paragraph_runs(paragraph))
+    return "".join(run_text(run) for run in iter_paragraph_runs(paragraph))
 
 def tc_text(tc, parent):
     """Cell text rebuilt per paragraph, keeping tabs and breaks visible.
@@ -72,6 +86,8 @@ def tc_text(tc, parent):
                 pieces.append("<tab>")
             elif node.tag in (qn("w:br"), qn("w:cr")):
                 pieces.append("<br>")
+            elif node.tag == qn("w:sym"):
+                pieces.append(legacy_symbol_record(node))
         paragraphs.append("".join(pieces))
     return " / ".join(paragraphs)
 
@@ -143,6 +159,9 @@ Notes:
   presenting an incomplete extraction. Convert them with a trusted office renderer before
   claiming their content was read. Each table-cell record carries its own `unreadable` list so
   an import nested in a cell is not lost from the report.
+  A legacy `w:sym` code is specific to its symbol font, so the helpers preserve its position
+  as an explicit unreadable record containing the font and character code rather than silently
+  dropping visible content or guessing a Unicode character.
   Text boxes, headers, footers, and footnotes still require their own collections
   (`section.header/.footer`) or raw XML.
 - For revision/comment metadata, inspect the XML parts directly: `word/comments.xml`,

@@ -26,7 +26,15 @@ def placeholder_of_type(slide, *types):
         ph for ph in slide.placeholders
         if ph.placeholder_format.type in types
     ]
-    assert len(matches) == 1, f"expected one placeholder of {types}, found {len(matches)}"
+    if len(matches) != 1:
+        available = [
+            f"{ph.name} ({ph.placeholder_format.type})"
+            for ph in slide.placeholders
+        ]
+        raise ValueError(
+            f"expected exactly one placeholder of {types}, found {len(matches)}; "
+            f"available placeholders: {available or 'none'}"
+        )
     return matches[0]
 
 # P1 title slide
@@ -48,14 +56,22 @@ for i, line in enumerate(lines):
 # P3 table slide
 s = add_slide(title_only_layout)
 s.shapes.title.text = "Regional service health"
-rows, cols = 4, 3
+hdr = ["Region", "Error rate", "P99 latency"]
+body = [
+    ["Americas", "0.08%", "182 ms"],
+    ["Europe", "0.05%", "164 ms"],
+    ["Asia Pacific", "0.11%", "213 ms"],
+]
+rows, cols = 1 + len(body), len(hdr)
 tbl_shape = s.shapes.add_table(rows, cols, Inches(0.5), Inches(1.5), Inches(9), Inches(3.5))
 table = tbl_shape.table
-hdr = ["Region", "Error rate", "P99 latency"]
 for j, text in enumerate(hdr):
     cell = table.cell(0, j); cell.text = text
     for par in cell.text_frame.paragraphs:
         for run in par.runs: run.font.bold = True
+for i, row in enumerate(body, start=1):
+    for j, text in enumerate(row):
+        table.cell(i, j).text = text
 
 # P4 chart slide (real chart part, not a picture)
 from pptx.chart.data import CategoryChartData

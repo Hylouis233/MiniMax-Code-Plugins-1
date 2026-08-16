@@ -179,8 +179,23 @@ def iter_paragraph_runs(paragraph):
     yield from walk(paragraph._p)
 
 
+def legacy_symbol_record(symbol):
+    font = symbol.get(qn("w:font"))
+    character = symbol.get(qn("w:char"))
+    return f"[unreadable legacy symbol font={font!r} char={character!r}]"
+
+
+def run_text(run):
+    pieces = []
+    for child in run._r.xpath(
+        "w:br | w:cr | w:noBreakHyphen | w:ptab | w:t | w:tab | w:sym"
+    ):
+        pieces.append(legacy_symbol_record(child) if child.tag == qn("w:sym") else str(child))
+    return "".join(pieces)
+
+
 def paragraph_text(paragraph):
-    return "".join(run.text for run in iter_paragraph_runs(paragraph))
+    return "".join(run_text(run) for run in iter_paragraph_runs(paragraph))
 
 
 def table_content(table):
@@ -238,6 +253,13 @@ inline_paragraph = sdt_doc.add_paragraph("before-")
 inline_run = inline_paragraph.add_run("inline한")
 inline_paragraph.add_run("-after")
 wrap_in_sdt(inline_run._r)
+inline_paragraph.add_run("-legacy-")
+legacy_symbol_run = inline_paragraph.add_run()
+legacy_symbol = OxmlElement("w:sym")
+legacy_symbol.set(qn("w:font"), "Wingdings")
+legacy_symbol.set(qn("w:char"), "F052")
+legacy_symbol_run._r.append(legacy_symbol)
+inline_paragraph.add_run("-visible")
 chunk_part = Part(
     PackURI("/word/altChunk1.html"), "text/html",
     b"<html><body>IMPORTED ALTCHUNK TEXT</body></html>", sdt_doc.part.package,
@@ -265,7 +287,15 @@ walked_paragraphs = [block for kind, block in walked_blocks if kind == "paragrap
 walked_text = [paragraph_text(paragraph) for paragraph in walked_paragraphs]
 check("content-control traversal emits the nested paragraph", "inside content control" in walked_text, walked_text)
 check("content-control traversal emits inline run text",
-      "before-inline한-after" in walked_text, walked_text)
+      any("before-inline한-after" in text for text in walked_text), walked_text)
+legacy_symbol_marker = "[unreadable legacy symbol font='Wingdings' char='F052']"
+legacy_paragraph = next(paragraph for paragraph in walked_paragraphs
+                        if "-legacy-" in paragraph_text(paragraph))
+check("Run.text silently omits visible legacy w:sym content (negative control)",
+      legacy_symbol_marker not in "".join(run.text for run in iter_paragraph_runs(legacy_paragraph)))
+check("paragraph extraction preserves the legacy symbol's position, font, and character code",
+      f"-legacy-{legacy_symbol_marker}-visible" in paragraph_text(legacy_paragraph),
+      paragraph_text(legacy_paragraph))
 walked_tables = [block for kind, block in walked_blocks if kind == "table"]
 rendered_tables = [table_content(table) for table in walked_tables]
 check("content-control traversal emits a wrapped table",
@@ -634,12 +664,23 @@ def new_restart_num_id(doc, base_num_id):
     clone = copy.deepcopy(source)
     new_id = max(int(n.get(qn("w:numId"))) for n in numbering.findall(qn("w:num"))) + 1
     clone.set(qn("w:numId"), str(new_id))
-    override = OxmlElement("w:lvlOverride")
-    override.set(qn("w:ilvl"), "0")
+    level_zero_overrides = [
+        item for item in clone.findall(qn("w:lvlOverride"))
+        if item.get(qn("w:ilvl")) == "0"
+    ]
+    if len(level_zero_overrides) > 1:
+        raise ValueError("base numbering has duplicate level-zero overrides")
+    if level_zero_overrides:
+        override = level_zero_overrides[0]
+        for old_start in override.findall(qn("w:startOverride")):
+            override.remove(old_start)
+    else:
+        override = OxmlElement("w:lvlOverride")
+        override.set(qn("w:ilvl"), "0")
+        clone.append(override)
     start = OxmlElement("w:startOverride")
     start.set(qn("w:val"), "1")
-    override.append(start)
-    clone.append(override)
+    override.insert(0, start)
     numbering.append(clone)
     return new_id
 
@@ -675,6 +716,15 @@ for item in ("one", "two", "three"):
     doc_b.add_paragraph(item, style="List Number")
 doc_b.add_paragraph("Second list, restarted")
 base_id = list_number_num_id(doc_b)
+numbering_b = doc_b.part.part_related_by(RT.NUMBERING).element
+base_entry = next(n for n in numbering_b.findall(qn("w:num"))
+                  if n.get(qn("w:numId")) == str(base_id))
+preexisting_override = OxmlElement("w:lvlOverride")
+preexisting_override.set(qn("w:ilvl"), "0")
+preexisting_start = OxmlElement("w:startOverride")
+preexisting_start.set(qn("w:val"), "7")
+preexisting_override.append(preexisting_start)
+base_entry.append(preexisting_override)
 restart_id = new_restart_num_id(doc_b, base_id)
 for item in ("four", "five", "six"):
     numbered_paragraph(doc_b, item, restart_id)
@@ -685,10 +735,15 @@ numbering_b = doc_b.part.part_related_by(RT.NUMBERING).element
 nums_b = numbering_b.findall(qn("w:num"))
 check("cloned num entry exists", any(n.get(qn("w:numId")) == str(restart_id) for n in nums_b))
 clone_entry = next(n for n in nums_b if n.get(qn("w:numId")) == str(restart_id))
-override = clone_entry.find(qn("w:lvlOverride"))
-check("clone carries startOverride=1 at ilvl 0",
-      override is not None and override.get(qn("w:ilvl")) == "0"
-      and override.find(qn("w:startOverride")).get(qn("w:val")) == "1")
+level_zero_overrides = [item for item in clone_entry.findall(qn("w:lvlOverride"))
+                        if item.get(qn("w:ilvl")) == "0"]
+start_overrides = ([] if not level_zero_overrides else
+                   level_zero_overrides[0].findall(qn("w:startOverride")))
+check("clone replaces a preexisting ilvl=0 override without creating a duplicate",
+      len(level_zero_overrides) == 1 and len(start_overrides) == 1
+      and start_overrides[0].get(qn("w:val")) == "1")
+check("cloning leaves the base numbering override unchanged",
+      preexisting_start.get(qn("w:val")) == "7")
 second_list_num_ids = [
     p._p.find(qn("w:pPr") + "/" + qn("w:numPr") + "/" + qn("w:numId")).get(qn("w:val"))
     for p in doc_b.paragraphs[-3:]

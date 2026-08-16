@@ -114,10 +114,10 @@ size_mismatches = [
 ]
 require(not size_mismatches, f"unexpected page sizes: {size_mismatches}")
 
-# Overflow is a defect (shared rule 4): text that runs past the page box is
-# clipped or off-page even though every check above still passes. Plain block
-# extraction silently drops fully off-page text, so extract through an
-# explicitly enlarged clip rectangle and compare the block boxes to the page.
+# Overflow is a defect (shared rule 4): text, images, or vector drawings that run
+# past the page box are clipped even though every check above still passes. Plain
+# text extraction silently drops fully off-page text, so use an enlarged clip for
+# text and inspect the placement boxes reported for every image and drawing.
 import fitz
 
 overflow_doc = fitz.open(output_path)
@@ -127,24 +127,45 @@ if overflow_doc.needs_pass:
     overflow_doc.authenticate(password)
 overflow_pages = []
 for page in overflow_doc:
-    # get_text() block coordinates are unrotated even when /Rotate is 90/270;
+    # These APIs report unrotated coordinates even when /Rotate is 90/270;
     # page.rect uses rotated dimensions. Compare against an unrotated crop-box
-    # extent so valid high-y portrait text is not flagged on a rotated page.
+    # extent so valid high-y portrait content is not flagged on a rotated page.
     page_box = fitz.Rect(0, 0, page.cropbox.width, page.cropbox.height)
     clip = fitz.Rect(
         page_box.x0 - 2000, page_box.y0 - 2000,
         page_box.x1 + 2000, page_box.y1 + 2000,
     )
-    text_blocks = [b for b in page.get_text("blocks", clip=clip) if b[6] == 0]
+    text_rects = [
+        fitz.Rect(block[:4])
+        for block in page.get_text("blocks", clip=clip)
+        if block[6] == 0
+    ]
+    image_rects = [
+        fitz.Rect(0, 0, 1, 1) * fitz.Matrix(*image["transform"])
+        for image in page.get_image_info()
+    ]
+    drawing_rects = []
+    for drawing in page.get_drawings():
+        rect = fitz.Rect(drawing["rect"])
+        # Path rectangles exclude stroke thickness. Expand stroked paths so a
+        # line centered on the page edge cannot hide half its width off-page.
+        stroke_pad = (
+            float(drawing.get("width") or 0) / 2
+            if "s" in drawing.get("type", "") else 0
+        )
+        drawing_rects.append(fitz.Rect(
+            rect.x0 - stroke_pad, rect.y0 - stroke_pad,
+            rect.x1 + stroke_pad, rect.y1 + stroke_pad,
+        ))
     beyond_box = any(
-        b[0] < page_box.x0 - 0.5 or b[1] < page_box.y0 - 0.5
-        or b[2] > page_box.x1 + 0.5 or b[3] > page_box.y1 + 0.5
-        for b in text_blocks
+        rect.x0 < page_box.x0 - 0.5 or rect.y0 < page_box.y0 - 0.5
+        or rect.x1 > page_box.x1 + 0.5 or rect.y1 > page_box.y1 + 0.5
+        for rect in text_rects + image_rects + drawing_rects
     )
     if beyond_box:
         overflow_pages.append(page.number + 1)
 overflow_doc.close()
-require(not overflow_pages, f"text blocks extend past the page box on pages: {overflow_pages}")
+require(not overflow_pages, f"content extends past the page box on pages: {overflow_pages}")
 # The page box is the hard bound. When the task declares specific margins,
 # additionally check key blocks against them (or render and inspect visually) -
 # content inside the box but past a declared margin is a softer, task-specific
@@ -155,6 +176,6 @@ Confirm: page count matches the request; every page except those explicitly list
 `intentionally_raster_only_pages` has extractable text or at least one form widget (a pure
 interactive page); each requested key string is listed in `expected_strings_by_page` and
 extracts on the correct page; every value in `page_sizes` is the declared size within
-`page_size_tolerance`; and no page's text blocks extend past the page box (the overflow
-check). Report all five. For pixel-sensitive work, render every applicable page
+`page_size_tolerance`; and no page's text, image placements, or vector drawings extend past
+the page box (the overflow check). Report all five. For pixel-sensitive work, render every applicable page
 with PyMuPDF at 100 dpi and check that each render is non-blank (mean pixel value).
