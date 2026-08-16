@@ -100,6 +100,7 @@ section.left_margin, section.right_margin = Cm(2.8), Cm(2.6)
 
    ```python
    from docx import Document
+   from docx.enum.style import WD_STYLE_TYPE
    from fontTools.ttLib import TTFont
    from docx.oxml.ns import qn
    from docx.text.paragraph import Paragraph
@@ -139,10 +140,37 @@ section.left_margin, section.right_margin = Cm(2.8), Cm(2.6)
                yield face
            style = style.base_style
 
+   def table_style_faces(run, slot):
+       """Find table/conditional style faces that python-docx does not cascade for runs."""
+       element = run._r
+       while element is not None and element.tag != qn("w:tbl"):
+           element = element.getparent()
+       if element is None:
+           return []
+       table_properties = element.find(qn("w:tblPr"))
+       table_style = None if table_properties is None else table_properties.find(qn("w:tblStyle"))
+       style_id = None if table_style is None else table_style.get(qn("w:val"))
+       style = None if not style_id else doc.styles.get_by_id(style_id, WD_STYLE_TYPE.TABLE)
+       faces = []
+       while style is not None:
+           rprs = [style.element.find(qn("w:rPr"))]
+           rprs.extend(
+               region.find(qn("w:rPr"))
+               for region in style.element.findall(qn("w:tblStylePr"))
+           )
+           faces.extend(face for rpr in rprs if (face := face_from_rpr(rpr, slot)))
+           style = style.base_style
+       return list(dict.fromkeys(faces))
+
    def effective_face(run, slot):
        direct = face_from_rpr(run._r.find(qn("w:rPr")), slot)
        if direct:
            return direct
+       if faces := table_style_faces(run, slot):
+           raise LookupError(
+               f"table style can override {slot} with {faces}; resolve the applicable "
+               "tblStylePr region or require rendered inspection"
+           )
        # Header/footer runs belong to a HeaderPart/FooterPart, which has no .document.
        # Resolve the owning document's Normal style once rather than via run.part.
        for style in (run.style, run._parent.style, normal_style):

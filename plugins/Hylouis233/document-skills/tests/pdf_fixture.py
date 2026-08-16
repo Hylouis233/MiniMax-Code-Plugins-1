@@ -10,7 +10,10 @@ import sys
 
 import fitz
 import pypdf
+import reportlab
 from reportlab.lib.pagesizes import A4
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 failures = []
@@ -52,6 +55,40 @@ check(
     all(abs(w - 595.2755) < A4_TOLERANCE and abs(h - 841.8897) < A4_TOLERANCE for w, h in page_sizes),
     page_sizes,
 )
+
+# ---- inspect.md distinguishes referenced-only and embedded fonts ---------------
+pdfmetrics.registerFont(TTFont("FixtureVera", os.path.join(
+    os.path.dirname(reportlab.__file__), "fonts", "Vera.ttf",
+)))
+font_canvas = canvas.Canvas("font-inventory.pdf", pagesize=A4)
+font_canvas.setFont("Helvetica", 12)  # standard PDF face, normally referenced only
+font_canvas.drawString(72, 780, "Referenced Helvetica")
+font_canvas.setFont("FixtureVera", 12)
+font_canvas.drawString(72, 750, "Embedded Vera")
+font_canvas.save()
+
+def font_inventory(document, page):
+    fonts = []
+    for entry in page.get_fonts(full=True):
+        xref, extension, font_type, base_name, resource_name, encoding = entry[:6]
+        embedded_bytes = 0
+        if xref > 0:
+            try:
+                embedded_bytes = len((document.extract_font(xref)[3] or b""))
+            except (RuntimeError, ValueError):
+                embedded_bytes = 0
+        fonts.append({
+            "base_name": base_name, "embedded": embedded_bytes > 0,
+            "embedded_bytes": embedded_bytes,
+        })
+    return fonts
+
+font_doc = fitz.open("font-inventory.pdf")
+fonts = font_inventory(font_doc, font_doc[0])
+check("font inventory labels the embedded TrueType face",
+      any("Vera" in item["base_name"] and item["embedded"] for item in fonts), fonts)
+check("font inventory labels referenced-only Helvetica as non-embedded",
+      any("Helvetica" in item["base_name"] and not item["embedded"] for item in fonts), fonts)
 
 # ---- SKILL.md postcheck: encrypted output is reopened with its password -------
 encrypted_writer = pypdf.PdfWriter()

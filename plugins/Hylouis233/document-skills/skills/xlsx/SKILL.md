@@ -66,7 +66,15 @@ output_path, *expected_sheets = sys.argv[1:]
 expected_number_formats = {
     # "Sales": {"D2": "#,##0.00", "E2": "yyyy-mm-dd"},
 }
+# Populate every formula the task intends to create or preserve.
+expected_formulas = {
+    # "Sales": {"D2": "=C2*1.08"},
+}
 wb = openpyxl.load_workbook(output_path)
+
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
 
 def formula_text(value):
     if isinstance(value, str):
@@ -81,10 +89,16 @@ def formula_text(value):
 
 print("sheets:", wb.sheetnames)
 missing = set(expected_sheets) - set(wb.sheetnames)
-assert not missing, f"missing expected sheets: {sorted(missing)}"
+require(not missing, f"missing expected sheets: {sorted(missing)}")
 calc = wb.calculation
 print("calcMode:", getattr(calc, "calcMode", None),
       "fullCalcOnLoad:", getattr(calc, "fullCalcOnLoad", None))
+if any(expected_formulas.values()):
+    require(
+        getattr(calc, "fullCalcOnLoad", False) is True
+        or getattr(calc, "calcMode", None) == "auto",
+        "formula output is not configured to recalculate in spreadsheet viewers",
+    )
 for ws in wb.worksheets:
     print(f"{ws.title} dims:", ws.dimensions)
     formulas = [
@@ -92,11 +106,18 @@ for ws in wb.worksheets:
         for row in ws.iter_rows() for c in row if c.data_type == "f"
     ]
     print(f"{ws.title} formula cells:", formulas[:10])
+    actual_formulas = dict(formulas)
+    for coordinate, expected_formula in expected_formulas.get(ws.title, {}).items():
+        require(
+            actual_formulas.get(coordinate) == expected_formula,
+            f"{ws.title}!{coordinate}: expected formula {expected_formula!r}, "
+            f"got {actual_formulas.get(coordinate)!r}",
+        )
     for coordinate, expected_format in expected_number_formats.get(ws.title, {}).items():
         actual_format = ws[coordinate].number_format
-        assert actual_format == expected_format, (
+        require(actual_format == expected_format, (
             f"{ws.title}!{coordinate}: expected format {expected_format!r}, got {actual_format!r}"
-        )
+        ))
 wb.close()
 ```
 

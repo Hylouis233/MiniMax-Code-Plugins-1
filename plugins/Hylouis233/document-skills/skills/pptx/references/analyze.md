@@ -6,6 +6,10 @@
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 from pptx.oxml.ns import qn
+from lxml import etree
+
+DIAGRAM_NS = "http://schemas.openxmlformats.org/drawingml/2006/diagram"
+SAFE_XML = etree.XMLParser(load_dtd=False, resolve_entities=False, no_network=True)
 
 def iter_shapes(shapes):
     """Walk shapes recursively so content nested inside group shapes is counted too."""
@@ -85,6 +89,26 @@ def chart_axis_titles(chart):
         titles[label] = axis.axis_title.text_frame.text if axis.has_title else ""
     return titles
 
+def smartart_content(shape):
+    """Extract SmartArt data-part labels, or report why the diagram is unreadable."""
+    graphic_data = shape._element.find(".//" + qn("a:graphicData"))
+    if graphic_data is None or graphic_data.get("uri") != DIAGRAM_NS:
+        return None
+    rel_ids = graphic_data.find(f".//{{{DIAGRAM_NS}}}relIds")
+    relationship_id = None if rel_ids is None else rel_ids.get(qn("r:dm"))
+    if not relationship_id:
+        return {"name": shape.name, "status": "unreadable", "reason": "missing data relationship"}
+    try:
+        data_part = shape.part.related_part(relationship_id)
+    except (KeyError, ValueError):
+        return {"name": shape.name, "status": "unreadable", "reason": relationship_id}
+    try:
+        root = etree.fromstring(data_part.blob, parser=SAFE_XML)
+    except etree.XMLSyntaxError as error:
+        return {"name": shape.name, "status": "unreadable", "reason": str(error)}
+    labels = [node.text for node in root.iter(qn("a:t")) if node.text]
+    return {"name": shape.name, "status": "ok", "text": labels}
+
 prs = Presentation("input.pptx")
 print("slide size:", prs.slide_width, prs.slide_height)
 for i, slide in enumerate(prs.slides):
@@ -124,6 +148,10 @@ for i, slide in enumerate(prs.slides):
         content for sh in shapes
         if (content := picture_content(sh)) is not None
     ]
+    smartart = [
+        content for sh in shapes
+        if (content := smartart_content(sh)) is not None
+    ]
 
     # These full values - not only counts or lengths - are the evidence for summaries and
     # repurposing. Keep notes verbatim so markdown output can preserve them as blockquotes.
@@ -132,6 +160,7 @@ for i, slide in enumerate(prs.slides):
     print("  tables:", tables)
     print("  charts:", charts)
     print("  pictures:", pictures)
+    print("  smartart:", smartart)
     print("  notes:", notes)
 ```
 

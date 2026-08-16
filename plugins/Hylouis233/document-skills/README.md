@@ -84,7 +84,10 @@ encrypted extraction, CMYK conversion, soft masks; PPTX run-preserving edits, ta
 actual content extraction, grouped shapes, script-aware per-master themes; XLSX dialect sniffing,
 array formulas, streamed extension checks, structural-reference audits; DOCX bounded package review,
 content controls, per-run glyph checks, guarded replacement, and a LibreOffice-rendered numbering
-restart). Each script is self-contained and exits non-zero on failure.
+restart). Each script is self-contained and exits non-zero on failure. `npm run check` executes
+all four through `tests/fixtures.test.mjs`; install the pinned Python environment with
+`python -m pip install -r tests/requirements-fixtures.txt` and make `soffice` available first.
+The repository CI installs those dependencies and LibreOffice Writer before running the same gate.
 
 ## Requirements
 

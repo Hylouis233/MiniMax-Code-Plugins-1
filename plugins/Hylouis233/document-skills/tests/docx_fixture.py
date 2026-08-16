@@ -12,6 +12,7 @@ import zipfile
 
 import fitz
 from docx import Document
+from docx.enum.style import WD_STYLE_TYPE
 from docx.opc.constants import RELATIONSHIP_TYPE as RT
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
@@ -161,6 +162,12 @@ def table_content(table):
     rows = []
     for row in table.rows:
         rendered_cells = []
+        row_properties = row._tr.find(qn("w:trPr"))
+        grid_before_node = None if row_properties is None else row_properties.find(qn("w:gridBefore"))
+        grid_after_node = None if row_properties is None else row_properties.find(qn("w:gridAfter"))
+        grid_before = 0 if grid_before_node is None else int(grid_before_node.get(qn("w:val"), "0"))
+        grid_after = 0 if grid_after_node is None else int(grid_after_node.get(qn("w:val"), "0"))
+        column = grid_before
         for cell in row.cells:
             items = []
             for kind, block in iter_part_blocks(cell._tc, cell):
@@ -170,8 +177,11 @@ def table_content(table):
                     items.append(table_content(block))
                 else:
                     items.append(block)
-            rendered_cells.append(items)
-        rows.append(rendered_cells)
+            rendered_cells.append({"column": column, "items": items})
+            column += 1
+        rows.append({
+            "grid_before": grid_before, "cells": rendered_cells, "grid_after": grid_after,
+        })
     return rows
 
 
@@ -189,6 +199,13 @@ sdt_paragraph = sdt_doc.add_paragraph("inside content control")
 wrap_in_sdt(sdt_paragraph._p)
 controlled_table = sdt_doc.add_table(rows=1, cols=1)
 controlled_table.cell(0, 0).text = "table한"
+row_properties = controlled_table.rows[0]._tr.get_or_add_trPr()
+grid_before = OxmlElement("w:gridBefore")
+grid_before.set(qn("w:val"), "1")
+row_properties.append(grid_before)
+grid_after = OxmlElement("w:gridAfter")
+grid_after.set(qn("w:val"), "2")
+row_properties.append(grid_after)
 nested_table = controlled_table.cell(0, 0).add_table(rows=1, cols=1)
 nested_table.cell(0, 0).text = "nested한"
 wrap_in_sdt(controlled_table._tbl)
@@ -228,6 +245,11 @@ check("table text is emitted exactly once, not again as prose",
       sum(item.count("table한") for item in all_emitted) == 1, all_emitted)
 check("nested-table text is emitted exactly once",
       sum(item.count("nested한") for item in all_emitted) == 1, all_emitted)
+check("nonuniform table rows preserve leading/trailing grid omissions",
+      rendered_tables[0][0]["grid_before"] == 1
+      and rendered_tables[0][0]["cells"][0]["column"] == 1
+      and rendered_tables[0][0]["grid_after"] == 2,
+      rendered_tables[0])
 unreadable_parts = [block for kind, block in walked_blocks if kind == "unreadable"]
 check("altChunk content is reported instead of silently omitted",
       unreadable_parts == [{
@@ -297,10 +319,32 @@ def style_faces(style, slot):
         style = style.base_style
 
 
+def table_style_faces(run, slot):
+    element = run._r
+    while element is not None and element.tag != qn("w:tbl"):
+        element = element.getparent()
+    if element is None:
+        return []
+    table_properties = element.find(qn("w:tblPr"))
+    table_style = None if table_properties is None else table_properties.find(qn("w:tblStyle"))
+    style_id = None if table_style is None else table_style.get(qn("w:val"))
+    style = None if not style_id else font_doc.styles.get_by_id(style_id, WD_STYLE_TYPE.TABLE)
+    faces = []
+    while style is not None:
+        rprs = [style.element.find(qn("w:rPr"))]
+        rprs.extend(region.find(qn("w:rPr"))
+                    for region in style.element.findall(qn("w:tblStylePr")))
+        faces.extend(face for rpr in rprs if (face := face_from_rpr(rpr, slot)))
+        style = style.base_style
+    return list(dict.fromkeys(faces))
+
+
 def effective_face(run, slot):
     direct = face_from_rpr(run._r.find(qn("w:rPr")), slot)
     if direct:
         return direct
+    if faces := table_style_faces(run, slot):
+        raise LookupError(f"conditional table style face requires rendered resolution: {faces}")
     for style in (run.style, run._parent.style, normal_style):
         if face := next(style_faces(style, slot), None):
             return face
@@ -336,6 +380,26 @@ check("glyph traversal includes CJK text nested in a hyperlink",
       [run.text for run in walked_hyperlink_runs])
 check("hyperlink CJK text resolves through the east-Asian font slot",
       effective_face(walked_hyperlink_runs[0], "eastAsia") == "CJK Face")
+
+conditional_style = font_doc.styles.add_style("Conditional CJK Table", WD_STYLE_TYPE.TABLE)
+first_row = OxmlElement("w:tblStylePr")
+first_row.set(qn("w:type"), "firstRow")
+conditional_rpr = OxmlElement("w:rPr")
+conditional_fonts = OxmlElement("w:rFonts")
+conditional_fonts.set(qn("w:eastAsia"), "Conditional CJK Face")
+conditional_rpr.append(conditional_fonts)
+first_row.append(conditional_rpr)
+conditional_style.element.append(first_row)
+font_table = font_doc.add_table(rows=1, cols=1)
+font_table.style = conditional_style
+conditional_run = font_table.cell(0, 0).paragraphs[0].add_run("漢")
+try:
+    effective_face(conditional_run, "eastAsia")
+    conditional_style_rejected = False
+except LookupError:
+    conditional_style_rejected = True
+check("glyph audit fails closed for conditional table-style fonts",
+      conditional_style_rejected)
 
 # ---- edit.md guarded cross-run replacement ------------------------------------
 SAFE_RUN_CHILDREN = {

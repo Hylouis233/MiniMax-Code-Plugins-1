@@ -40,6 +40,10 @@ Watermark / stamp by merging a stamp page onto each page:
 ```python
 from pypdf import Transformation
 
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
 stamp = open_pdf("watermark.pdf").pages[0]
 stamp.transfer_rotation_to_content()
 stamp_text = (stamp.extract_text() or "").strip()
@@ -71,12 +75,17 @@ with open("watermarked.pdf", "wb") as f:
     writer.write(f)
 
 check = PdfReader("watermarked.pdf")
-assert len(check.pages) == len(expected_sizes)
-assert [tuple(float(value) for value in page.mediabox) for page in check.pages] == expected_sizes
+require(len(check.pages) == len(expected_sizes), "watermarking changed the page count")
+require(
+    [tuple(float(value) for value in page.mediabox) for page in check.pages] == expected_sizes,
+    "watermarking changed page geometry",
+)
 if expected_fields:
-    assert set(expected_fields) <= set(check.get_fields() or {}), "watermarking dropped form fields"
+    require(set(expected_fields) <= set(check.get_fields() or {}),
+            "watermarking dropped form fields")
 if stamp_text:
-    assert all(stamp_text in (page.extract_text() or "") for page in check.pages)
+    require(all(stamp_text in (page.extract_text() or "") for page in check.pages),
+            "watermark text is missing from one or more pages")
 ```
 
 If the stamp is graphical, render every output page and visually confirm that it is present;
@@ -97,7 +106,8 @@ Encryption and forms:
 
   reader = open_pdf("form.pdf")
   fields = reader.get_fields() or {}
-  assert fields, "this PDF has no AcroForm form fields"
+  if not fields:
+      raise ValueError("this PDF has no AcroForm form fields")
 
   writer = PdfWriter()
   writer.append(reader)   # clones every page AND the catalog /AcroForm into the writer
@@ -130,7 +140,8 @@ Encryption and forms:
 
   check = PdfReader("filled.pdf")
   value = str((check.get_fields() or {}).get("applicant_name", {}).get("/V", ""))
-  assert value.strip("/") == "Ada Byron"
+  if value.strip("/") != "Ada Byron":
+      raise ValueError(f"filled field did not round-trip: {value!r}")
   ```
 
   A freshly constructed `PdfWriter` is empty: `append` (or `clone_document_from_reader`) must

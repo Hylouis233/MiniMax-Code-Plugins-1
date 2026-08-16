@@ -312,6 +312,30 @@ def chart_axis_titles(chart):
     return titles
 
 
+DIAGRAM_NS = "http://schemas.openxmlformats.org/drawingml/2006/diagram"
+SAFE_DIAGRAM_XML = etree.XMLParser(load_dtd=False, resolve_entities=False, no_network=True)
+
+
+def smartart_content(shape):
+    graphic_data = shape._element.find(".//" + qn("a:graphicData"))
+    if graphic_data is None or graphic_data.get("uri") != DIAGRAM_NS:
+        return None
+    rel_ids = graphic_data.find(f".//{{{DIAGRAM_NS}}}relIds")
+    relationship_id = None if rel_ids is None else rel_ids.get(qn("r:dm"))
+    if not relationship_id:
+        return {"name": shape.name, "status": "unreadable", "reason": "missing data relationship"}
+    try:
+        data_part = shape.part.related_part(relationship_id)
+    except (KeyError, ValueError):
+        return {"name": shape.name, "status": "unreadable", "reason": relationship_id}
+    try:
+        root = etree.fromstring(data_part.blob, parser=SAFE_DIAGRAM_XML)
+    except etree.XMLSyntaxError as error:
+        return {"name": shape.name, "status": "unreadable", "reason": str(error)}
+    labels = [node.text for node in root.iter(qn("a:t")) if node.text]
+    return {"name": shape.name, "status": "ok", "text": labels}
+
+
 def extract_slide_content(slide):
     shapes = list(iter_shapes(slide.shapes))
     text = [sh.text_frame.text for sh in shapes if sh.has_text_frame and sh.text_frame.text]
@@ -347,8 +371,12 @@ def extract_slide_content(slide):
         info for shape in shapes
         if (info := picture_content(shape)) is not None
     ]
+    smartart = [
+        info for shape in shapes
+        if (info := smartart_content(shape)) is not None
+    ]
     return {"text": text, "tables": tables, "charts": charts,
-            "pictures": pictures, "notes": notes}
+            "pictures": pictures, "smartart": smartart, "notes": notes}
 
 
 content = extract_slide_content(Presentation("input.pptx").slides[0])
@@ -378,6 +406,36 @@ check("content inventory emits bubble x/y/size points",
       and chart_by_title["Bubble risk"]["plots"][0]["series"][0]["bubble_points"]
       == [(0, 5.0)])
 check("content inventory emits notes text", "regional split" in content["notes"], content["notes"])
+
+diagram_frame = etree.fromstring(f'''<p:graphicFrame
+    xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+    xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+    xmlns:dgm="{DIAGRAM_NS}"
+    xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <a:graphic><a:graphicData uri="{DIAGRAM_NS}"><dgm:relIds r:dm="rIdSmart"/></a:graphicData></a:graphic>
+</p:graphicFrame>'''.encode())
+diagram_data = f'''<dgm:dataModel xmlns:dgm="{DIAGRAM_NS}"
+    xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <dgm:ptLst><dgm:pt><dgm:t><a:p><a:r><a:t>Revenue</a:t></a:r></a:p></dgm:t></dgm:pt></dgm:ptLst>
+</dgm:dataModel>'''.encode()
+diagram_part = type("DiagramPart", (), {"blob": diagram_data})()
+diagram_owner = type("SlidePart", (), {
+    "related_part": lambda self, relationship_id: {"rIdSmart": diagram_part}[relationship_id],
+})()
+diagram_shape = type("SmartArtShape", (), {
+    "name": "SmartArt 1", "_element": diagram_frame, "part": diagram_owner,
+})()
+check("SmartArt inventory extracts text from the diagram data part",
+      smartart_content(diagram_shape)
+      == {"name": "SmartArt 1", "status": "ok", "text": ["Revenue"]})
+missing_diagram_shape = type("SmartArtShape", (), {
+    "name": "Broken SmartArt", "_element": diagram_frame,
+    "part": type("SlidePart", (), {
+        "related_part": lambda self, relationship_id: {}[relationship_id],
+    })(),
+})()
+check("SmartArt inventory reports an unresolved diagram relationship",
+      smartart_content(missing_diagram_shape)["status"] == "unreadable")
 
 placeholder_png = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZlRYAAAAASUVORK5CYII="

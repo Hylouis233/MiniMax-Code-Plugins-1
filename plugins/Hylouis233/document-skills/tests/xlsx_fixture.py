@@ -5,6 +5,7 @@
 #   python pptx_fixture.py  (deps: python-pptx)
 #   python xlsx_fixture.py  (deps: openpyxl)
 #   python docx_fixture.py  (deps: python-docx, pymupdf, soffice on PATH)
+import base64
 import csv
 import sys
 import zipfile
@@ -218,9 +219,10 @@ check(
 
 # ---- edit.md structural audit includes non-cell dependencies ------------------
 from openpyxl.chart import BarChart, Reference
+from openpyxl.drawing.image import Image
 from openpyxl.formula import Tokenizer
 from openpyxl.formatting.rule import CellIsRule, ColorScaleRule, DataBarRule, FormulaRule
-from openpyxl.utils.cell import range_boundaries
+from openpyxl.utils.cell import coordinate_to_tuple, range_boundaries
 from openpyxl.workbook.defined_name import DefinedName
 from openpyxl.worksheet.datavalidation import DataValidation
 from openpyxl.worksheet.table import Table
@@ -241,6 +243,18 @@ def formula_text(value):
 def defined_name_values(workbook):
     names = workbook.defined_names
     return names.values() if hasattr(names, "values") else names.definedName
+
+
+def drawing_anchor_rows(drawing):
+    anchor = drawing.anchor
+    if isinstance(anchor, str):
+        return (coordinate_to_tuple(anchor)[0],)
+    rows = []
+    if marker := getattr(anchor, "_from", None):
+        rows.append(marker.row + 1)
+    if marker := getattr(anchor, "to", None):
+        rows.append(marker.row + 1)
+    return tuple(rows)
 
 
 def structural_references(workbook):
@@ -278,9 +292,12 @@ def structural_references(workbook):
                 for formula in getattr(rule, "formula", ()):
                     refs.append(("conditional formatting formula", owner, str(formula)))
         for index, chart in enumerate(sheet._charts, start=1):
+            refs.append(("drawing anchor", f"{owner} chart {index}", drawing_anchor_rows(chart)))
             for element in chart._write().iter():
                 if element.tag.rsplit("}", 1)[-1] == "f" and element.text:
                     refs.append(("chart series", f"{owner} chart {index}", element.text))
+        for index, image in enumerate(sheet._images, start=1):
+            refs.append(("drawing anchor", f"{owner} image {index}", drawing_anchor_rows(image)))
     return refs
 
 
@@ -369,6 +386,11 @@ audit_ws.conditional_formatting.add("A2:A3", FormulaRule(formula=["A2>0"]))
 chart = BarChart()
 chart.add_data(Reference(audit_ws, min_col=1, min_row=1, max_row=3), titles_from_data=True)
 audit_ws.add_chart(chart, "C1")
+with open("anchor.png", "wb") as stream:
+    stream.write(base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZlRYAAAAASUVORK5CYII="
+    ))
+audit_ws.add_image(Image("anchor.png"), "E5")
 audit_references = structural_references(audit_wb)
 reference_kinds = {kind for kind, _, _ in audit_references}
 formula_references = cell_formula_references(audit_wb)
@@ -377,9 +399,11 @@ check(
     {"defined name", "cell formula", "table", "merged range", "auto filter", "print area",
      "print title rows", "print title columns", "data validation range",
      "data validation formula", "conditional formatting range",
-     "conditional formatting formula", "chart series"} <= reference_kinds,
+     "conditional formatting formula", "chart series", "drawing anchor"} <= reference_kinds,
     reference_kinds,
 )
+check("drawing audit records an image anchored at the insertion row",
+      ("drawing anchor", "Audit image 1", (5,)) in audit_references, audit_references)
 check(
     "structural audit snapshots ordinary cell formulas before row insertion",
     formula_references == [("cell formula", "Audit", "C1", "=SUM(A2:A3)")],
@@ -423,10 +447,16 @@ safe_dependencies = [
 ]
 if not safe_dependencies:
     safe_ws.insert_rows(5)
+    safe_wb.calculation.fullCalcOnLoad = True
+    safe_wb.calculation.forceFullCalc = True
+    safe_wb.calculation.calcMode = "auto"
     safe_wb.save("audited-structural-edit.xlsx")
 safe_reopened = openpyxl.load_workbook("audited-structural-edit.xlsx", data_only=False)
 check("audited non-intersecting formula path reaches save",
       safe_reopened["Data"]["D2"].value == "=C2*1.08")
+check("formula edit forces recalculation after save",
+      safe_reopened.calculation.fullCalcOnLoad is True
+      and safe_reopened.calculation.calcMode == "auto")
 
 legacy_name = DefinedName("LegacyName", attr_text="Audit!$A$1")
 legacy_names = type("LegacyDefinedNames", (), {"definedName": [legacy_name]})()

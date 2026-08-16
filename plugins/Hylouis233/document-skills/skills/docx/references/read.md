@@ -79,7 +79,12 @@ def table_content(table):
     rows = []
     for row in table.rows:
         rendered_cells = []
-        column = 0
+        row_properties = row._tr.find(qn("w:trPr"))
+        grid_before_node = None if row_properties is None else row_properties.find(qn("w:gridBefore"))
+        grid_after_node = None if row_properties is None else row_properties.find(qn("w:gridAfter"))
+        grid_before = 0 if grid_before_node is None else int(grid_before_node.get(qn("w:val"), "0"))
+        grid_after = 0 if grid_after_node is None else int(grid_after_node.get(qn("w:val"), "0"))
+        column = grid_before
         # row.cells repeats a merge-origin proxy for every grid position it spans.
         # Walk physical w:tc elements and expose the merge structure instead.
         for cell_element in row._tr.tc_lst:
@@ -99,7 +104,11 @@ def table_content(table):
                 "tables": nested_tables,
             })
             column += colspan
-        rows.append(rendered_cells)
+        rows.append({
+            "grid_before": grid_before,
+            "cells": rendered_cells,
+            "grid_after": grid_after,
+        })
     return rows
 
 doc = Document("input.docx")
@@ -121,8 +130,10 @@ Notes:
   tables, and `Paragraph.runs` omits runs wrapped by inline content controls and other containers.
   Use the XML-backed traversal above and report the content-control count. It stops descending
   when a table is yielded, so table text is not also emitted as prose; `table_content()` handles
-  nested tables recursively and emits `column`, `colspan`, and `vMerge` metadata for physical
-  cells instead of duplicating merge-origin text through `row.cells`.
+  nested tables recursively and emits `grid_before`, `grid_after`, `column`, `colspan`, and
+  `vMerge` metadata for physical cells instead of duplicating merge-origin text through
+  `row.cells`. The row-level grid omissions are required for nonuniform tables whose cells do
+  not start in logical column zero or do not extend to the final grid column.
   Imported `w:altChunk` HTML/RTF/document parts are not modeled by python-docx; the traversal
   reports their relationship target and content type as `unreadable` instead of silently
   presenting an incomplete extraction. Convert them with a trusted office renderer before

@@ -5,7 +5,7 @@ import openpyxl
 from datetime import date
 from openpyxl.formula import Tokenizer
 from openpyxl.styles import Font
-from openpyxl.utils.cell import range_boundaries
+from openpyxl.utils.cell import coordinate_to_tuple, range_boundaries
 
 wb = openpyxl.load_workbook("input.xlsx")   # NOT data_only: that would drop all formulas
 ws = wb["Data"]
@@ -25,6 +25,18 @@ def defined_name_values(workbook):
     names = workbook.defined_names
     # openpyxl 3.1 uses DefinedNameDict; 3.0 uses DefinedNameList. Support both.
     return names.values() if hasattr(names, "values") else names.definedName
+
+def drawing_anchor_rows(drawing):
+    """Return 1-based rows occupied by a string/one-cell/two-cell anchor."""
+    anchor = drawing.anchor
+    if isinstance(anchor, str):
+        return (coordinate_to_tuple(anchor)[0],)
+    rows = []
+    if marker := getattr(anchor, "_from", None):
+        rows.append(marker.row + 1)
+    if marker := getattr(anchor, "to", None):
+        rows.append(marker.row + 1)
+    return tuple(rows)
 
 def structural_references(workbook):
     """Inventory formulas/ranges that insert_rows/delete_rows will not rewrite."""
@@ -62,9 +74,12 @@ def structural_references(workbook):
                 for formula in getattr(rule, "formula", ()):
                     refs.append(("conditional formatting formula", owner, str(formula)))
         for index, chart in enumerate(sheet._charts, start=1):
+            refs.append(("drawing anchor", f"{owner} chart {index}", drawing_anchor_rows(chart)))
             for element in chart._write().iter():
                 if element.tag.rsplit("}", 1)[-1] == "f" and element.text:
                     refs.append(("chart series", f"{owner} chart {index}", element.text))
+        for index, image in enumerate(sheet._images, start=1):
+            refs.append(("drawing anchor", f"{owner} image {index}", drawing_anchor_rows(image)))
     return refs
 
 def non_cell_references(workbook):
@@ -165,6 +180,11 @@ print("cell formulas before:", cell_formulas_before)
 print("cell formulas after planned rewrites:", cell_formula_references(wb))
 print("non-cell references after planned rewrites:", non_cell_references(wb))
 
+# Formula caches are not calculated by openpyxl. Force spreadsheet viewers to
+# recalculate every edited formula instead of preserving a manual/stale input mode.
+wb.calculation.fullCalcOnLoad = True
+wb.calculation.forceFullCalc = True
+wb.calculation.calcMode = "auto"
 wb.save("input-edited.xlsx")
 ```
 
