@@ -481,11 +481,12 @@ async function gitCommonDirectory(workspacePath, options = {}) {
     cwd: workspacePath, ...options,
   });
   const failure = snapshotFailure("git rev-parse --git-common-dir", result);
-  if (failure || !result.stdout.trim()) {
+  const output = result.stdout.replace(/\r?\n$/u, "");
+  if (failure || !output) {
     throw new Error("cannot identify Git common directory: " + (failure || "empty output"));
   }
   try {
-    return await realpath(path.resolve(workspacePath, result.stdout.trim()));
+    return await realpath(path.resolve(workspacePath, output));
   } catch (error) {
     throw new Error("cannot canonicalize Git common directory: " + error.message);
   }
@@ -663,6 +664,61 @@ async function peelCommitish(worktreeRoot, oid, cache = new Map(), options = {})
   return commit;
 }
 
+async function closestExistingBase(worktreeRoot, target, baselineCommits, options = {}) {
+  async function distanceFromTarget(candidate) {
+    const distance = await runGitCommand(["rev-list", "--count", candidate + ".." + target], {
+      cwd: worktreeRoot, ...options,
+    });
+    const failure = snapshotFailure("git rev-list --count " + candidate + ".." + target, distance);
+    const count = Number(distance.stdout.trim());
+    if (failure || !Number.isInteger(count)) {
+      throw new Error("cannot select committed-delta baseline: " + (failure || "invalid distance"));
+    }
+    return count;
+  }
+
+  let best = null;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  // Check every pre-run tip in bounded, cancellable commands. This avoids a
+  // command-line-size limit and never silently drops late refs from attribution.
+  for (const candidate of baselineCommits) {
+    const ancestor = await runGitCommand(["merge-base", "--is-ancestor", candidate, target], {
+      cwd: worktreeRoot, ...options,
+    });
+    if (ancestor.timedOut || ancestor.stdoutTruncated || ancestor.stderrTruncated ||
+        ![0, 1].includes(ancestor.exitCode)) {
+      throw new Error("cannot select committed-delta baseline: git merge-base --is-ancestor failed");
+    }
+    if (ancestor.exitCode !== 0) continue;
+    const distance = await distanceFromTarget(candidate);
+    if (distance < bestDistance) {
+      best = candidate;
+      bestDistance = distance;
+    }
+  }
+  if (best) return best;
+
+  // Rewritten histories may have no pre-run tip that remains a direct ancestor.
+  // Evaluate each merge base independently and retain the closest one.
+  for (const candidate of baselineCommits) {
+    const mergeBase = await runGitCommand(["merge-base", target, candidate], {
+      cwd: worktreeRoot, ...options,
+    });
+    if (mergeBase.exitCode === 1 && !mergeBase.timedOut) continue;
+    const failure = snapshotFailure("git merge-base " + target + " " + candidate, mergeBase);
+    const merged = mergeBase.stdout.trim();
+    if (failure || !merged) {
+      throw new Error("cannot select committed-delta baseline: " + (failure || "empty merge base"));
+    }
+    const distance = await distanceFromTarget(merged);
+    if (distance < bestDistance) {
+      best = merged;
+      bestDistance = distance;
+    }
+  }
+  return best;
+}
+
 async function committedDelta(worktreeRoot, before, after, options = {}) {
   const refNames = new Set([...Object.keys(before.refs ?? {}), ...Object.keys(after.refs ?? {})]);
   const refsChanged = [...refNames].sort().flatMap((ref) => {
@@ -800,13 +856,7 @@ async function committedDelta(worktreeRoot, before, after, options = {}) {
     if (previousTarget) {
       base = previousTarget;
     } else if (baselineCommits.length > 0) {
-      const mergeBase = await runGitCommand(
-        ["merge-base", target, ...baselineCommits.slice(0, 256)],
-        { cwd: worktreeRoot, ...options },
-      );
-      base = mergeBase.exitCode === 0 && mergeBase.stdout.trim()
-        ? mergeBase.stdout.trim()
-        : await emptyTree();
+      base = await closestExistingBase(worktreeRoot, target, baselineCommits, options) ?? await emptyTree();
     } else {
       base = before.head || await emptyTree();
     }

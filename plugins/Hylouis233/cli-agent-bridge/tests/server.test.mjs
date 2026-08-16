@@ -29,7 +29,7 @@ function currentUserLockRoot() {
 
 async function canonicalGitCommonDirectory(workspace) {
   const { stdout } = await execFileAsync("git", ["rev-parse", "--git-common-dir"], { cwd: workspace });
-  return await realpath(path.resolve(workspace, stdout.trim()));
+  return await realpath(path.resolve(workspace, stdout.replace(/\r?\n$/u, "")));
 }
 
 function repositoryStatePaths(canonicalGitCommonDir) {
@@ -949,6 +949,41 @@ test("a new branch forked from a divergent branch diffs only its own commits", a
   assert.match(out.commits.diffStat, /fork\.txt/u);
 });
 
+test("new-branch attribution considers baselines beyond the first 256 tips", {
+  skip: process.platform === "win32",
+}, async (context) => {
+  const { workspace, client } = await makeHarness(context);
+  const { stdout: mainTree } = await execFileAsync("git", ["rev-parse", "HEAD^{tree}"], { cwd: workspace });
+  for (let index = 0; index < 256; index += 1) {
+    const { stdout: oid } = await execFileAsync(
+      "git",
+      ["commit-tree", mainTree.trim(), "-p", "HEAD", "-m", "filler " + String(index)],
+      { cwd: workspace },
+    );
+    await execFileAsync(
+      "git", ["update-ref", `refs/heads/a-filler-${String(index).padStart(3, "0")}`, oid.trim()],
+      { cwd: workspace },
+    );
+  }
+  await execFileAsync("git", ["checkout", "-b", "zzz-source"], { cwd: workspace });
+  await writeFile(path.join(workspace, "late-source.txt"), "pre-existing late baseline\n");
+  await execFileAsync("git", ["add", "late-source.txt"], { cwd: workspace });
+  await execFileAsync("git", ["commit", "-m", "late source baseline"], { cwd: workspace });
+  await execFileAsync("git", ["checkout", "main"], { cwd: workspace });
+
+  const response = await client.request("tools/call", taskArguments(workspace, {
+    name: "late-baseline-worker", newBranchFromExisting: true,
+    fromBranch: "zzz-source", branchName: "late-baseline-work",
+    writeFile: "late-worker.txt", commitMessage: "late baseline worker commit",
+  }, { timeoutMs: 120_000 }));
+  const out = response.result.structuredContent;
+  assert.equal(out.ok, true, JSON.stringify(out.error));
+  assert.match(out.commits.log, /late baseline worker commit/u);
+  assert.doesNotMatch(out.commits.diffStat, /late-source\.txt/u,
+    "the source tip after 256 other baselines remains the selected diff base");
+  assert.match(out.commits.diffStat, /late-worker\.txt/u);
+});
+
 test("fetched remote history is excluded from worker-created commits", async (context) => {
   const { workspace, client } = await makeHarness(context);
   const response = await client.request("tools/call", taskArguments(workspace, {
@@ -1058,4 +1093,26 @@ test("a worktree root ending in whitespace is canonicalized without trimming it"
   assert.equal(out.ok, true, JSON.stringify(out.error ?? out));
   assert.ok(out.worktreeRoot.endsWith(" "),
     "the trailing space is part of the canonical root: " + JSON.stringify(out.worktreeRoot));
+});
+
+test("a separate Git common directory ending in whitespace is preserved", async (context) => {
+  if (process.platform === "win32") return; // NTFS forbids trailing spaces in names
+  const { tempRoot, client } = await makeHarness(context);
+  const commonDirectory = path.join(tempRoot, "separate-git ");
+  const worktree = path.join(tempRoot, "separate-worktree");
+  await execFileAsync("git", [
+    "init", "-b", "main", "--separate-git-dir", commonDirectory, worktree,
+  ], { cwd: tempRoot });
+  await execFileAsync("git", ["config", "user.name", "Bridge Test"], { cwd: worktree });
+  await execFileAsync("git", ["config", "user.email", "bridge-test@example.invalid"], { cwd: worktree });
+  await writeFile(path.join(worktree, "baseline.txt"), "baseline\n");
+  await execFileAsync("git", ["add", "baseline.txt"], { cwd: worktree });
+  await execFileAsync("git", ["commit", "-m", "baseline"], { cwd: worktree });
+  const response = await client.request("tools/call", {
+    name: "workspace_status",
+    arguments: { workspacePath: worktree },
+  });
+  const out = response.result.structuredContent;
+  assert.equal(out.ok, true, JSON.stringify(out.error ?? out));
+  assert.equal(await canonicalGitCommonDirectory(worktree), await realpath(commonDirectory));
 });
