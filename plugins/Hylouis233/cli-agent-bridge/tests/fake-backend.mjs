@@ -8,6 +8,10 @@ import { fileURLToPath } from "node:url";
 const ownPath = fileURLToPath(import.meta.url);
 const spec = JSON.parse(process.argv[2] ?? "{}");
 
+if (spec.ignoreSigterm === true && process.platform !== "win32") {
+  process.on("SIGTERM", () => {});
+}
+
 function event(name) {
   if (!spec.eventFile) return;
   appendFileSync(spec.eventFile, JSON.stringify({ event: name, name: spec.name ?? "", pid: process.pid }) + "\n");
@@ -65,6 +69,21 @@ if (spec.branchRoundTrip) {
   writeFileSync(path.resolve(process.cwd(), spec.writeFile ?? "worker-after-fetch.txt"), "worker\n");
   execFileSync("git", ["add", spec.writeFile ?? "worker-after-fetch.txt"]);
   execFileSync("git", ["commit", "-m", spec.commitMessage ?? "worker commit after fetch"]);
+  execFileSync("git", ["checkout", original]);
+  event("end");
+} else if (spec.fetchIntoLocalRef) {
+  // Exercise fetch's arbitrary destination refspec. FETCH_HEAD, rather than
+  // the refs/heads destination namespace, is the provenance signal.
+  event("start");
+  const original = execFileSync("git", ["branch", "--show-current"], { encoding: "utf8" }).trim();
+  const importedRef = spec.importedRef ?? "refs/heads/imported-upstream";
+  execFileSync("git", [
+    "fetch", spec.remotePath, "refs/heads/topic:" + importedRef,
+  ]);
+  execFileSync("git", ["checkout", "-b", spec.branchName ?? "local-fetch-work", importedRef]);
+  writeFileSync(path.resolve(process.cwd(), spec.writeFile ?? "worker-after-local-fetch.txt"), "worker\n");
+  execFileSync("git", ["add", spec.writeFile ?? "worker-after-local-fetch.txt"]);
+  execFileSync("git", ["commit", "-m", spec.commitMessage ?? "worker commit after local-ref fetch"]);
   execFileSync("git", ["checkout", original]);
   event("end");
 } else if (spec.mirrorPush) {

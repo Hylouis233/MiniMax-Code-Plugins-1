@@ -1,8 +1,12 @@
 # No param block: with -File, every token after the script path lands in
 # $args as a literal string, so dashes, quotes, parentheses, and percent
 # signs survive verbatim.
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[Console]::InputEncoding = $utf8NoBom
+[Console]::OutputEncoding = $utf8NoBom
+$OutputEncoding = $utf8NoBom
 $Command = $args[0]
-$rest = $args | Select-Object -Skip 1
+[string[]]$rest = @($args | Select-Object -Skip 1)
 if ([string]::IsNullOrWhiteSpace($Command)) {
     [Console]::Error.WriteLine("backend command is missing")
     exit 127

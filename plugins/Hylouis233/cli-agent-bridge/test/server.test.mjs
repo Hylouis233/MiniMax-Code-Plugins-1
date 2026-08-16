@@ -112,10 +112,13 @@ test("workspace_status reports changed files including untracked ones", async ()
 });
 
 test("delegate_task refuses a dirty tree without allowDirty and sets isError", async () => {
-  await withServer({}, async (s) => {
+  const env = writeBackends("bridge-dirty-backends.json", {
+    fake: { command: process.execPath, buildArgs: ["-e", "", "<task>"], experimental: true },
+  });
+  await withServer(env, async (s) => {
     const repo = makeRepo();
     writeFileSync(path.join(repo, "dirty.txt"), "dirty");
-    const res = await s.rpc(2, "tools/call", { name: "delegate_task", arguments: { backend: "claude", task: "x", workspacePath: repo } });
+    const res = await s.rpc(2, "tools/call", { name: "delegate_task", arguments: { backend: "fake", task: "x", workspacePath: repo } });
     assert.equal(res.result.structuredContent.ok, false);
     assert.equal(res.result.isError, true);
     assert.match(res.result.structuredContent.error, /dirty/);

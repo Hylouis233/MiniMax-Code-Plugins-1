@@ -60,7 +60,8 @@ inside the target git repository, and their results come back as a git diff for 
 - Cancellation: cancelling an in-flight delegate_task call terminates the complete worker process
   tree and the result reports cancelled=true. If tree termination cannot be confirmed, the bridge
   writes a shared quarantine marker that blocks every bridge process. After checking for leftover
-  processes, an operator must deliberately remove the reported quarantinePath. The workspace may
+  processes, an operator must deliberately rename the reported quarantinePath with the
+  `.recovery-approved` suffix. Mere marker absence never authorizes recovery. The workspace may
   still contain edits made before cancellation, so still review the returned snapshot.
 - Snapshot reliability: a worker's changes to Git refs are compared as well as final HEAD, and a
   truncated Git capture fails closed. If outputTruncated/stderrTruncated is true, treat the returned
@@ -74,7 +75,8 @@ inside the target git repository, and their results come back as a git diff for 
 - Only stale idle locks with a positively dead same-host owner are reclaimed automatically. A stale
   starting/running ref fails closed because escaped descendants cannot be reconstructed after a
   bridge crash; inspect the process tree before deliberately clearing its lock-store ref. A lease
-  moved to the quarantined state is reclaimable once the operator removes the quarantine marker.
+  moved to the quarantined state is reclaimable once the operator performs that explicit approval
+  rename.
 
 ## Notes
 

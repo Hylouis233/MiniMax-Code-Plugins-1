@@ -3,6 +3,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import os from "node:os";
 
+import { safeGitInvocation } from "./git-executable.mjs";
+
 export const WORKSPACE_LOCK_REF_PREFIX = "refs/cli-agent-bridge/workspace-locks/";
 const WORKSPACE_HISTORY_REF_SUFFIX = ".history";
 const WORKSPACE_RECOVERY_REF_SUFFIX = ".recovery";
@@ -149,9 +151,11 @@ async function runGit(cwd, args, {
   checkInterrupted(cancel, deadline);
   const remaining = deadline === null ? GIT_TIMEOUT_MS : deadline - Date.now();
   const timeoutMs = Math.max(1, Math.min(GIT_TIMEOUT_MS, remaining));
+  const git = await safeGitInvocation(args);
   const result = await new Promise((resolve) => {
-    const child = spawn("git", args, {
+    const child = spawn(git.command, git.args, {
       cwd,
+      env: git.env,
       windowsHide: true,
       stdio: [stdinText === undefined ? "ignore" : "pipe", "pipe", "pipe"],
     });
@@ -278,26 +282,26 @@ async function canReclaim(owner, {
   hostIdentity,
   processProbe,
   processIdentityProbe = null,
-  operatorCleared = null,
+  operatorRecoveryApproved = null,
 }) {
   if (!owner || owner.version !== 1 || owner.hostIdentity !== hostIdentity) return false;
   if (!Number.isFinite(owner.heartbeatAt)) return false;
   // A quarantined lease means termination already failed and the operator was
-  // told to inspect leftovers. It becomes reclaimable once the quarantine
-  // marker is deliberately removed (or, failing that, the owner died and the
-  // heartbeat went stale after a crash).
+  // told to inspect leftovers. It becomes reclaimable only through a durable,
+  // token-bound recovery authorization. Owner death cannot prove that an
+  // escaped descendant died too, and mere marker absence may be routine
+  // temporary-directory cleanup; neither is approval.
   if (owner.workerState === "quarantined") {
     // This bit is written only after the shared marker was durably created.
     // Older/partial records cannot distinguish "operator removed" from
     // "marker creation failed" and therefore remain fail-closed.
     if (owner.quarantineMarkerPersisted !== true) return false;
-    if (operatorCleared) {
+    if (typeof owner.quarantineId === "string" && owner.quarantineId && operatorRecoveryApproved) {
       try {
-        if (await operatorCleared()) return true;
-      } catch { /* treat a failed check as not cleared */ }
+        if (await operatorRecoveryApproved(owner)) return true;
+      } catch { /* treat a failed check as not approved */ }
     }
-    return now - owner.heartbeatAt >= staleMs &&
-      await originalOwnerStatus(owner, processProbe, processIdentityProbe) === "dead";
+    return false;
   }
   if (now - owner.heartbeatAt < staleMs) return false;
   if (await originalOwnerStatus(owner, processProbe, processIdentityProbe) !== "dead") return false;
@@ -432,8 +436,13 @@ function createLease({ cwd, ref, oid, owner, heartbeatMs }) {
     async markWorkerIdle(interrupt = {}) {
       await queueUpdate({ workerState: "idle", workerPid: null }, interrupt);
     },
-    async markWorkerQuarantined() {
-      await queueUpdate({ workerState: "quarantined", quarantineMarkerPersisted: true });
+    async markWorkerQuarantined(quarantineId) {
+      if (typeof quarantineId !== "string" || !quarantineId) {
+        throw new Error("quarantine id is unavailable");
+      }
+      await queueUpdate({
+        workerState: "quarantined", quarantineMarkerPersisted: true, quarantineId,
+      });
     },
     retain() {
       retained = true;
@@ -509,7 +518,7 @@ export async function tryAcquireGitWorkspaceLock({
   now = Date.now(),
   processProbe = probeProcess,
   processIdentityProbe = null,
-  operatorCleared = null,
+  operatorRecoveryApproved = null,
 } = {}) {
   checkInterrupted(cancel, deadline);
   const ref = workspaceLockRef(key);
@@ -522,7 +531,7 @@ export async function tryAcquireGitWorkspaceLock({
     recovery.owner.ownerToken === current.owner?.token,
   );
   if (current && !sharedRecoveryAuthorized && !await canReclaim(current.owner, {
-    now, staleMs, hostIdentity, processProbe, processIdentityProbe, operatorCleared,
+    now, staleMs, hostIdentity, processProbe, processIdentityProbe, operatorRecoveryApproved,
   })) {
     return { acquired: false, reason: "held" };
   }

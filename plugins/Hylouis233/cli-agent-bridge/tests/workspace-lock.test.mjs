@@ -367,9 +367,8 @@ test("worker state updates honour the delegation cancellation and deadline", asy
   await assert.rejects(execFileAsync("git", ["rev-parse", "--verify", workspaceLockRef(key)], { cwd: repo }), /Command failed/u);
 });
 
-test("initial acquisition CAS obeys cancellation while a Git hook blocks", {
-  // This fixture depends on Linux's executable-hook and process interruption
-  // semantics. macOS Git installations may disable or sandbox this hook path.
+test("workspace-lock Git operations disable repository transaction hooks", {
+  // This fixture depends on executable-hook semantics.
   skip: process.platform !== "linux",
 }, async (context) => {
   const repo = await makeRepo(context);
@@ -386,42 +385,16 @@ test("initial acquisition CAS obeys cancellation while a Git hook blocks", {
   ].join("\n"));
   await chmod(hook, 0o755);
   context.after(() => writeFile(release, "release\n").catch(() => {}));
-
-  const listeners = new Set();
-  let resolveCancelled;
-  const cancel = {
-    cancelled: false,
-    promise: new Promise((resolve) => { resolveCancelled = resolve; }),
-    subscribe(listener) {
-      listeners.add(listener);
-      return () => { listeners.delete(listener); };
-    },
-    cancel() {
-      this.cancelled = true;
-      resolveCancelled();
-      for (const listener of [...listeners]) listener();
-    },
-  };
-  const acquisition = tryAcquireGitWorkspaceLock({
-    cwd: repo, key: "git-worktree:" + repo, cancel, heartbeatMs: 60_000,
+  const acquisition = await tryAcquireGitWorkspaceLock({
+    cwd: repo, key: "git-worktree:" + repo, heartbeatMs: 60_000,
   });
-  const readyDeadline = Date.now() + 3_000;
-  while (true) {
-    try { await access(ready); break; }
-    catch {
-      if (Date.now() >= readyDeadline) throw new Error("reference-transaction hook did not start");
-      await new Promise((resolve) => setTimeout(resolve, 20));
-    }
-  }
-  const cancelledAt = Date.now();
-  cancel.cancel();
-  await assert.rejects(acquisition, WorkspaceLockCancelledError);
-  assert.ok(Date.now() - cancelledAt < 1_500,
-    "cancellation must interrupt the update-ref CAS instead of waiting for the hook timeout");
-  await writeFile(release, "release\n");
+  assert.equal(acquisition.acquired, true);
+  await assert.rejects(access(ready), /ENOENT/u,
+    "coordination refs must never execute repository-controlled transaction hooks");
+  await acquisition.lease.release();
 });
 
-test("quarantined leases are reclaimable after the operator clears the marker", async (context) => {
+test("quarantined leases require an explicit token-bound recovery approval", async (context) => {
   const repo = await makeRepo(context);
   const key = "git-worktree:" + repo;
   const ref = workspaceLockRef(key);
@@ -433,6 +406,7 @@ test("quarantined leases are reclaimable after the operator clears the marker", 
     ownerPid: process.pid,
     workerState: "quarantined",
     quarantineMarkerPersisted: true,
+    quarantineId: "quarantine-incident-1",
     workerPid: 4242,
     acquiredAt: now,
     heartbeatAt: now,
@@ -440,15 +414,15 @@ test("quarantined leases are reclaimable after the operator clears the marker", 
 
   const stillHeld = await tryAcquireGitWorkspaceLock({
     cwd: repo, key, now, staleMs: 60_000, processProbe: () => "alive",
-    operatorCleared: () => false,
+    operatorRecoveryApproved: () => false,
   });
   assert.deepEqual(stillHeld, { acquired: false, reason: "held" });
 
   const reclaimed = await tryAcquireGitWorkspaceLock({
     cwd: repo, key, now, staleMs: 60_000, processProbe: () => "alive",
-    operatorCleared: () => true,
+    operatorRecoveryApproved: (owner) => owner.quarantineId === "quarantine-incident-1",
   });
-  assert.equal(reclaimed.acquired, true, "a removed quarantine marker authorizes takeover");
+  assert.equal(reclaimed.acquired, true, "a matching durable approval authorizes takeover");
   await reclaimed.lease.release();
 });
 
@@ -468,10 +442,10 @@ test("a quarantined lease without proof of a durable marker fails closed", async
   });
   const result = await tryAcquireGitWorkspaceLock({
     cwd: repo, key, now, staleMs: 30_000, processProbe: () => "dead",
-    operatorCleared: () => true,
+    operatorRecoveryApproved: () => true,
   });
   assert.deepEqual(result, { acquired: false, reason: "held" },
-    "an absent marker is not operator clearance unless persistence was recorded");
+    "approval is invalid unless marker persistence and an incident id were recorded");
 });
 
 test("a different OS user cannot clear another user's quarantined lease", async (context) => {
@@ -486,18 +460,19 @@ test("a different OS user cannot clear another user's quarantined lease", async 
     ownerIdentity: "other-user-process",
     workerState: "quarantined",
     quarantineMarkerPersisted: true,
+    quarantineId: "other-user-incident",
     workerPid: 5353,
     acquiredAt: now - 120_000,
     heartbeatAt: now - 120_000,
   });
   const result = await tryAcquireGitWorkspaceLock({
     cwd: repo, key, now, staleMs: 30_000, processProbe: () => "dead",
-    operatorCleared: () => true,
+    operatorRecoveryApproved: () => true,
   });
   assert.deepEqual(result, { acquired: false, reason: "held" });
 });
 
-test("a quarantined lease left by a crashed owner is reclaimable after the stale window", async (context) => {
+test("a crashed quarantined owner remains held without explicit recovery approval", async (context) => {
   const repo = await makeRepo(context);
   const key = "git-worktree:" + repo;
   const now = Date.now();
@@ -508,14 +483,15 @@ test("a quarantined lease left by a crashed owner is reclaimable after the stale
     ownerPid: 12345,
     workerState: "quarantined",
     quarantineMarkerPersisted: true,
+    quarantineId: "crashed-incident",
     workerPid: 5353,
     acquiredAt: now - 120_000,
     heartbeatAt: now - 120_000,
   });
   const result = await tryAcquireGitWorkspaceLock({
     cwd: repo, key, now, staleMs: 30_000, processProbe: () => "dead",
-    operatorCleared: () => false,
+    operatorRecoveryApproved: () => false,
   });
-  assert.equal(result.acquired, true, "crash fallback: stale heartbeat plus dead owner");
-  await result.lease.release();
+  assert.deepEqual(result, { acquired: false, reason: "held" },
+    "owner death cannot prove that escaped descendants terminated");
 });

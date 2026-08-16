@@ -8,11 +8,12 @@
 
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { link, mkdir, readFile, realpath, stat, unlink, writeFile } from "node:fs/promises";
+import { chmod, link, mkdir, mkdtemp, open, readFile, realpath, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
+import { resolvePathCommand, safeGitInvocation } from "./git-executable.mjs";
 import { initializeProcessTree, isProcessTreeAlive, refreshProcessTree, signalProcessTree, waitForChildExit, waitForProcessTreeExit } from "./process-tree.mjs";
 import {
   acquireGitWorkspaceLock,
@@ -37,6 +38,27 @@ const KILL_GRACE_MS = Number.isInteger(TEST_KILL_GRACE_MS) && TEST_KILL_GRACE_MS
   : 10_000;
 const MAX_CAPTURE_CHARS = 5_000_000;
 const RAW_TAIL_CHARS = 60_000;
+const TEST_RUNTIME_PLATFORM = process.env.NODE_ENV === "test"
+  ? process.env.CLI_AGENT_BRIDGE_TEST_PLATFORM
+  : "";
+const RUNTIME_PLATFORM = ["darwin", "freebsd", "linux", "win32"].includes(TEST_RUNTIME_PLATFORM)
+  ? TEST_RUNTIME_PLATFORM
+  : process.platform;
+
+function supportsReliableProcessContainment(platform = RUNTIME_PLATFORM) {
+  return platform === "linux" || platform === "win32";
+}
+
+function trustedWindowsPowerShell() {
+  const windowsRoot = process.env.SystemRoot ?? process.env.WINDIR ?? "";
+  if (!path.win32.isAbsolute(windowsRoot)) {
+    throw new Error("cannot locate the trusted Windows PowerShell executable");
+  }
+  return path.win32.join(
+    windowsRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe",
+  );
+}
+
 function currentUserLockScope() {
   let identity;
   try {
@@ -232,7 +254,7 @@ function capture(binary = false) {
   };
 }
 
-async function runCommand(command, args, options = {}) {
+export async function runCommand(command, args, options = {}) {
   const spawnOnce = (argv, shellArgs) => new Promise((resolve) => {
     const binaryStdout = options.binaryStdout === true;
     if (typeof options.shouldCancel === "function" && options.shouldCancel()) {
@@ -245,13 +267,48 @@ async function runCommand(command, args, options = {}) {
       return;
     }
     const manageProcessTree = options.manageProcessTree === true;
+    const useWindowsJobRunner = manageProcessTree && process.platform === "win32" && !shellArgs &&
+      options.processTreeTestMode !== true;
+    const useProcessTreeRunner = manageProcessTree && process.platform !== "win32" && !shellArgs;
+    const trackProcessTree = manageProcessTree && !useWindowsJobRunner;
+    const processTreeRunnerPayload = (useWindowsJobRunner || useProcessTreeRunner) ? JSON.stringify({
+      command,
+      args: argv,
+      ...(options.stdinText === undefined ? {} : { stdinText: options.stdinText }),
+    }) : "";
     const linuxRunMarker = manageProcessTree && process.platform === "linux"
       ? randomUUID()
       : null;
+    const baseEnvironment = options.env ?? process.env;
     const childEnvironment = linuxRunMarker
-      ? { ...process.env, CLI_AGENT_BRIDGE_RUN_ID: linuxRunMarker }
-      : process.env;
-    const child = shellArgs
+      ? { ...baseEnvironment, CLI_AGENT_BRIDGE_RUN_ID: linuxRunMarker }
+      : baseEnvironment;
+    const child = useWindowsJobRunner
+      ? spawn(trustedWindowsPowerShell(), [
+          "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File",
+          options.windowsJobRunnerPath ??
+            path.join(path.dirname(fileURLToPath(import.meta.url)), "windows-job-runner.ps1"),
+          "-NodeExecutable", process.execPath,
+          "-NodeRunner", path.join(
+            path.dirname(fileURLToPath(import.meta.url)), "process-tree-runner.mjs",
+          ),
+        ], {
+          cwd: options.cwd,
+          env: childEnvironment,
+          windowsHide: true,
+          stdio: ["pipe", "pipe", "pipe"],
+        })
+      : useProcessTreeRunner
+      ? spawn(process.execPath, [
+          path.join(path.dirname(fileURLToPath(import.meta.url)), "process-tree-runner.mjs"),
+        ], {
+          cwd: options.cwd,
+          env: childEnvironment,
+          detached: process.platform !== "win32",
+          windowsHide: true,
+          stdio: ["pipe", "pipe", "pipe"],
+        })
+      : shellArgs
       ? spawn(shellArgs[0], shellArgs.slice(1), {
           cwd: options.cwd,
           env: childEnvironment,
@@ -266,9 +323,18 @@ async function runCommand(command, args, options = {}) {
           windowsHide: true,
           stdio: [options.stdinText === undefined ? "ignore" : "pipe", "pipe", "pipe"],
         });
+    let childSpawned = false;
+    child.once("spawn", () => { childSpawned = true; });
+    // A containment/bootstrap process can fail before consuming a large
+    // payload. Its exit status/stderr carry the failure; absorb the pipe-side
+    // EPIPE so it cannot become an unhandled error that crashes the bridge.
+    child.stdin?.on("error", () => {});
     const stdoutBuf = capture(binaryStdout);
     const stderrBuf = capture();
     let settled = false;
+    let settlingPromise = null;
+    let resolveStreamsClosed;
+    const streamsClosed = new Promise((resolve) => { resolveStreamsClosed = resolve; });
     let spawnError = null;
     let timedOut = false;
     let killed = false;
@@ -276,7 +342,25 @@ async function runCommand(command, args, options = {}) {
     let treeTerminated = true;
     let terminationError = "";
     let exitCode = null;
+    let terminationCleanupPromise = null;
     let terminationPromise = null;
+    let terminationReason = null;
+    let timer = null;
+    const timeoutMs = options.timeoutMs ?? 30_000;
+    const killGraceMs = options.killGraceMs ?? KILL_GRACE_MS;
+    const inspectionWaitMs = options.processTreeInspectionWaitMs ??
+      Math.max(250, Math.min(killGraceMs, 2_000));
+    const streamDrainMs = options.streamDrainMs ??
+      Math.max(250, Math.min(killGraceMs, 2_000));
+    const waitBounded = async (promise, waitMs) => {
+      let waitTimer;
+      const completed = await Promise.race([
+        Promise.resolve(promise).then(() => true),
+        new Promise((resolveWait) => { waitTimer = setTimeout(() => resolveWait(false), waitMs); }),
+      ]);
+      clearTimeout(waitTimer);
+      return completed;
+    };
     const treeState = {
       knownPids: new Set(Number.isInteger(child.pid) ? [child.pid] : []),
       knownStarts: new Map(),
@@ -285,88 +369,164 @@ async function runCommand(command, args, options = {}) {
     };
     let treeRefreshPromise = null;
     let treeRefreshTimer = null;
+    let treeRefreshStopped = false;
     const refreshTree = () => {
-      if (!manageProcessTree) return Promise.resolve();
+      if (!trackProcessTree || treeRefreshStopped) return Promise.resolve();
       if (treeRefreshPromise) return treeRefreshPromise;
-      treeRefreshPromise = refreshProcessTree(child, treeState)
-        .catch((error) => { terminationError ||= "process-tree inspection failed: " + error.message; })
+      const refresh = options.refreshProcessTree ?? refreshProcessTree;
+      treeRefreshPromise = Promise.resolve().then(() => refresh(child, treeState))
+        .then((snapshot) => {
+          if (process.platform !== "win32" && snapshot === null) {
+            treeState.processInspectionUncertain = true;
+            treeTerminated = false;
+            terminationError ||= "process-tree refresh returned an incomplete snapshot";
+          }
+        })
+        .catch((error) => {
+          treeState.processInspectionUncertain = true;
+          treeTerminated = false;
+          terminationError ||= "process-tree inspection failed: " + error.message;
+        })
         .finally(() => { treeRefreshPromise = null; });
       return treeRefreshPromise;
     };
-    const timeoutMs = options.timeoutMs ?? 30_000;
-    const killGraceMs = options.killGraceMs ?? KILL_GRACE_MS;
+    const stopTreeRefresh = async () => {
+      treeRefreshStopped = true;
+      if (treeRefreshTimer) {
+        clearInterval(treeRefreshTimer);
+        treeRefreshTimer = null;
+      }
+      if (!await waitBounded(treeState.initialRefresh, inspectionWaitMs)) {
+        treeState.processInspectionUncertain = true;
+        treeTerminated = false;
+        terminationError ||= "process-tree initialization did not finish before cleanup";
+      }
+      const inFlightRefresh = treeRefreshPromise;
+      if (inFlightRefresh && !await waitBounded(inFlightRefresh, inspectionWaitMs)) {
+        treeState.processInspectionUncertain = true;
+        treeTerminated = false;
+        terminationError ||= "process-tree refresh did not finish before cleanup";
+      }
+    };
     const settle = () => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      if (treeRefreshTimer) clearInterval(treeRefreshTimer);
-      resolve({
-        stdout: stdoutBuf.value(),
-        stderr: stderrBuf.value(),
-        exitCode,
-        timedOut,
-        killed,
-        orphanedProcesses,
-        treeTerminated,
-        terminationError,
-        errorMessage: "",
-        spawnError,
-        stdoutTruncated: stdoutBuf.truncated(),
-        stderrTruncated: stderrBuf.truncated(),
-      });
+      if (settled) return Promise.resolve();
+      if (settlingPromise) return settlingPromise;
+      settlingPromise = (async () => {
+        // `exit` identifies backend/supervisor termination and starts cleanup.
+        // `close` is only the stdout/stderr drain barrier; an escaped process
+        // retaining those handles must not postpone tree inspection until the
+        // overall command timeout.
+        if (!await waitBounded(streamsClosed, streamDrainMs)) {
+          treeTerminated = false;
+          terminationError ||= "backend output streams did not close after cleanup";
+          child.stdout?.destroy();
+          child.stderr?.destroy();
+        }
+        if (terminationCleanupPromise) await terminationCleanupPromise;
+        if (settled) return;
+        settled = true;
+        treeRefreshStopped = true;
+        clearTimeout(timer);
+        if (treeRefreshTimer) clearInterval(treeRefreshTimer);
+        resolve({
+          stdout: stdoutBuf.value(),
+          stderr: stderrBuf.value(),
+          exitCode,
+          timedOut,
+          killed,
+          orphanedProcesses,
+          treeTerminated,
+          terminationError,
+          errorMessage: "",
+          spawnError,
+          stdoutTruncated: stdoutBuf.truncated(),
+          stderrTruncated: stderrBuf.truncated(),
+        });
+      })();
+      return settlingPromise;
     };
 
     const terminate = (reason) => {
-      if (reason === "timeout") timedOut = true;
-      if (reason === "orphaned") orphanedProcesses = true;
+      if (settled) return Promise.resolve();
       if (terminationPromise) return terminationPromise;
-      terminationPromise = (async () => {
-        if (manageProcessTree) await signalProcessTree(child, "SIGTERM", treeState);
+      terminationReason = reason;
+      if (terminationReason === "timeout") timedOut = true;
+      if (terminationReason === "orphaned") orphanedProcesses = true;
+      terminationCleanupPromise = Promise.resolve().then(async () => {
+        if (trackProcessTree) await stopTreeRefresh();
+        const signalTree = options.signalProcessTree ?? signalProcessTree;
+        const waitForTreeExit = options.waitForProcessTreeExit ?? waitForProcessTreeExit;
+        if (trackProcessTree) await signalTree(child, "SIGTERM", treeState);
         else try { child.kill("SIGTERM"); } catch { /* already gone */ }
-        const exited = manageProcessTree
-          ? await waitForProcessTreeExit(child, killGraceMs, treeState)
+        const exited = trackProcessTree
+          ? await waitForTreeExit(child, killGraceMs, treeState)
           : await waitForChildExit(child, killGraceMs);
         if (!exited) {
           killed = true;
-          if (manageProcessTree) await signalProcessTree(child, "SIGKILL", treeState);
+          if (trackProcessTree) await signalTree(child, "SIGKILL", treeState);
           else try { child.kill("SIGKILL"); } catch { /* already gone */ }
-          treeTerminated = manageProcessTree
-            ? await waitForProcessTreeExit(child, killGraceMs, treeState, { ignoreZombieOnly: true })
+          treeTerminated = trackProcessTree
+            ? await waitForTreeExit(child, killGraceMs, treeState, { ignoreZombieOnly: true })
             : await waitForChildExit(child, killGraceMs);
           if (!treeTerminated) {
-            terminationError = "process tree still appears alive after forceful termination";
+            terminationError ||= "process tree still appears alive after forceful termination";
           }
         }
-        settle();
-      })().catch((error) => {
+        if (treeState.processInspectionUncertain === true) treeTerminated = false;
+      }).catch((error) => {
         treeTerminated = false;
-        terminationError = error.message;
-        settle();
+        terminationError ||= error.message;
       });
+      terminationPromise = terminationCleanupPromise.then(() => settle());
       return terminationPromise;
     };
 
-    if (typeof options.onChild === "function" && Number.isInteger(child.pid)) {
-      options.onChild({ child, terminate });
-    }
-    if (manageProcessTree) {
+    if (trackProcessTree) {
       // Capture the root's start identity immediately so termination can later
-      // detect a reused PID. Windows performs this one-shot inspection only;
-      // POSIX keeps polling to track descendants that escape the process group.
+      // detect a reused PID. POSIX keeps polling to track descendants that
+      // escape the process group.
       // Linux follows only tracked /proc task children, so a short interval
       // catches session escapes without scanning the host process table.
-      treeState.initialRefresh = initializeProcessTree(child, treeState).catch((error) => {
+      const initializeTree = options.initializeProcessTree ?? initializeProcessTree;
+      treeState.initialRefresh = Promise.resolve().then(() => initializeTree(child, treeState)).catch((error) => {
+        treeState.processInspectionUncertain = true;
+        treeTerminated = false;
         terminationError ||= "process-tree initialization failed: " + error.message;
+        try { child.kill("SIGKILL"); } catch { /* already gone */ }
       });
-      if (process.platform !== "win32") {
+      if (process.platform !== "win32" || options.refreshProcessTree) {
         const refreshIntervalMs = process.platform === "linux" ? 25 : 250;
         treeRefreshTimer = setInterval(() => { void refreshTree(); }, refreshIntervalMs);
         treeRefreshTimer.unref?.();
       }
     }
-    if (child.stdin) child.stdin.end(options.stdinText);
+    // Publish the controller only after the startup identity barrier exists.
+    // A synchronous cancellation callback can then terminate immediately
+    // without racing signal delivery ahead of initialization.
+    if (typeof options.onChild === "function" && Number.isInteger(child.pid)) {
+      options.onChild({ child, terminate });
+    }
+    if (typeof options.shouldCancel === "function" && options.shouldCancel()) {
+      void terminate("cancelled");
+    }
+    if (child.stdin) {
+      if (useWindowsJobRunner) {
+        // The PowerShell runner establishes and joins a kill-on-close Job
+        // before reading stdin, so sending the payload cannot race containment.
+        if (!terminationPromise) child.stdin.end(processTreeRunnerPayload);
+      } else if (useProcessTreeRunner) {
+        void treeState.initialRefresh.then(() => {
+          if (!treeTerminated || terminationPromise || treeRefreshStopped ||
+              child.exitCode !== null || child.signalCode !== null ||
+              (typeof options.shouldCancel === "function" && options.shouldCancel())) return;
+          child.stdin.end(processTreeRunnerPayload);
+        });
+      } else {
+        child.stdin.end(options.stdinText);
+      }
+    }
 
-    const timer = setTimeout(() => { void terminate("timeout"); }, timeoutMs);
+    timer = setTimeout(() => { void terminate("timeout"); }, timeoutMs);
 
     if (!binaryStdout) child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
@@ -374,9 +534,16 @@ async function runCommand(command, args, options = {}) {
     child.stderr.on("data", (chunk) => { stderrBuf.push(chunk); });
 
     child.on("error", (error) => {
-      spawnError = error;
       if (settled) return;
+      if (childSpawned) {
+        treeTerminated = false;
+        terminationError ||= "backend process error after spawn: " + error.message;
+        void terminate("process-error");
+        return;
+      }
+      spawnError = error;
       settled = true;
+      treeRefreshStopped = true;
       clearTimeout(timer);
       if (treeRefreshTimer) clearInterval(treeRefreshTimer);
       resolve({
@@ -394,34 +561,53 @@ async function runCommand(command, args, options = {}) {
         stderrTruncated: stderrBuf.truncated(),
       });
     });
-    child.on("close", async (code) => {
+    child.on("exit", (code) => {
       if (settled) return;
       exitCode = code;
       if (terminationPromise) return;
-      if (manageProcessTree) {
-        let stillAlive = false;
+      void (async () => {
         try {
-          stillAlive = await isProcessTreeAlive(child, treeState);
+          if (trackProcessTree) await stopTreeRefresh();
+          if (terminationPromise) {
+            await terminationPromise;
+            return;
+          }
+          const inspectTree = options.inspectProcessTree ?? isProcessTreeAlive;
+          if (trackProcessTree && treeState.processInspectionUncertain === true) {
+            await terminate("orphaned");
+            return;
+          }
+          if (trackProcessTree && await inspectTree(child, treeState)) {
+            await terminate("orphaned");
+            return;
+          }
+          if (terminationPromise) {
+            await terminationPromise;
+            return;
+          }
+          await settle();
         } catch (error) {
+          if (terminationPromise) {
+            await terminationPromise;
+            return;
+          }
           // An inspection failure (for example WMI unavailable on Windows) must
           // settle through the fail-closed path, not surface as an unhandled
           // rejection that could take down the whole server.
           treeTerminated = false;
           terminationError = "process-tree inspection failed: " + error.message;
-          settle();
-          return;
+          await settle();
         }
-        if (stillAlive) {
-          await terminate("orphaned");
-          return;
-        }
-      }
-      settle();
+      })();
     });
+    child.on("close", () => { resolveStreamsClosed(); });
   });
 
   const direct = await spawnOnce(args, null);
   if (process.platform !== "win32" || !direct.spawnError) return direct;
+  // A managed Windows backend must never fall back to an uncontained process.
+  // The Job runner already resolves native executables and PowerShell/.cmd shims.
+  if (options.manageProcessTree === true) return direct;
   if (typeof options.shouldCancel === "function" && options.shouldCancel()) return direct;
 
   // Windows shim fallback: .ps1/.cmd npm shims cannot be launched by CreateProcess,
@@ -429,7 +615,7 @@ async function runCommand(command, args, options = {}) {
   // verbatim (no cmd.exe re-interpretation).
   const runner = path.join(path.dirname(fileURLToPath(import.meta.url)), "ps1-runner.ps1");
   return await spawnOnce(null, [
-    "powershell.exe",
+    trustedWindowsPowerShell(),
     "-NoProfile",
     "-NonInteractive",
     "-ExecutionPolicy",
@@ -553,7 +739,10 @@ async function gitCommonDirectory(workspacePath, options = {}) {
   }
 }
 
-function repositoryLockKey(gitCommonDir) {
+function repositoryLockKey(gitCommonDir, repositoryId = null) {
+  if (process.platform === "linux" && repositoryId) {
+    return "git-common-dir-id:" + repositoryId;
+  }
   const normalized = path.normalize(gitCommonDir);
   // realpath() has already canonicalized ordinary aliases and path casing.
   // Preserve the result: NTFS directories can opt into case sensitivity and
@@ -561,7 +750,112 @@ function repositoryLockKey(gitCommonDir) {
   return "git-common-dir:" + normalized;
 }
 
+async function openRepositoryAccess(gitCommonDir, options = {}) {
+  if (process.platform !== "linux") {
+    return {
+      commonDir: gitCommonDir,
+      key: repositoryLockKey(gitCommonDir),
+      close: async () => {},
+    };
+  }
+  const opening = open(gitCommonDir, "r");
+  let handle;
+  try {
+    handle = await interruptibleFilesystemOperation(opening, options);
+  } catch (error) {
+    // Cancellation/deadline cannot cancel fs.open itself. Close a handle that
+    // arrives after the interrupt so the rename-stable directory pin cannot leak.
+    void opening.then((lateHandle) => lateHandle.close()).catch(() => {});
+    throw error;
+  }
+  try {
+    const identity = await interruptibleFilesystemOperation(handle.stat({ bigint: true }), options);
+    if (!identity.isDirectory()) throw new Error("Git common directory is not a directory");
+    const commonDir = "/proc/" + String(process.pid) + "/fd/" + String(handle.fd);
+    const observed = await interruptibleFilesystemOperation(stat(commonDir, { bigint: true }), options);
+    if (observed.dev !== identity.dev || observed.ino !== identity.ino) {
+      throw new Error("cannot establish a rename-stable Git common-directory handle");
+    }
+    let closed = false;
+    return {
+      commonDir,
+      key: null,
+      async close() {
+        if (closed) return;
+        closed = true;
+        await handle.close();
+      },
+    };
+  } catch (error) {
+    await handle.close().catch(() => {});
+    throw error;
+  }
+}
+
 const WORKSPACE_LOCK_STORE_NAME = "cli-agent-bridge-lock-store.git";
+const REPOSITORY_ID_FILE = "cli-agent-bridge-repository-id";
+const REPOSITORY_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+
+async function readRepositoryId(idPath, options = {}) {
+  const metadata = await interruptibleFilesystemOperation(stat(idPath), options);
+  if (!metadata.isFile() || metadata.size > 128) {
+    throw new Error("workspace lock store repository identity is invalid");
+  }
+  const value = (await interruptibleFilesystemOperation(readFile(idPath, "utf8"), options)).trim();
+  if (!REPOSITORY_ID_PATTERN.test(value)) {
+    throw new Error("workspace lock store repository identity is malformed");
+  }
+  return value;
+}
+
+async function repositoryIdMode(storeRoot, options = {}) {
+  const result = await runGitCommand(["config", "--get", "core.sharedRepository"], {
+    cwd: storeRoot, ...options,
+  });
+  if (result.exitCode === 1 && !result.stdout.trim() && !result.timedOut) return 0o600;
+  const failure = snapshotFailure("git config core.sharedRepository", result);
+  if (failure) throw new Error("cannot inspect lock-store sharing mode: " + failure);
+  const value = result.stdout.trim().toLowerCase();
+  if (["all", "world", "everybody", "2"].includes(value)) return 0o664;
+  if (["group", "true", "1"].includes(value)) return 0o660;
+  if (/^0?[0-7]{3}$/u.test(value)) return Number.parseInt(value, 8) & 0o666;
+  return 0o600;
+}
+
+async function ensureRepositoryId(storeRoot, options = {}) {
+  const idPath = path.join(storeRoot, REPOSITORY_ID_FILE);
+  try {
+    return await readRepositoryId(idPath, options);
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  const candidateId = randomUUID();
+  const candidatePath = idPath + ".candidate-" + String(process.pid) + "-" + randomUUID();
+  const mode = await repositoryIdMode(storeRoot, options);
+  const writing = writeFile(candidatePath, candidateId + "\n", { flag: "wx", mode });
+  try {
+    await interruptibleFilesystemOperation(writing, options);
+  } catch (error) {
+    // A cancellation cannot abort the underlying write. Remove a candidate
+    // that arrives after the request has already stopped waiting for it.
+    void writing.then(() => unlink(candidatePath)).catch(() => {});
+    throw error;
+  }
+  try {
+    await interruptibleFilesystemOperation(chmod(candidatePath, mode), options);
+    try {
+      await interruptibleFilesystemOperation(link(candidatePath, idPath), options);
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+    }
+  } finally {
+    await unlink(candidatePath).catch((error) => {
+      if (error.code !== "ENOENT") throw error;
+    });
+  }
+  return await readRepositoryId(idPath, options);
+}
+
 async function ensureWorkspaceLockStore(gitCommonDir, options = {}) {
   const storeRoot = path.join(gitCommonDir, WORKSPACE_LOCK_STORE_NAME);
   let initialized = false;
@@ -582,52 +876,85 @@ async function ensureWorkspaceLockStore(gitCommonDir, options = {}) {
       throw new Error("cannot inspect repository sharing mode: " + sharedFailure);
     }
     const shared = sharedResult.stdout.replace(/\r?\n$/u, "");
-    const initArgs = ["init", "--bare", "--quiet"];
-    if (shared) initArgs.push("--shared=" + shared);
-    initArgs.push(storeRoot);
-    const result = await runGitCommand(initArgs, {
-      cwd: gitCommonDir, ...options,
-    });
-    const failure = snapshotFailure("git init --bare workspace lock store", result);
-    if (failure) throw new Error("cannot initialize workspace lock store: " + failure);
+    const creatingCandidate = mkdtemp(path.join(gitCommonDir, ".cli-agent-bridge-lock-store-"));
+    let candidateRoot;
+    try {
+      candidateRoot = await interruptibleFilesystemOperation(creatingCandidate, options);
+    } catch (error) {
+      void creatingCandidate.then((lateRoot) => rm(lateRoot, { recursive: true, force: true })).catch(() => {});
+      throw error;
+    }
+    try {
+      const initArgs = ["init", "--bare", "--quiet", "--template="];
+      if (shared) initArgs.push("--shared=" + shared);
+      initArgs.push(candidateRoot);
+      const result = await runGitCommand(initArgs, {
+        cwd: gitCommonDir, ...options, containProcessTree: true,
+      });
+      const failure = snapshotFailure("git init --bare workspace lock store", result);
+      if (failure) throw new Error("cannot initialize workspace lock store: " + failure);
+      try {
+        await interruptibleFilesystemOperation(rename(candidateRoot, storeRoot), options);
+      } catch (error) {
+        if (!["EEXIST", "ENOTEMPTY", "EPERM"].includes(error.code)) throw error;
+      }
+    } finally {
+      await rm(candidateRoot, { recursive: true, force: true });
+    }
   }
-  return await interruptibleFilesystemOperation(realpath(storeRoot), options);
+  const head = await interruptibleFilesystemOperation(stat(path.join(storeRoot, "HEAD")), options);
+  if (!head.isFile()) throw new Error("workspace lock store HEAD is not a file");
+  // On Linux storeRoot may be below /proc/<bridge-pid>/fd/<directory-fd>.
+  // Keep that stable alias instead of resolving it back to a pathname that a
+  // concurrent repository rename can invalidate while the lease is active.
+  return { root: storeRoot, repositoryId: await ensureRepositoryId(storeRoot, options) };
 }
 
 function snapshotFailure(label, result) {
+  if (result.treeTerminated === false) {
+    return label + " process tree could not be confirmed terminated" +
+      (result.terminationError ? ": " + result.terminationError : "");
+  }
   if (result.timedOut) return label + " timed out";
   if (result.stdoutTruncated || result.stderrTruncated) {
     return label + " exceeded the " + String(MAX_CAPTURE_CHARS) + " character capture limit";
   }
+  if (result.errorMessage) return label + " could not start: " + result.errorMessage;
   if (result.exitCode !== 0) return label + " failed with exit code " + String(result.exitCode);
   return "";
 }
 
 class OperationCancelledError extends Error {}
 class DeadlineExceededError extends Error {}
+class GitProcessTreeUnconfirmedError extends Error {
+  constructor(label, terminationError, quarantine = null) {
+    super(label + " process tree could not be confirmed terminated: " + terminationError);
+    this.terminationError = terminationError;
+    this.quarantine = quarantine;
+  }
+}
 
-async function runGitCommand(args, {
+export async function runGitCommand(args, {
   cwd,
   cancel = null,
   deadline = null,
   stdinText,
   binaryStdout = false,
   timeoutMs = GIT_TIMEOUT_MS,
+  containProcessTree = false,
+  commandRunner = runCommand,
 } = {}) {
   if (cancel?.cancelled) throw new OperationCancelledError("operation cancelled by client");
   const remaining = deadline === null ? GIT_TIMEOUT_MS : deadline - Date.now();
   if (remaining <= 0) throw new DeadlineExceededError("delegation deadline exceeded");
+  const git = await safeGitInvocation(args);
   let controller = null;
-  const result = await runCommand("git", args, {
+  const result = await commandRunner(git.command, git.args, {
     cwd,
+    env: git.env,
     stdinText,
     binaryStdout,
-    manageProcessTree: true,
-    // Git hooks/helpers are polled while Git is alive and receive one final
-    // marker scan after it exits. Do not add the worker-oriented 500 ms late-
-    // visibility grace to every merge-base/ref query: attribution can issue
-    // hundreds of these commands. A marked descendant found by the final scan
-    // is still terminated and drained before this call returns.
+    manageProcessTree: containProcessTree,
     markerObservationGraceMs: 0,
     timeoutMs: Math.max(1, Math.min(timeoutMs, remaining)),
     killGraceMs: 1_000,
@@ -638,9 +965,15 @@ async function runGitCommand(args, {
     },
   });
   if (cancel?.controller === controller) cancel.controller = null;
-  if (cancel?.cancelled) throw new OperationCancelledError("operation cancelled by client");
-  if (deadline !== null && result.timedOut && Date.now() >= deadline) {
-    throw new DeadlineExceededError("delegation deadline exceeded");
+  // A contained Git command can be cancelled or hit the overall deadline at
+  // the same time that descendant cleanup becomes uncertain. Preserve that
+  // result so the snapshot caller can quarantine the retained lease before
+  // reporting the interruption; throwing here would release the lease.
+  if (!(containProcessTree && result.treeTerminated === false)) {
+    if (cancel?.cancelled) throw new OperationCancelledError("operation cancelled by client");
+    if (deadline !== null && result.timedOut && Date.now() >= deadline) {
+      throw new DeadlineExceededError("delegation deadline exceeded");
+    }
   }
   return result;
 }
@@ -652,39 +985,48 @@ const CONCURRENT_LEASE_STALE_MS = 30_000;
 
 async function gitSnapshot(worktreeRoot, options = {}) {
   const ownLockRef = typeof options.ownLockRef === "string" ? options.ownLockRef : null;
+  const lockStoreRoot = typeof options.lockStoreRoot === "string" ? options.lockStoreRoot : null;
   const jobs = [
-    ["git status --short", "status", ["status", "--short", "--untracked-files=all", "--ignore-submodules=none"]],
-    ["git diff --stat", "diffStat", ["diff", "--ignore-submodules=none", "--stat"]],
-    ["git diff --name-only -z", "diffNames", ["diff", "--ignore-submodules=none", "--name-only", "-z"], false, true],
+    ["git status --short", "status", ["status", "--short", "--untracked-files=all", "--ignore-submodules=none"], false, false, true],
+    ["git diff --stat", "diffStat", ["diff", "--ignore-submodules=none", "--stat"], false, false, true],
+    ["git diff --name-only -z", "diffNames", ["diff", "--ignore-submodules=none", "--name-only", "-z"], false, true, true],
     ["git diff --cached --stat", "cachedDiffStat", ["diff", "--cached", "--ignore-submodules=none", "--stat"]],
     ["git diff --cached --name-only -z", "cachedDiffNames", ["diff", "--cached", "--ignore-submodules=none", "--name-only", "-z"], false, true],
     ["git ls-files --others --exclude-standard -z", "untracked", ["ls-files", "--others", "--exclude-standard", "-z"], false, true],
     ["git rev-parse --verify --quiet HEAD", "head", ["rev-parse", "--verify", "--quiet", "HEAD"], true],
     ["git symbolic-ref --quiet HEAD", "headRef", ["symbolic-ref", "--quiet", "HEAD"], true],
     ["git for-each-ref", "refs", ["for-each-ref", "--format=%(refname)%09%(objectname)", "refs"]],
+    ["git rev-parse --git-path FETCH_HEAD", "fetchHeadPath", ["rev-parse", "--git-path", "FETCH_HEAD"]],
   ];
   // Run serially: status/diff may both refresh the index, so concurrent Git
   // processes can race for .git/index.lock on the same repository.
-  const results = [];
-  for (const job of jobs) {
-    results.push(await runGitCommand(job[2], {
-      cwd: worktreeRoot, ...options, binaryStdout: job[4] === true,
-    }));
-  }
-  const failures = [];
   const out = {};
-  results.forEach((result, i) => {
-    if (jobs[i][3] === true && result.exitCode === 1 && !result.timedOut) {
-      out[jobs[i][1]] = "";
-      return;
+  for (const job of jobs) {
+    const result = await runGitCommand(job[2], {
+      cwd: worktreeRoot, ...options, binaryStdout: job[4] === true,
+      // Worktree status/diff can execute arbitrary clean filters despite
+      // --no-ext-diff/--no-textconv. Keep those commands contained; commands
+      // that only read refs/index metadata stay on the lightweight path.
+      containProcessTree: options.containProcessTree === true || job[5] === true,
+    });
+    const contained = options.containProcessTree === true || job[5] === true;
+    if (contained && result.treeTerminated === false) {
+      const terminationError = result.terminationError ||
+        "repository helper descendants may still be running";
+      const quarantine = typeof options.onUnconfirmedProcessTree === "function"
+        ? await options.onUnconfirmedProcessTree({ label: job[0], terminationError })
+        : null;
+      throw new GitProcessTreeUnconfirmedError(job[0], terminationError, quarantine);
     }
-    const failure = snapshotFailure(jobs[i][0], result);
-    if (failure) { failures.push(failure); return; }
-    out[jobs[i][1]] = result.stdout;
-  });
-  if (failures.length > 0) {
-    // Fail closed: an unreliable snapshot must never authorize a delegation.
-    throw new Error("git snapshot unreliable: " + failures.join("; "));
+    if (job[3] === true && result.exitCode === 1 && !result.timedOut) {
+      out[job[1]] = "";
+      continue;
+    }
+    const failure = snapshotFailure(job[0], result);
+    // Fail closed immediately: continuing with later commands only delays
+    // lease release when a repository was renamed or removed mid-delegation.
+    if (failure) throw new Error("git snapshot unreliable: " + failure);
+    out[job[1]] = result.stdout;
   }
   const seen = new Set();
   const nulNames = (value) => {
@@ -721,17 +1063,47 @@ async function gitSnapshot(worktreeRoot, options = {}) {
     .map((s, i) => (i === 0 ? s : s.split(/\r?\n/).map((l) => "staged: " + l).join("\n")))
     .join("\n");
   const refs = {};
-  const lockRefs = [];
   for (const line of String(out.refs ?? "").split(/\r?\n/u)) {
     if (!line) continue;
     const separator = line.indexOf("\t");
     if (separator <= 0) continue;
     const ref = line.slice(0, separator);
-    if (ref.startsWith(WORKSPACE_LOCK_REF_PREFIX)) {
-      if (ref !== ownLockRef) lockRefs.push(line.slice(separator + 1));
-      continue;
-    }
     refs[ref] = line.slice(separator + 1);
+  }
+  const fetchHeads = [];
+  const fetchHeadPath = path.resolve(
+    worktreeRoot, String(out.fetchHeadPath ?? "").replace(/\r?\n$/u, ""),
+  );
+  try {
+    const rawFetchHead = await interruptibleFilesystemOperation(readFile(fetchHeadPath, "utf8"), options);
+    for (const line of rawFetchHead.split(/\r?\n/u)) {
+      if (!line) continue;
+      const oid = line.split("\t", 1)[0];
+      if (!/^[0-9a-f]{40,64}$/u.test(oid)) {
+        throw new Error("malformed FETCH_HEAD record");
+      }
+      if (!fetchHeads.includes(oid)) fetchHeads.push(oid);
+    }
+  } catch (error) {
+    if (error.code !== "ENOENT") {
+      if (error instanceof OperationCancelledError || error instanceof DeadlineExceededError) throw error;
+      throw new Error("git snapshot unreliable: cannot read FETCH_HEAD: " + error.message);
+    }
+  }
+  const lockRefs = [];
+  if (lockStoreRoot) {
+    const storedRefs = await runGitCommand([
+      "for-each-ref", "--format=%(refname)%09%(objectname)", WORKSPACE_LOCK_REF_PREFIX,
+    ], { cwd: lockStoreRoot, ...options });
+    const storedRefsFailure = snapshotFailure("git for-each-ref workspace lock store", storedRefs);
+    if (storedRefsFailure) throw new Error("git snapshot unreliable: " + storedRefsFailure);
+    for (const line of String(storedRefs.stdout ?? "").split(/\r?\n/u)) {
+      if (!line) continue;
+      const separator = line.indexOf("\t");
+      if (separator <= 0) continue;
+      const ref = line.slice(0, separator);
+      if (ref !== ownLockRef) lockRefs.push(line.slice(separator + 1));
+    }
   }
   // Linked worktrees serialize per worktree but share repository refs, so a
   // commit from a parallel delegation can land between our two snapshots.
@@ -743,7 +1115,7 @@ async function gitSnapshot(worktreeRoot, options = {}) {
     : Number.POSITIVE_INFINITY;
   let concurrentDelegations = 0;
   for (const oid of lockRefs) {
-    const blob = await runGitCommand(["cat-file", "blob", oid], { cwd: worktreeRoot, ...options });
+    const blob = await runGitCommand(["cat-file", "blob", oid], { cwd: lockStoreRoot, ...options });
     if (blob.exitCode !== 0) continue; // unreadable owner blob: ignore for disclosure
     try {
       const record = JSON.parse(blob.stdout);
@@ -770,6 +1142,7 @@ async function gitSnapshot(worktreeRoot, options = {}) {
     head: String(out.head ?? "").trim(),
     headRef: String(out.headRef ?? "").replace(/\r?\n$/u, ""),
     refs,
+    fetchHeads,
     concurrentDelegations,
   };
 }
@@ -799,59 +1172,60 @@ async function peelCommitish(worktreeRoot, oid, cache = new Map(), options = {})
   return commit;
 }
 
-async function closestExistingBase(worktreeRoot, target, baselineCommits, options = {}) {
-  async function distanceFromTarget(candidate) {
-    const distance = await runGitCommand(["rev-list", "--count", candidate + ".." + target], {
-      cwd: worktreeRoot, ...options,
+export async function populateCommitishCache(worktreeRoot, oids, cache, options = {}) {
+  const pending = [...new Set(oids)].filter((oid) =>
+    typeof oid === "string" && /^[0-9a-f]{40,64}$/u.test(oid) && !cache.has(oid));
+  // Keep each response comfortably below the bounded capture limit while
+  // reducing thousands of per-ref cat-file processes to a few batch queries.
+  const chunkSize = 4_000;
+  for (let offset = 0; offset < pending.length; offset += chunkSize) {
+    const chunk = pending.slice(offset, offset + chunkSize);
+    const result = await runGitCommand([
+      "cat-file", "--batch-check=%(objectname) %(objecttype)",
+    ], {
+      cwd: worktreeRoot,
+      ...options,
+      stdinText: chunk.map((oid) => oid + "^{commit}").join("\n") + "\n",
     });
-    const failure = snapshotFailure("git rev-list --count " + candidate + ".." + target, distance);
-    const count = Number(distance.stdout.trim());
-    if (failure || !Number.isInteger(count)) {
-      throw new Error("cannot select committed-delta baseline: " + (failure || "invalid distance"));
+    const failure = snapshotFailure("git cat-file --batch-check", result);
+    if (failure) throw new Error("cannot classify repository tips: " + failure);
+    const lines = String(result.stdout ?? "").replace(/\r?\n$/u, "").split(/\r?\n/u);
+    if (lines.length !== chunk.length) {
+      throw new Error("cannot classify repository tips: incomplete git cat-file response");
     }
-    return count;
+    for (let index = 0; index < chunk.length; index += 1) {
+      const match = /^([0-9a-f]{40,64}) commit$/u.exec(lines[index]);
+      if (!match && !lines[index].endsWith(" missing")) {
+        throw new Error("cannot classify repository tips: malformed git cat-file response");
+      }
+      cache.set(chunk[index], match ? match[1] : null);
+    }
   }
+}
 
-  let best = null;
-  let bestDistance = Number.POSITIVE_INFINITY;
-  // Check every pre-run tip in bounded, cancellable commands. This avoids a
-  // command-line-size limit and never silently drops late refs from attribution.
-  for (const candidate of baselineCommits) {
-    const ancestor = await runGitCommand(["merge-base", "--is-ancestor", candidate, target], {
-      cwd: worktreeRoot, ...options,
-    });
-    if (ancestor.timedOut || ancestor.stdoutTruncated || ancestor.stderrTruncated ||
-        ![0, 1].includes(ancestor.exitCode)) {
-      throw new Error("cannot select committed-delta baseline: git merge-base --is-ancestor failed");
-    }
-    if (ancestor.exitCode !== 0) continue;
-    const distance = await distanceFromTarget(candidate);
-    if (distance < bestDistance) {
-      best = candidate;
-      bestDistance = distance;
-    }
+export async function closestExistingBase(worktreeRoot, target, baselineCommits, options = {}) {
+  if (baselineCommits.length === 0) return null;
+  // One boundary walk finds the pre-run commits immediately adjacent to the
+  // target's new history. Supplying exclusions on stdin avoids command-line
+  // limits and, unlike one merge-base/rev-list process per ref, keeps Git
+  // process count constant even for repositories with thousands of tips.
+  const walk = await runGitCommand([
+    "rev-list", "--topo-order", "--boundary", target, "--stdin",
+  ], {
+    cwd: worktreeRoot,
+    ...options,
+    stdinText: baselineCommits.map((commit) => "^" + commit).join("\n") + "\n",
+  });
+  const failure = snapshotFailure("git rev-list --boundary " + target, walk);
+  if (failure) throw new Error("cannot select committed-delta baseline: " + failure);
+  for (const line of String(walk.stdout ?? "").split(/\r?\n/u)) {
+    if (!line.startsWith("-")) continue;
+    const boundary = line.slice(1).trim();
+    if (/^[0-9a-f]{40,64}$/u.test(boundary)) return boundary;
   }
-  if (best) return best;
-
-  // Rewritten histories may have no pre-run tip that remains a direct ancestor.
-  // Evaluate each merge base independently and retain the closest one.
-  for (const candidate of baselineCommits) {
-    const mergeBase = await runGitCommand(["merge-base", target, candidate], {
-      cwd: worktreeRoot, ...options,
-    });
-    if (mergeBase.exitCode === 1 && !mergeBase.timedOut) continue;
-    const failure = snapshotFailure("git merge-base " + target + " " + candidate, mergeBase);
-    const merged = mergeBase.stdout.trim();
-    if (failure || !merged) {
-      throw new Error("cannot select committed-delta baseline: " + (failure || "empty merge base"));
-    }
-    const distance = await distanceFromTarget(merged);
-    if (distance < bestDistance) {
-      best = merged;
-      bestDistance = distance;
-    }
-  }
-  return best;
+  // Disjoint histories have no excluded boundary; callers use the empty tree
+  // so the stat still represents the newly reachable target history.
+  return null;
 }
 
 async function committedDelta(worktreeRoot, before, after, options = {}) {
@@ -870,6 +1244,7 @@ async function committedDelta(worktreeRoot, before, after, options = {}) {
       cwd: worktreeRoot,
       ...options,
       stdinText: "",
+      containProcessTree: true,
     });
     const failure = snapshotFailure("git mktree", emptyTree);
     if (failure || !emptyTree.stdout.trim()) {
@@ -880,6 +1255,15 @@ async function committedDelta(worktreeRoot, before, after, options = {}) {
   }
 
   const cache = new Map();
+  await populateCommitishCache(worktreeRoot, [
+    before.head,
+    ...Object.values(before.refs ?? {}),
+    ...(before.fetchHeads ?? []),
+    after.head,
+    ...Object.values(after.refs ?? {}),
+    ...(after.fetchHeads ?? []),
+    ...refsChanged.flatMap((change) => [change.before, change.after]),
+  ], cache, options);
   // Baseline: every commit that already existed before the worker ran. New
   // commits are attributed to the worker only when they are reachable from the
   // after-state but from none of these, so merely checking out an existing
@@ -892,6 +1276,7 @@ async function committedDelta(worktreeRoot, before, after, options = {}) {
   await addBaseline(before.head);
   for (const oid of new Set([
     ...Object.values(before.refs ?? {}),
+    ...(before.fetchHeads ?? []),
     ...refsChanged.map((change) => change.before),
   ])) {
     await addBaseline(oid);
@@ -920,6 +1305,12 @@ async function committedDelta(worktreeRoot, before, after, options = {}) {
     if (tagCommit && !movedLocalTargets.has(tagCommit)) externalRefChanges.push(change);
   }
   for (const change of externalRefChanges) await addBaseline(change.after);
+  // FETCH_HEAD records the actual objects downloaded by fetch independently
+  // of its arbitrary destination refspec. A fetch can write directly into
+  // refs/heads or any custom namespace, so namespace alone cannot establish
+  // provenance. Exclude every recorded fetched tip while retaining the local
+  // destination movement as an attribution target for any later worker commit.
+  for (const oid of after.fetchHeads ?? []) await addBaseline(oid);
   const externalRefNames = new Set(externalRefChanges.map((change) => change.ref));
 
   // A worker committing on the checked-out branch moves HEAD and its branch ref
@@ -946,6 +1337,15 @@ async function committedDelta(worktreeRoot, before, after, options = {}) {
   const movementLogs = externalRefChanges.map((change) =>
     change.ref + " moved to externally sourced history; excluded from worker-created commits",
   );
+  const beforeFetchHeads = new Set(before.fetchHeads ?? []);
+  for (const oid of after.fetchHeads ?? []) {
+    if (!beforeFetchHeads.has(oid)) {
+      movementLogs.push(
+        "FETCH_HEAD recorded externally fetched history at " + oid.slice(0, 12) +
+        "; excluded from worker-created commits",
+      );
+    }
+  }
   if ((before.headRef ?? "") !== (after.headRef ?? "")) {
     movementLogs.push(
       "HEAD symbolic target " + (before.headRef || "(detached)") +
@@ -1066,8 +1466,38 @@ async function listBackends(cancel = null) {
     // the discovery call, terminating the current probe and skipping the rest.
     if (cancel?.cancelled) break;
     if (!spec || typeof spec.command !== "string") continue;
-    const check = await runCommand(spec.command, ["--version"], {
+    if (!supportsReliableProcessContainment()) {
+      entries.push({
+        name,
+        label: typeof spec.label === "string" ? spec.label : name,
+        command: spec.command,
+        available: false,
+        experimental: Boolean(spec.experimental),
+        version: null,
+        error: "unsupported platform: reliable descendant containment is available only on Windows and Linux",
+        resumeSupported: Array.isArray(spec.resumeArgs),
+        notes: typeof spec.notes === "string" ? spec.notes : "",
+      });
+      continue;
+    }
+    const resolvedCommand = await resolvePathCommand(spec.command);
+    if (!resolvedCommand) {
+      entries.push({
+        name,
+        label: typeof spec.label === "string" ? spec.label : name,
+        command: spec.command,
+        available: false,
+        experimental: Boolean(spec.experimental),
+        version: null,
+        error: "command not found or not executable",
+        resumeSupported: Array.isArray(spec.resumeArgs),
+        notes: typeof spec.notes === "string" ? spec.notes : "",
+      });
+      continue;
+    }
+    const check = await runCommand(resolvedCommand, ["--version"], {
       timeoutMs: VERSION_CHECK_TIMEOUT_MS,
+      manageProcessTree: true,
       shouldCancel: () => Boolean(cancel?.cancelled),
       onChild: (controller) => {
         if (cancel) cancel.controller = controller;
@@ -1094,6 +1524,10 @@ function workspaceQuarantinePath(key) {
   return path.join(WORKSPACE_LOCK_ROOT, digest + ".quarantine");
 }
 
+function workspaceQuarantineRecoveryPath(key) {
+  return workspaceQuarantinePath(key) + ".recovery-approved";
+}
+
 async function readWorkspaceQuarantine(key) {
   const quarantinePath = workspaceQuarantinePath(key);
   try {
@@ -1107,34 +1541,54 @@ async function readWorkspaceQuarantine(key) {
   }
 }
 
-// Quarantined leases become reclaimable through this check: the operator
-// deliberately removed the shared marker after inspecting leftover processes.
-async function quarantineFileAbsent(key) {
+// Recovery is an explicit, durable rename of the quarantine record rather than
+// inference from an absent temporary file. The random id binds authorization
+// to the exact quarantined lease and prevents a stale approval from carrying
+// over to a later incident.
+async function quarantineRecoveryApproved(key, owner) {
   try {
-    return (await readWorkspaceQuarantine(key)) === null;
+    const raw = await readFile(workspaceQuarantineRecoveryPath(key), "utf8");
+    const record = JSON.parse(raw);
+    return typeof owner?.quarantineId === "string" &&
+      record?.quarantineId === owner.quarantineId;
   } catch {
     return false;
   }
 }
 
+async function clearQuarantineRecoveryApproval(key) {
+  await unlink(workspaceQuarantineRecoveryPath(key)).catch((error) => {
+    if (error.code !== "ENOENT") throw error;
+  });
+}
+
 async function markWorkspaceQuarantined(key, details) {
   await mkdir(WORKSPACE_LOCK_ROOT, { recursive: true, mode: 0o700 });
   const quarantinePath = workspaceQuarantinePath(key);
+  const quarantineId = randomUUID();
   const token = process.pid + "-" + randomUUID();
   const temporaryPath = quarantinePath + ".owner-" + token;
-  await writeFile(temporaryPath, JSON.stringify({
+  const record = {
     ...details,
+    quarantineId,
     serverPid: process.pid,
     processIdentity: await cachedProcessStartIdentity(process.pid),
     quarantinedAt: new Date().toISOString(),
-  }), { flag: "wx", mode: 0o600 });
+  };
+  await writeFile(temporaryPath, JSON.stringify(record), { flag: "wx", mode: 0o600 });
   try {
-    try { await link(temporaryPath, quarantinePath); }
-    catch (error) { if (error.code !== "EEXIST") throw error; }
+    try {
+      await link(temporaryPath, quarantinePath);
+    } catch (error) {
+      if (error.code === "EEXIST") {
+        throw new Error("workspace quarantine marker already exists at " + quarantinePath);
+      }
+      throw error;
+    }
   } finally {
     try { await unlink(temporaryPath); } catch (error) { if (error.code !== "ENOENT") throw error; }
   }
-  return quarantinePath;
+  return { quarantinePath, quarantineId, details: record };
 }
 
 let linuxBootIdPromise = null;
@@ -1160,7 +1614,7 @@ async function processStartIdentity(pid) {
   } else if (process.platform === "win32") {
     const script = "$p=Get-Process -Id " + String(pid) +
       " -ErrorAction SilentlyContinue; if ($null -ne $p) { $p.StartTime.ToUniversalTime().Ticks }";
-    const result = await runCommand("powershell.exe", [
+    const result = await runCommand(trustedWindowsPowerShell(), [
       "-NoProfile", "-NonInteractive", "-Command", script,
     ], { timeoutMs: 5_000 });
     if (result.exitCode === 0 && result.stdout.trim()) {
@@ -1201,6 +1655,21 @@ async function serverProcessStartIdentity() {
 // server processes without a read-then-unlink stale-owner race.
 const workspaceLocks = new Map();
 const quarantinedWorkspaces = new Set();
+async function quarantineLeaseForProcessTree({
+  lockKey, workspaceLease, backend, workspacePath, worktreeRoot, terminationError,
+}) {
+  quarantinedWorkspaces.add(lockKey);
+  workspaceLease.retain();
+  const details = {
+    backend, workspacePath, worktreeRoot, lockRef: workspaceLease.ref, terminationError,
+  };
+  const quarantine = await markWorkspaceQuarantined(lockKey, details);
+  try {
+    await workspaceLease.markWorkerQuarantined(quarantine.quarantineId);
+  } catch { /* the retained lease remains fail-closed; the marker explains recovery */ }
+  quarantinedWorkspaces.delete(lockKey);
+  return { quarantinePath: quarantine.quarantinePath, details: quarantine.details };
+}
 async function withWorkspaceLock(key, lockStoreRoot, fn, {
   cancel = null,
   deadline = null,
@@ -1208,7 +1677,8 @@ async function withWorkspaceLock(key, lockStoreRoot, fn, {
   onDeadline = null,
   isUnavailable = null,
   onUnavailable = null,
-  operatorCleared = null,
+  operatorRecoveryApproved = null,
+  onAcquired = null,
 } = {}) {
   const prev = workspaceLocks.get(key) ?? Promise.resolve();
   const prevDone = prev.catch(() => {});
@@ -1250,7 +1720,7 @@ async function withWorkspaceLock(key, lockStoreRoot, fn, {
         key,
         cancel,
         deadline,
-        operatorCleared,
+        operatorRecoveryApproved,
         ownerIdentity: await serverProcessStartIdentity(),
         processIdentityProbe: processStartIdentity,
       });
@@ -1263,6 +1733,7 @@ async function withWorkspaceLock(key, lockStoreRoot, fn, {
       }
       throw error;
     }
+    if (typeof onAcquired === "function") await onAcquired(lease);
     return await fn(lease);
   } finally {
     try {
@@ -1360,7 +1831,7 @@ function lockDeadlineDelegation({
 function quarantinedDelegation({ backend, workspacePath, worktreeRoot, spec }, sharedQuarantine = null) {
   return {
     ok: false,
-    error: "this workspace is quarantined because a previous worker process tree could not be confirmed terminated; inspect leftover processes, then remove the reported quarantine file deliberately",
+    error: "this workspace is quarantined because a previous worker or repository helper process tree could not be confirmed terminated; inspect leftover processes, then rename the reported quarantine file with the .recovery-approved suffix",
     backend, workspacePath, worktreeRoot, exitCode: null, timedOut: false, killed: false, cancelled: false,
     treeTerminated: false, outputTail: "", stderrTail: "",
     gitBefore: null, git: null, commits: null,
@@ -1389,7 +1860,7 @@ function cancelledWorkspaceStatus(id, { workspacePath = "", worktreeRoot = "" } 
 function quarantinedWorkspaceStatus(id, { workspacePath = "", worktreeRoot = "" } = {}, sharedQuarantine = null) {
   const out = {
     ok: false,
-    error: "workspace status is unavailable because an earlier worker process tree could not be confirmed terminated",
+    error: "workspace status is unavailable because an earlier worker or repository helper process tree could not be confirmed terminated; after inspection, rename quarantinePath with the .recovery-approved suffix",
     cancelled: false,
     workspacePath,
     worktreeRoot,
@@ -1417,6 +1888,48 @@ async function delegateTask(rawArgs, cancel) {
   if (typeof rawArgs.task !== "string" || !rawArgs.task.trim()) {
     throw new Error("task must be a non-empty string");
   }
+  if (!supportsReliableProcessContainment()) {
+    return {
+      ok: false,
+      error: "delegate_task is unsupported on " + RUNTIME_PLATFORM +
+        ": reliable descendant containment is available only on Windows and Linux",
+      backend,
+      workspacePath: typeof rawArgs.workspacePath === "string" ? rawArgs.workspacePath : "",
+      worktreeRoot: "",
+      exitCode: null,
+      timedOut: false,
+      killed: false,
+      cancelled: false,
+      treeTerminated: true,
+      outputTail: "",
+      stderrTail: "",
+      gitBefore: null,
+      git: null,
+      commits: null,
+      experimental: Boolean(spec.experimental),
+    };
+  }
+  const backendCommand = await resolvePathCommand(spec.command);
+  if (!backendCommand) {
+    return {
+      ok: false,
+      error: "backend \"" + backend + "\" command was not found or is not executable",
+      backend,
+      workspacePath: typeof rawArgs.workspacePath === "string" ? rawArgs.workspacePath : "",
+      worktreeRoot: "",
+      exitCode: null,
+      timedOut: false,
+      killed: false,
+      cancelled: false,
+      treeTerminated: true,
+      outputTail: "",
+      stderrTail: "",
+      gitBefore: null,
+      git: null,
+      commits: null,
+      experimental: Boolean(spec.experimental),
+    };
+  }
   const timeoutMs = Number.isInteger(rawArgs.timeoutMs)
     ? Math.min(MAX_TIMEOUT_MS, Math.max(MIN_TIMEOUT_MS, rawArgs.timeoutMs))
     : DEFAULT_TIMEOUT_MS;
@@ -1425,6 +1938,7 @@ async function delegateTask(rawArgs, cancel) {
   let worktreeRoot = "";
   let gitCommonDir = "";
   let lockStoreRoot = "";
+  let repositoryAccess = null;
   try {
     if (cancel?.cancelled) {
       return cancelledDelegation({ backend, workspacePath, worktreeRoot, spec });
@@ -1434,8 +1948,12 @@ async function delegateTask(rawArgs, cancel) {
     await requireGitRepo(workspacePath, { cancel, deadline });
     worktreeRoot = await gitWorktreeRoot(workspacePath, { cancel, deadline });
     gitCommonDir = await gitCommonDirectory(workspacePath, { cancel, deadline });
-    lockStoreRoot = await ensureWorkspaceLockStore(gitCommonDir, { cancel, deadline });
+    repositoryAccess = await openRepositoryAccess(gitCommonDir, { cancel, deadline });
+    const lockStore = await ensureWorkspaceLockStore(repositoryAccess.commonDir, { cancel, deadline });
+    lockStoreRoot = lockStore.root;
+    repositoryAccess.key = repositoryLockKey(gitCommonDir, lockStore.repositoryId);
   } catch (error) {
+    await repositoryAccess?.close().catch(() => {});
     if (error instanceof OperationCancelledError) {
       return cancelledDelegation({ backend, workspacePath, worktreeRoot, spec });
     }
@@ -1450,13 +1968,14 @@ async function delegateTask(rawArgs, cancel) {
     }
     throw error;
   }
-  const lockKey = repositoryLockKey(gitCommonDir);
-  const existingQuarantine = await readWorkspaceQuarantine(lockKey);
-  if (quarantinedWorkspaces.has(lockKey) || existingQuarantine) {
-    return quarantinedDelegation({ backend, workspacePath, worktreeRoot, spec }, existingQuarantine);
-  }
-  let observedQuarantine = null;
-  return await withWorkspaceLock(lockKey, lockStoreRoot, async (workspaceLease) => {
+  const lockKey = repositoryAccess.key;
+  try {
+    const existingQuarantine = await readWorkspaceQuarantine(lockKey);
+    if (quarantinedWorkspaces.has(lockKey) || existingQuarantine) {
+      return quarantinedDelegation({ backend, workspacePath, worktreeRoot, spec }, existingQuarantine);
+    }
+    let observedQuarantine = null;
+    return await withWorkspaceLock(lockKey, lockStoreRoot, async (workspaceLease) => {
     const sharedQuarantine = await readWorkspaceQuarantine(lockKey);
     if (quarantinedWorkspaces.has(lockKey) || sharedQuarantine) {
       return quarantinedDelegation({ backend, workspacePath, worktreeRoot, spec }, sharedQuarantine);
@@ -1464,14 +1983,34 @@ async function delegateTask(rawArgs, cancel) {
     if (cancel && cancel.cancelled) {
       return cancelledDelegation({ backend, workspacePath, worktreeRoot, spec });
     }
+    let gitProcessQuarantine = null;
+    const quarantineGitProcessTree = async ({ label, terminationError }) => {
+      gitProcessQuarantine ??= await quarantineLeaseForProcessTree({
+        lockKey,
+        workspaceLease,
+        backend: label,
+        workspacePath,
+        worktreeRoot,
+        terminationError,
+      });
+      return gitProcessQuarantine;
+    };
     const allowDirty = rawArgs.allowDirty === true;
     // Attribution window for concurrency disclosure: everything between the
     // before-snapshot and the after-snapshot.
     const attributionWindowStart = Date.now();
     let before;
     try {
-      before = await gitSnapshot(worktreeRoot, { cancel, deadline, ownLockRef: workspaceLease.ref });
+      before = await gitSnapshot(worktreeRoot, {
+        cancel, deadline, ownLockRef: workspaceLease.ref, lockStoreRoot,
+        onUnconfirmedProcessTree: quarantineGitProcessTree,
+      });
     } catch (error) {
+      if (error instanceof GitProcessTreeUnconfirmedError) {
+        return quarantinedDelegation(
+          { backend, workspacePath, worktreeRoot, spec }, error.quarantine,
+        );
+      }
       if (error instanceof OperationCancelledError) {
         return cancelledDelegation({ backend, workspacePath, worktreeRoot, spec });
       }
@@ -1594,7 +2133,7 @@ async function delegateTask(rawArgs, cancel) {
       ownershipLostError ??= error;
     });
     let workerLockUpdate = Promise.resolve();
-    const result = await runCommand(spec.command, args, {
+    const result = await runCommand(backendCommand, args, {
       cwd: workspacePath,
       timeoutMs: remaining,
       manageProcessTree: true,
@@ -1629,20 +2168,22 @@ async function delegateTask(rawArgs, cancel) {
       workspaceLease.retain();
       // Persist the operator-visible marker before making the retained lease
       // recoverable. If persistence fails, the lease remains in the
-      // unreclaimable running state instead of treating a never-created marker
-      // as one that an operator deliberately removed.
-      quarantinePath = await markWorkspaceQuarantined(lockKey, {
+      // unreclaimable running state instead of mistaking temporary-file cleanup
+      // for an explicit operator recovery authorization.
+      const quarantine = await markWorkspaceQuarantined(lockKey, {
         backend,
         workspacePath,
         worktreeRoot,
         lockRef: workspaceLease.ref,
         terminationError: result.terminationError,
       });
+      quarantinePath = quarantine.quarantinePath;
       try {
-        await workspaceLease.markWorkerQuarantined();
+        await workspaceLease.markWorkerQuarantined(quarantine.quarantineId);
       } catch { /* running state remains fail-closed; the marker still explains manual recovery */ }
-      // The shared marker is now authoritative and removable by an operator;
-      // retain the local fallback only when writing that marker failed.
+      // The shared marker is now authoritative and can be explicitly renamed
+      // by an operator after inspection; retain the local fallback only when
+      // writing that marker failed.
       quarantinedWorkspaces.delete(lockKey);
     } else if (!ownershipLostError) {
       try {
@@ -1670,11 +2211,18 @@ async function delegateTask(rawArgs, cancel) {
           cancel,
           deadline,
           ownLockRef: workspaceLease.ref,
+          lockStoreRoot,
           concurrencyWindowStart: attributionWindowStart,
+          onUnconfirmedProcessTree: quarantineGitProcessTree,
         });
         commits = await committedDelta(worktreeRoot, before, after, { cancel, deadline });
       } catch (error) {
-        if (error instanceof OperationCancelledError) {
+        if (error instanceof GitProcessTreeUnconfirmedError) {
+          result.treeTerminated = false;
+          result.terminationError = error.terminationError;
+          quarantinePath = error.quarantine?.quarantinePath ?? "";
+          after = null;
+        } else if (error instanceof OperationCancelledError) {
           // The worker is already stopped; report cancellation without a
           // misleading partial snapshot assembled from interrupted Git calls.
           after = null;
@@ -1695,7 +2243,7 @@ async function delegateTask(rawArgs, cancel) {
     );
     let error = "";
     if (!result.treeTerminated) {
-      error = "backend process tree could not be confirmed terminated; the shared workspace quarantine remains until an operator checks for leftovers and removes quarantinePath";
+      error = "backend or Git snapshot process tree could not be confirmed terminated; the shared workspace quarantine remains until an operator checks for leftovers and renames quarantinePath with the .recovery-approved suffix";
     } else if (cancel && cancel.cancelled) {
       error = "delegation cancelled by client; post-run snapshot may be unavailable";
     } else if (result.timedOut) {
@@ -1735,20 +2283,24 @@ async function delegateTask(rawArgs, cancel) {
       commits,
       experimental: Boolean(spec.experimental),
     };
-  }, {
-    cancel,
-    deadline,
-    onCancelled: () => cancelledDelegation({ backend, workspacePath, worktreeRoot, spec }),
-    onDeadline: () => lockDeadlineDelegation({ backend, workspacePath, worktreeRoot, spec }),
-    operatorCleared: () => quarantineFileAbsent(lockKey),
-    isUnavailable: async () => {
-      observedQuarantine = await readWorkspaceQuarantine(lockKey);
-      return quarantinedWorkspaces.has(lockKey) || Boolean(observedQuarantine);
-    },
-    onUnavailable: () => quarantinedDelegation(
-      { backend, workspacePath, worktreeRoot, spec }, observedQuarantine,
-    ),
-  });
+    }, {
+      cancel,
+      deadline,
+      onCancelled: () => cancelledDelegation({ backend, workspacePath, worktreeRoot, spec }),
+      onDeadline: () => lockDeadlineDelegation({ backend, workspacePath, worktreeRoot, spec }),
+      operatorRecoveryApproved: (owner) => quarantineRecoveryApproved(lockKey, owner),
+      onAcquired: () => clearQuarantineRecoveryApproval(lockKey),
+      isUnavailable: async () => {
+        observedQuarantine = await readWorkspaceQuarantine(lockKey);
+        return quarantinedWorkspaces.has(lockKey) || Boolean(observedQuarantine);
+      },
+      onUnavailable: () => quarantinedDelegation(
+        { backend, workspacePath, worktreeRoot, spec }, observedQuarantine,
+      ),
+    });
+  } finally {
+    await repositoryAccess.close().catch(() => {});
+  }
 }
 
 function textResult(header, obj) {
@@ -1799,6 +2351,7 @@ function jsonRpcError(id, code, message) { return { jsonrpc: "2.0", id, error: {
 // In-flight cancellable tool requests, keyed by the original JSON-RPC id type,
 // so notifications/cancelled can interrupt workers, lock waits, and snapshots.
 const activeRequests = new Map();
+let shutdownRequested = false;
 
 function trackActiveRequest(id, cancel) {
   let resolveDone;
@@ -1824,17 +2377,24 @@ async function terminateActiveRequests(reason = "shutdown") {
   await Promise.allSettled(entries.map((entry) => entry.done));
 }
 
-function installShutdownHandlers(stdin) {
-  let shuttingDown = false;
+function installShutdownHandlers(stdin, stdout = process.stdout) {
   const shutdown = (exitCode) => {
-    if (shuttingDown) return;
-    shuttingDown = true;
+    if (shutdownRequested) return;
+    // Close the dispatch gate before snapshotting activeRequests. Otherwise a
+    // request arriving while termination is in progress would not be included
+    // in the awaited snapshot and process.exit could skip its lease cleanup.
+    shutdownRequested = true;
+    stdin.pause?.();
     void terminateActiveRequests().finally(() => process.exit(exitCode));
   };
   process.once("SIGTERM", () => shutdown(0));
   process.once("SIGINT", () => shutdown(130));
   stdin.once("end", () => shutdown(0));
   stdin.once("close", () => shutdown(0));
+  // A disconnected MCP host turns the next response write into EPIPE. Treat
+  // that as the same awaited shutdown as stdin closure so active workers are
+  // terminated and their lease finalizers finish before this process exits.
+  stdout.once("error", () => shutdown(1));
   // Last-chance best effort. On POSIX, controller.terminate signals the
   // detached process group synchronously before its first await.
   process.once("exit", () => {
@@ -1898,12 +2458,29 @@ async function handleMessage(message) {
           }
         }
         if (params.name === "workspace_status") {
+          if (!supportsReliableProcessContainment()) {
+            const out = {
+              ok: false,
+              error: "workspace_status is unsupported on " + RUNTIME_PLATFORM +
+                ": reliable Git helper containment is available only on Windows and Linux",
+              cancelled: false,
+              workspacePath: typeof args.workspacePath === "string" ? args.workspacePath : "",
+              worktreeRoot: "",
+              git: null,
+            };
+            return jsonRpcResult(message.id, {
+              content: [{ type: "text", text: textResult("Workspace Status", out) }],
+              structuredContent: out,
+              isError: true,
+            });
+          }
           const cancel = createCancellation();
           const finishRequest = trackActiveRequest(message.id, cancel);
           let workspacePath = "";
           let worktreeRoot = "";
           let gitCommonDir = "";
           let lockStoreRoot = "";
+          let repositoryAccess = null;
           try {
             workspacePath = await validateWorkspace(args.workspacePath, { cancel });
             if (cancel.cancelled) return cancelledWorkspaceStatus(message.id, { workspacePath });
@@ -1912,7 +2489,10 @@ async function handleMessage(message) {
               if (cancel.cancelled) return cancelledWorkspaceStatus(message.id, { workspacePath });
               worktreeRoot = await gitWorktreeRoot(workspacePath, { cancel });
               gitCommonDir = await gitCommonDirectory(workspacePath, { cancel });
-              lockStoreRoot = await ensureWorkspaceLockStore(gitCommonDir, { cancel });
+              repositoryAccess = await openRepositoryAccess(gitCommonDir, { cancel });
+              const lockStore = await ensureWorkspaceLockStore(repositoryAccess.commonDir, { cancel });
+              lockStoreRoot = lockStore.root;
+              repositoryAccess.key = repositoryLockKey(gitCommonDir, lockStore.repositoryId);
             } catch (error) {
               if (error instanceof OperationCancelledError) {
                 return cancelledWorkspaceStatus(message.id, { workspacePath, worktreeRoot });
@@ -1920,7 +2500,7 @@ async function handleMessage(message) {
               throw error;
             }
             if (cancel.cancelled) return cancelledWorkspaceStatus(message.id, { workspacePath, worktreeRoot });
-            const lockKey = repositoryLockKey(gitCommonDir);
+            const lockKey = repositoryAccess.key;
             const existingQuarantine = await readWorkspaceQuarantine(lockKey);
             if (quarantinedWorkspaces.has(lockKey) || existingQuarantine) {
               return quarantinedWorkspaceStatus(
@@ -1928,15 +2508,30 @@ async function handleMessage(message) {
               );
             }
             let observedQuarantine = null;
-            return await withWorkspaceLock(lockKey, lockStoreRoot, async () => {
+            return await withWorkspaceLock(lockKey, lockStoreRoot, async (workspaceLease) => {
               const sharedQuarantine = await readWorkspaceQuarantine(lockKey);
               if (quarantinedWorkspaces.has(lockKey) || sharedQuarantine) {
                 return quarantinedWorkspaceStatus(
                   message.id, { workspacePath, worktreeRoot }, sharedQuarantine,
                 );
               }
+              let gitProcessQuarantine = null;
+              const quarantineGitProcessTree = async ({ label, terminationError }) => {
+                gitProcessQuarantine ??= await quarantineLeaseForProcessTree({
+                  lockKey,
+                  workspaceLease,
+                  backend: label,
+                  workspacePath,
+                  worktreeRoot,
+                  terminationError,
+                });
+                return gitProcessQuarantine;
+              };
               try {
-                const git = await gitSnapshot(worktreeRoot, { cancel });
+                const git = await gitSnapshot(worktreeRoot, {
+                  cancel, ownLockRef: workspaceLease.ref, lockStoreRoot,
+                  onUnconfirmedProcessTree: quarantineGitProcessTree,
+                });
                 if (cancel.cancelled) {
                   return cancelledWorkspaceStatus(message.id, { workspacePath, worktreeRoot });
                 }
@@ -1945,6 +2540,11 @@ async function handleMessage(message) {
                   structuredContent: { ok: true, workspacePath, worktreeRoot, git },
                 });
               } catch (error) {
+                if (error instanceof GitProcessTreeUnconfirmedError) {
+                  return quarantinedWorkspaceStatus(
+                    message.id, { workspacePath, worktreeRoot }, error.quarantine,
+                  );
+                }
                 if (error instanceof OperationCancelledError) {
                   return cancelledWorkspaceStatus(message.id, { workspacePath, worktreeRoot });
                 }
@@ -1953,7 +2553,8 @@ async function handleMessage(message) {
             }, {
               cancel,
               onCancelled: () => cancelledWorkspaceStatus(message.id, { workspacePath, worktreeRoot }),
-              operatorCleared: () => quarantineFileAbsent(lockKey),
+              operatorRecoveryApproved: (owner) => quarantineRecoveryApproved(lockKey, owner),
+              onAcquired: () => clearQuarantineRecoveryApproval(lockKey),
               isUnavailable: async () => {
                 observedQuarantine = await readWorkspaceQuarantine(lockKey);
                 return quarantinedWorkspaces.has(lockKey) || Boolean(observedQuarantine);
@@ -1963,6 +2564,7 @@ async function handleMessage(message) {
               ),
             });
           } finally {
+            await repositoryAccess?.close().catch(() => {});
             finishRequest();
           }
         }
@@ -1994,9 +2596,14 @@ function startStdioServer({ stdin = process.stdin, stdout = process.stdout } = {
   stdin.setEncoding("utf8");
   let buffer = "";
   stdin.on("data", (chunk) => {
+    if (shutdownRequested) return;
     buffer += chunk;
     let newlineIndex = buffer.indexOf("\n");
     while (newlineIndex !== -1) {
+      if (shutdownRequested) {
+        buffer = "";
+        break;
+      }
       const line = buffer.slice(0, newlineIndex).trim();
       buffer = buffer.slice(newlineIndex + 1);
       newlineIndex = buffer.indexOf("\n");
@@ -2019,5 +2626,5 @@ function startStdioServer({ stdin = process.stdin, stdout = process.stdout } = {
 
 if (process.argv[1] && process.argv[1] === fileURLToPath(import.meta.url)) {
   startStdioServer();
-  installShutdownHandlers(process.stdin);
+  installShutdownHandlers(process.stdin, process.stdout);
 }

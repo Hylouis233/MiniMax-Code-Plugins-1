@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { access, chmod, copyFile, mkdir, mkdtemp, readFile, realpath, rm, symlink, unlink, writeFile } from "node:fs/promises";
+import { access, chmod, copyFile, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
@@ -9,7 +9,12 @@ import test from "node:test";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 
-import { workspaceLockRef } from "../workspace-lock.mjs";
+import {
+  localHostIdentity, WORKSPACE_LOCK_REF_PREFIX, workspaceLockRef,
+} from "../workspace-lock.mjs";
+import {
+  closestExistingBase, populateCommitishCache, runCommand, runGitCommand,
+} from "../server.mjs";
 
 const execFileAsync = promisify(execFile);
 const testsRoot = path.dirname(fileURLToPath(import.meta.url));
@@ -17,6 +22,623 @@ const pluginRoot = path.resolve(testsRoot, "..");
 const serverPath = path.join(pluginRoot, "server.mjs");
 const fakeBackendPath = path.join(testsRoot, "fake-backend.mjs");
 const requestKey = (id) => typeof id + ":" + String(id);
+
+function unconfirmedGitResult(overrides = {}) {
+  return {
+    stdout: "", stderr: "", exitCode: null, timedOut: false, killed: true,
+    orphanedProcesses: true, treeTerminated: false,
+    terminationError: "fixture descendants remain uncertain",
+    errorMessage: "", spawnError: null,
+    stdoutTruncated: false, stderrTruncated: false,
+    ...overrides,
+  };
+}
+
+test("Git interruption never outruns unconfirmed descendant quarantine", async () => {
+  const cancelled = { cancelled: false, controller: null };
+  const cancelledResult = await runGitCommand(["version"], {
+    cwd: pluginRoot,
+    cancel: cancelled,
+    containProcessTree: true,
+    commandRunner: async () => {
+      cancelled.cancelled = true;
+      return unconfirmedGitResult();
+    },
+  });
+  assert.equal(cancelledResult.treeTerminated, false,
+    "the snapshot caller must receive the unsafe cleanup result before cancellation is reported");
+
+  const deadline = Date.now() + 40;
+  const deadlineResult = await runGitCommand(["version"], {
+    cwd: pluginRoot,
+    deadline,
+    containProcessTree: true,
+    commandRunner: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      return unconfirmedGitResult({ timedOut: true });
+    },
+  });
+  assert.equal(deadlineResult.treeTerminated, false,
+    "the snapshot caller must receive the unsafe cleanup result before the deadline is reported");
+});
+
+test("committed-delta baseline preparation uses bounded batch queries", async () => {
+  const target = "a".repeat(40);
+  const boundary = "b".repeat(40);
+  const baselines = Array.from({ length: 1_000 }, (_, index) =>
+    index.toString(16).padStart(40, "0"));
+  const invocations = [];
+  const cache = new Map();
+  await populateCommitishCache(pluginRoot, baselines, cache, {
+    commandRunner: async (_command, args, options) => {
+      invocations.push({ args, stdinText: options.stdinText });
+      const stdout = options.stdinText.trim().split("\n").map((revision) =>
+        revision.replace(/\^\{commit\}$/u, "") + " commit").join("\n") + "\n";
+      return {
+        ...unconfirmedGitResult(), stdout, exitCode: 0, killed: false,
+        orphanedProcesses: false, treeTerminated: true, terminationError: "",
+      };
+    },
+  });
+  assert.equal(cache.size, baselines.length);
+  assert.equal(invocations.length, 1, "ref count must not determine cat-file process count");
+
+  const selected = await closestExistingBase(pluginRoot, target, baselines, {
+    commandRunner: async (_command, args, options) => {
+      invocations.push({ args, stdinText: options.stdinText });
+      return {
+        ...unconfirmedGitResult(),
+        stdout: target + "\n-" + boundary + "\n",
+        exitCode: 0,
+        killed: false,
+        orphanedProcesses: false,
+        treeTerminated: true,
+        terminationError: "",
+      };
+    },
+  });
+  assert.equal(selected, boundary);
+  assert.equal(invocations.length, 2, "baseline selection must add only one graph process");
+  assert.equal(invocations[1].stdinText.trim().split("\n").length, baselines.length);
+  assert.ok(invocations[1].args.includes("--boundary"));
+});
+
+test("post-exit process-tree inspection failures settle fail-closed", async () => {
+  const result = await runCommand(process.execPath, ["-e", ""], {
+    manageProcessTree: true,
+    processTreeTestMode: true,
+    timeoutMs: 5_000,
+    initializeProcessTree: async () => {},
+    inspectProcessTree: async () => { throw new Error("inspection unavailable"); },
+  });
+  assert.equal(result.treeTerminated, false);
+  assert.match(result.terminationError, /process-tree inspection failed: inspection unavailable/iu);
+});
+
+test("post-exit inspection waits for an in-flight ancestry refresh", async () => {
+  let refreshStartedResolve;
+  let releaseRefresh;
+  const refreshStarted = new Promise((resolve) => { refreshStartedResolve = resolve; });
+  const refreshGate = new Promise((resolve) => { releaseRefresh = resolve; });
+  let inspectedAfterRefresh = false;
+  let resolved = false;
+  const pending = runCommand(process.execPath, ["-e", "setTimeout(()=>{},1300)"], {
+    manageProcessTree: true,
+    processTreeTestMode: true,
+    timeoutMs: 5_000,
+    initializeProcessTree: async () => {},
+    refreshProcessTree: async (_child, state) => {
+      refreshStartedResolve();
+      await refreshGate;
+      state.completedRefresh = true;
+    },
+    inspectProcessTree: async (_child, state) => {
+      inspectedAfterRefresh = state.completedRefresh === true;
+      return false;
+    },
+  });
+  void pending.then(() => { resolved = true; });
+  await refreshStarted;
+  await new Promise((resolve) => setTimeout(resolve, 1_500));
+  assert.equal(resolved, false, "close must not settle ahead of the active ancestry refresh");
+  releaseRefresh();
+  const result = await pending;
+  assert.equal(result.treeTerminated, true);
+  assert.equal(inspectedAfterRefresh, true);
+});
+
+test("runner exit starts tree cleanup before escaped descendants close inherited streams", {
+  skip: process.platform === "win32" ? "POSIX process-group fixture" : false,
+}, async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "cli-agent-exit-before-close-test-"));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const pidFile = path.join(root, "escaped.pid");
+  let escapedPid = null;
+  context.after(() => {
+    if (Number.isInteger(escapedPid)) {
+      try { process.kill(escapedPid, "SIGKILL"); } catch { /* already gone */ }
+    }
+  });
+  const parentCode = [
+    "const {spawn}=require('node:child_process')",
+    "const fs=require('node:fs')",
+    "const child=spawn(process.execPath,['-e','setTimeout(()=>{},20000)']," +
+      "{detached:true,stdio:['ignore',process.stdout,process.stderr]})",
+    `fs.writeFileSync(${JSON.stringify(pidFile)},String(child.pid))`,
+    "child.unref()",
+  ].join(";");
+  const startedAt = Date.now();
+  const result = await runCommand(process.execPath, ["-e", parentCode], {
+    cwd: root,
+    manageProcessTree: true,
+    timeoutMs: 3_000,
+    initializeProcessTree: async () => {},
+    refreshProcessTree: async () => {},
+    inspectProcessTree: async () => {
+      escapedPid = Number(await readFile(pidFile, "utf8"));
+      return true;
+    },
+    signalProcessTree: async (_child, signal) => {
+      if (Number.isInteger(escapedPid)) {
+        try { process.kill(escapedPid, signal); } catch { /* already gone */ }
+      }
+    },
+    waitForProcessTreeExit: async () => true,
+  });
+  assert.equal(result.timedOut, false, JSON.stringify(result));
+  assert.equal(result.orphanedProcesses, true);
+  assert.ok(Date.now() - startedAt < 2_500,
+    "tree inspection must start on exit instead of waiting for descendant-held stream handles");
+});
+
+test("stream draining cannot finalize ahead of termination started after exit", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "cli-agent-drain-termination-race-test-"));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const pidFile = path.join(root, "stream-holder.pid");
+  let escapedPid = null;
+  let controller;
+  let signalStartedResolve;
+  let releaseSignal;
+  const signalStarted = new Promise((resolve) => { signalStartedResolve = resolve; });
+  const signalGate = new Promise((resolve) => { releaseSignal = resolve; });
+  context.after(() => {
+    if (Number.isInteger(escapedPid)) {
+      try { process.kill(escapedPid, "SIGKILL"); } catch { /* already gone */ }
+    }
+  });
+  const parentCode = [
+    "const {spawn}=require('node:child_process')",
+    "const fs=require('node:fs')",
+    "const child=spawn(process.execPath,['-e','setTimeout(()=>{},20000)']," +
+      "{detached:true,stdio:['ignore',process.stdout,process.stderr]})",
+    `fs.writeFileSync(${JSON.stringify(pidFile)},String(child.pid))`,
+    "child.unref()",
+  ].join(";");
+  let resolved = false;
+  const pending = runCommand(process.execPath, ["-e", parentCode], {
+    cwd: root,
+    manageProcessTree: true,
+    processTreeTestMode: true,
+    timeoutMs: 5_000,
+    killGraceMs: 250,
+    streamDrainMs: 250,
+    initializeProcessTree: async () => {},
+    refreshProcessTree: async () => {},
+    inspectProcessTree: async () => false,
+    signalProcessTree: async (_child, signal) => {
+      signalStartedResolve();
+      await signalGate;
+      if (Number.isInteger(escapedPid)) {
+        try { process.kill(escapedPid, signal); } catch { /* already gone */ }
+      }
+    },
+    waitForProcessTreeExit: async () => true,
+    onChild: (value) => { controller = value; },
+  });
+  void pending.then(() => { resolved = true; });
+  await waitFor(async () => {
+    try { escapedPid = Number(await readFile(pidFile, "utf8")); return true; } catch { return false; }
+  });
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  const terminating = controller.terminate("cancelled");
+  await signalStarted;
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(resolved, false, "stream timeout must still wait for active termination cleanup");
+  releaseSignal();
+  const result = await pending;
+  await terminating;
+  assert.equal(result.timedOut, false);
+  await waitFor(async () => {
+    try {
+      if (process.platform === "linux") {
+        const statLine = await readFile("/proc/" + String(escapedPid) + "/stat", "utf8");
+        const state = statLine.slice(statLine.lastIndexOf(")") + 1).trim().split(/\s+/u)[0];
+        return ["Z", "X", "x"].includes(state);
+      }
+      process.kill(escapedPid, 0);
+      return false;
+    } catch { return true; }
+  });
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  escapedPid = null;
+});
+
+test("post-exit inspection cannot settle ahead of concurrent termination", async () => {
+  let controller;
+  let inspectionStartedResolve;
+  let releaseInspection;
+  let signalStartedResolve;
+  let releaseSignal;
+  const inspectionStarted = new Promise((resolve) => { inspectionStartedResolve = resolve; });
+  const inspectionGate = new Promise((resolve) => { releaseInspection = resolve; });
+  const signalStarted = new Promise((resolve) => { signalStartedResolve = resolve; });
+  const signalGate = new Promise((resolve) => { releaseSignal = resolve; });
+  let resolved = false;
+  const pending = runCommand(process.execPath, ["-e", ""], {
+    manageProcessTree: true,
+    processTreeTestMode: true,
+    timeoutMs: 5_000,
+    initializeProcessTree: async () => {},
+    refreshProcessTree: async () => {},
+    inspectProcessTree: async () => {
+      inspectionStartedResolve();
+      await inspectionGate;
+      return false;
+    },
+    signalProcessTree: async () => {
+      signalStartedResolve();
+      await signalGate;
+    },
+    waitForProcessTreeExit: async () => true,
+    onChild: (value) => { controller = value; },
+  });
+  void pending.then(() => { resolved = true; });
+  await inspectionStarted;
+  const terminating = controller.terminate("test-race");
+  await signalStarted;
+  releaseInspection();
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(resolved, false, "close must await termination started during inspection");
+  releaseSignal();
+  const result = await pending;
+  await terminating;
+  assert.equal(result.treeTerminated, true);
+});
+
+test("cancellation published with the controller waits for tree initialization", async () => {
+  let cancellationChecks = 0;
+  let releaseInitialization;
+  let signalStarted = false;
+  const initializationGate = new Promise((resolve) => { releaseInitialization = resolve; });
+  const pending = runCommand(process.execPath, ["-e", "process.exit(99)"], {
+    manageProcessTree: true,
+    processTreeTestMode: true,
+    timeoutMs: 5_000,
+    shouldCancel: () => {
+      cancellationChecks += 1;
+      return cancellationChecks >= 2;
+    },
+    initializeProcessTree: async () => { await initializationGate; },
+    signalProcessTree: async (child) => {
+      signalStarted = true;
+      try { child.kill("SIGKILL"); } catch { /* already gone */ }
+    },
+    waitForProcessTreeExit: async () => true,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(signalStarted, false, "termination must not outrun startup identity capture");
+  releaseInitialization();
+  const result = await pending;
+  assert.equal(signalStarted, true);
+  assert.equal(result.timedOut, false);
+});
+
+test("the first termination reason remains authoritative", async () => {
+  let controller;
+  const pending = runCommand(process.execPath, ["-e", "setTimeout(()=>{},5000)"], {
+    manageProcessTree: true,
+    processTreeTestMode: true,
+    timeoutMs: 5_000,
+    killGraceMs: 250,
+    initializeProcessTree: async () => {},
+    signalProcessTree: async (child, signal) => {
+      try { child.kill(signal); } catch { /* already gone */ }
+    },
+    waitForProcessTreeExit: async () => true,
+    onChild: (value) => { controller = value; },
+  });
+  assert.ok(controller);
+  const cancelled = controller.terminate("cancelled");
+  const sameTermination = controller.terminate("timeout");
+  assert.equal(cancelled, sameTermination);
+  const result = await pending;
+  await cancelled;
+  assert.equal(result.timedOut, false,
+    "a later timer must not relabel an already-started cancellation as a timeout");
+});
+
+test("process-tree refresh uncertainty is sticky and cleanup waits are bounded", async () => {
+  let refreshStarted = false;
+  const result = await runCommand(process.execPath, ["-e", "setTimeout(()=>{},400)"], {
+    manageProcessTree: true,
+    processTreeTestMode: true,
+    timeoutMs: 3_000,
+    killGraceMs: 250,
+    processTreeInspectionWaitMs: 50,
+    streamDrainMs: 50,
+    initializeProcessTree: async () => {},
+    refreshProcessTree: async () => {
+      refreshStarted = true;
+      await new Promise(() => {});
+    },
+    signalProcessTree: async () => {},
+    waitForProcessTreeExit: async () => true,
+    inspectProcessTree: async () => false,
+  });
+  assert.equal(refreshStarted, true);
+  assert.equal(result.treeTerminated, false);
+  assert.match(result.terminationError, /process-tree refresh did not finish/iu);
+});
+
+test("a post-spawn child error cannot finalize ahead of termination cleanup", async () => {
+  let signalStartedResolve;
+  let releaseSignal;
+  const signalStarted = new Promise((resolve) => { signalStartedResolve = resolve; });
+  const signalGate = new Promise((resolve) => { releaseSignal = resolve; });
+  let resolved = false;
+  const pending = runCommand(process.execPath, ["-e", "setTimeout(()=>{},5000)"], {
+    manageProcessTree: true,
+    processTreeTestMode: true,
+    timeoutMs: 5_000,
+    killGraceMs: 250,
+    initializeProcessTree: async () => {},
+    signalProcessTree: async (child, signal) => {
+      signalStartedResolve();
+      await signalGate;
+      try { child.kill(signal); } catch { /* already gone */ }
+    },
+    waitForProcessTreeExit: async () => true,
+    onChild: ({ child }) => {
+      setImmediate(() => {
+        const error = new Error("fixture post-spawn failure");
+        error.code = "EIO";
+        child.emit("error", error);
+      });
+    },
+  });
+  void pending.then(() => { resolved = true; });
+  await signalStarted;
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(resolved, false);
+  releaseSignal();
+  const result = await pending;
+  assert.equal(result.treeTerminated, false);
+  assert.equal(result.spawnError, null,
+    "a runtime child error must never be mistaken for a pre-spawn failure and retried");
+  assert.match(result.terminationError, /backend process error after spawn/iu);
+});
+
+test("a controller cannot terminate again after runCommand settles", async () => {
+  let controller;
+  let signals = 0;
+  const result = await runCommand(process.execPath, ["-e", ""], {
+    manageProcessTree: true,
+    processTreeTestMode: true,
+    timeoutMs: 5_000,
+    initializeProcessTree: async () => {},
+    inspectProcessTree: async () => false,
+    signalProcessTree: async () => { signals += 1; },
+    waitForProcessTreeExit: async () => true,
+    onChild: (value) => { controller = value; },
+  });
+  assert.equal(result.treeTerminated, true);
+  assert.equal(signals, 0);
+  await controller.terminate("late-ownership-loss");
+  assert.equal(signals, 0, "a settled controller must never signal a reused numeric process id");
+});
+
+test("Windows Job runner contains launch and preserves backend streams and exit code", {
+  skip: process.platform !== "win32",
+}, async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "cli-agent-job-runner-test-"));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const backend = path.join(root, "backend-fixture.cmd");
+  await writeFile(path.join(root, "powershell.exe"), "workspace shadow must not execute\n");
+  await writeFile(backend, [
+    "@echo off",
+    "echo job-stdout-ok",
+    "echo job-stderr-ok 1>&2",
+    "exit /b 37",
+    "",
+  ].join("\r\n"));
+  const result = await runCommand(backend, [], {
+    cwd: root, manageProcessTree: true, timeoutMs: 5_000,
+  });
+  assert.equal(result.exitCode, 37, JSON.stringify(result));
+  assert.match(result.stdout, /job-stdout-ok/u);
+  assert.match(result.stderr, /job-stderr-ok/u);
+  assert.equal(result.treeTerminated, true);
+
+  const exactArgument = "任务 \"quoted\" % (x) & caret^";
+  const exact = await runCommand(process.execPath, [
+    "-e", "process.stdout.write(process.argv[1])", exactArgument,
+  ], { cwd: root, manageProcessTree: true, timeoutMs: 5_000 });
+  assert.equal(exact.exitCode, 0, JSON.stringify(exact));
+  assert.equal(exact.stdout, exactArgument,
+    "the PowerShell containment layer must preserve UTF-8 and option-like task text exactly");
+
+  const scriptBackend = path.join(root, "echo-argument.ps1");
+  await writeFile(scriptBackend, [
+    "param([string]$Value)",
+    "[Console]::Out.Write($Value)",
+    "",
+  ].join("\r\n"));
+  const fallbackExact = await runCommand(scriptBackend, [exactArgument], {
+    cwd: root, manageProcessTree: true, timeoutMs: 5_000,
+  });
+  assert.equal(fallbackExact.exitCode, 0, JSON.stringify(fallbackExact));
+  assert.equal(fallbackExact.stdout, exactArgument,
+    "the contained PowerShell shim fallback must preserve the same argument bytes");
+
+  const argvFixture = path.join(root, "node_modules", "fixture", "argv-fixture.mjs");
+  const cmdShim = path.join(root, "npm-style-shim.cmd");
+  await mkdir(path.dirname(argvFixture), { recursive: true });
+  await writeFile(argvFixture,
+    "process.stdout.write(JSON.stringify(process.argv.slice(2)));\n");
+  await writeFile(cmdShim, [
+    "@ECHO off",
+    "GOTO start",
+    ":find_dp0",
+    "SET dp0=%~dp0",
+    "EXIT /b",
+    ":start",
+    "SETLOCAL",
+    "CALL :find_dp0",
+    "",
+    "IF EXIST \"%dp0%\\node.exe\" (",
+    "  SET \"_prog=%dp0%\\node.exe\"",
+    ") ELSE (",
+    "  SET \"_prog=node\"",
+    "  SET PATHEXT=%PATHEXT:;.JS;=;%",
+    ")",
+    "",
+    "endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & " +
+      "\"%_prog%\" \"%dp0%\\node_modules\\fixture\\argv-fixture.mjs\" %*",
+    "",
+  ].join("\r\n"));
+  const exactArguments = [
+    "", " ", exactArgument, "tail\\", "two\\\\", "line1\nline2", "crlf1\r\ncrlf2", "汉🙂",
+  ];
+  const shimExact = await runCommand(cmdShim, exactArguments, {
+    cwd: root, manageProcessTree: true, timeoutMs: 5_000,
+  });
+  assert.equal(shimExact.exitCode, 0, JSON.stringify(shimExact));
+  assert.deepEqual(JSON.parse(shimExact.stdout), exactArguments,
+    "the final Node process behind an npm-style .cmd shim must receive exact argv values");
+
+  const customCmd = await runCommand(backend, [exactArgument], {
+    cwd: root, manageProcessTree: true, timeoutMs: 5_000,
+  });
+  assert.equal(customCmd.exitCode, 127, JSON.stringify(customCmd));
+  assert.match(customCmd.stderr, /non-standard \.cmd\/\.bat backend/iu);
+
+  const errorBackend = path.join(root, "stderr-and-exit.ps1");
+  await writeFile(errorBackend, [
+    "Write-Error 'fixture-nonterminating-error'",
+    "exit 37",
+    "",
+  ].join("\r\n"));
+  const errorResult = await runCommand(errorBackend, [], {
+    cwd: root, manageProcessTree: true, timeoutMs: 5_000,
+  });
+  assert.equal(errorResult.exitCode, 37, JSON.stringify(errorResult));
+  assert.match(errorResult.stderr, /fixture-nonterminating-error/iu);
+
+  const handledNativeFailure = path.join(root, "handled-native-failure.ps1");
+  await writeFile(handledNativeFailure, [
+    "& $env:ComSpec /d /c 'exit 23' | Out-Null",
+    "[Console]::Out.Write('handled')",
+    "",
+  ].join("\r\n"));
+  const handledResult = await runCommand(handledNativeFailure, [], {
+    cwd: root, manageProcessTree: true, timeoutMs: 5_000,
+  });
+  assert.equal(handledResult.exitCode, 0, JSON.stringify(handledResult));
+  assert.equal(handledResult.stdout, "handled",
+    "a stale LASTEXITCODE must not override normal PowerShell script completion");
+
+  const throwingBackend = path.join(root, "throwing-backend.ps1");
+  await writeFile(throwingBackend, "throw 'fixture-terminating-error'\r\n");
+  const throwingResult = await runCommand(throwingBackend, [], {
+    cwd: root, manageProcessTree: true, timeoutMs: 5_000,
+  });
+  assert.equal(throwingResult.exitCode, 127, JSON.stringify(throwingResult));
+  assert.match(throwingResult.stderr, /fixture-terminating-error/iu);
+
+  const invalidMarker = path.join(root, "invalid-argv-started.txt");
+  const invalidArgument = await runCommand(process.execPath, [
+    "-e", `require('node:fs').writeFileSync(${JSON.stringify(invalidMarker)}, 'started')`,
+    "A\0B", "tail",
+  ], { cwd: root, manageProcessTree: true, timeoutMs: 5_000 });
+  assert.equal(invalidArgument.exitCode, 127, JSON.stringify(invalidArgument));
+  assert.match(invalidArgument.stderr, /invalid process-tree runner command/iu);
+  await assert.rejects(access(invalidMarker), /ENOENT/u);
+
+  const earlyExit = await runCommand(process.execPath, ["-e", "process.exit(0)"], {
+    cwd: root, manageProcessTree: true, stdinText: "x".repeat(1_000_000), timeoutMs: 5_000,
+  });
+  assert.equal(earlyExit.exitCode, 0, JSON.stringify(earlyExit));
+
+  const source = await readFile(path.join(pluginRoot, "windows-job-runner.ps1"), "utf8");
+  const containmentReady = source.indexOf(
+    "$jobHandle = [CliAgentBridgeJobObject]::CreateKillOnCloseJobForCurrentProcess()",
+  );
+  const payloadRead = source.indexOf("[Console]::In.ReadToEnd()");
+  const backendLaunch = source.indexOf("& $NodeExecutable $NodeRunner");
+  assert.ok(containmentReady >= 0 && containmentReady < payloadRead && payloadRead < backendLaunch,
+    "Job containment must be live before the payload can launch a backend");
+});
+
+test("a failed Windows containment runner never falls back to the backend", {
+  skip: process.platform !== "win32",
+}, async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "cli-agent-job-failure-test-"));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const marker = path.join(root, "backend-started.txt");
+  const backend = path.join(root, "must-not-start.cmd");
+  await writeFile(backend, `@echo started>${marker}\r\n`);
+  const failedRunner = path.join(root, "failed-job-runner.ps1");
+  await writeFile(failedRunner, [
+    "param([string]$NodeExecutable, [string]$NodeRunner)",
+    "$null = [Console]::In.ReadToEnd()",
+    "[Console]::Error.WriteLine('job-object initialization failed: fixture')",
+    "exit 125",
+    "",
+  ].join("\r\n"));
+  const result = await runCommand(backend, [], {
+    cwd: root,
+    manageProcessTree: true,
+    windowsJobRunnerPath: failedRunner,
+    timeoutMs: 5_000,
+  });
+  assert.equal(result.exitCode, 125, JSON.stringify(result));
+  assert.match(result.stderr, /job-object initialization failed/iu);
+  await assert.rejects(access(marker), /ENOENT/u);
+
+  const missingRunner = await runCommand(process.execPath, [
+    "-e", "process.exit(0)", "x".repeat(2_000_000),
+  ], {
+    cwd: root,
+    manageProcessTree: true,
+    windowsJobRunnerPath: path.join(root, "missing-job-runner.ps1"),
+    timeoutMs: 5_000,
+  });
+  assert.notEqual(missingRunner.exitCode, 0,
+    "a bootstrap failure with a large pending payload must resolve without crashing the bridge");
+});
+
+test("cancellation in the spawn-to-controller window never launches the backend", {
+  skip: process.platform !== "win32",
+}, async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "cli-agent-cancel-window-test-"));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const marker = path.join(root, "must-not-start.txt");
+  let checks = 0;
+  const result = await runCommand(process.execPath, [
+    "-e", `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'started')`,
+  ], {
+    cwd: root,
+    manageProcessTree: true,
+    timeoutMs: 5_000,
+    shouldCancel: () => {
+      checks += 1;
+      return checks >= 2;
+    },
+  });
+  assert.equal(result.timedOut, false, JSON.stringify(result));
+  assert.equal(result.treeTerminated, true, JSON.stringify(result));
+  await assert.rejects(access(marker), /ENOENT/u);
+});
 
 function currentUserLockRoot() {
   const user = os.userInfo();
@@ -36,14 +658,24 @@ async function coordinationLockStore(workspace) {
   return path.join(await canonicalGitCommonDirectory(workspace), "cli-agent-bridge-lock-store.git");
 }
 
-function repositoryStatePaths(canonicalGitCommonDir) {
-  const normalized = path.normalize(canonicalGitCommonDir);
-  const key = "git-common-dir:" + normalized;
+async function repositoryKey(canonicalGitCommonDir) {
+  if (process.platform === "linux") {
+    const repositoryId = (await readFile(path.join(
+      canonicalGitCommonDir, "cli-agent-bridge-lock-store.git", "cli-agent-bridge-repository-id",
+    ), "utf8")).trim();
+    return "git-common-dir-id:" + repositoryId;
+  }
+  return "git-common-dir:" + path.normalize(canonicalGitCommonDir);
+}
+
+async function repositoryStatePaths(canonicalGitCommonDir) {
+  const key = await repositoryKey(canonicalGitCommonDir);
   const digest = createHash("sha256").update(key).digest("hex");
   const root = currentUserLockRoot();
   return {
     root,
     quarantinePath: path.join(root, digest + ".quarantine"),
+    recoveryPath: path.join(root, digest + ".quarantine.recovery-approved"),
   };
 }
 
@@ -127,14 +759,7 @@ async function makeHarness(context, { unborn = false } = {}) {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), "cli-agent-bridge-test-"));
   const workspace = path.join(tempRoot, "workspace");
   await mkdir(workspace);
-  await execFileAsync("git", ["init", "-b", "main"], { cwd: workspace });
-  await execFileAsync("git", ["config", "user.name", "Bridge Test"], { cwd: workspace });
-  await execFileAsync("git", ["config", "user.email", "bridge-test@example.invalid"], { cwd: workspace });
-  if (!unborn) {
-    await writeFile(path.join(workspace, "baseline.txt"), "baseline\n");
-    await execFileAsync("git", ["add", "baseline.txt"], { cwd: workspace });
-    await execFileAsync("git", ["commit", "-m", "baseline"], { cwd: workspace });
-  }
+  await initializeFixtureRepository(workspace, { unborn });
   const configPath = path.join(tempRoot, "backends.json");
   await writeFile(configPath, JSON.stringify({
     backends: {
@@ -154,6 +779,17 @@ async function makeHarness(context, { unborn = false } = {}) {
     await rm(tempRoot, { recursive: true, force: true });
   });
   return { tempRoot, workspace, configPath, client };
+}
+
+async function initializeFixtureRepository(workspace, { unborn = false } = {}) {
+  await execFileAsync("git", ["init", "-b", "main"], { cwd: workspace });
+  await execFileAsync("git", ["config", "user.name", "Bridge Test"], { cwd: workspace });
+  await execFileAsync("git", ["config", "user.email", "bridge-test@example.invalid"], { cwd: workspace });
+  if (!unborn) {
+    await writeFile(path.join(workspace, "baseline.txt"), "baseline\n");
+    await execFileAsync("git", ["add", "baseline.txt"], { cwd: workspace });
+    await execFileAsync("git", ["commit", "-m", "baseline"], { cwd: workspace });
+  }
 }
 
 function taskArguments(workspacePath, spec, extra = {}) {
@@ -192,6 +828,85 @@ test("Codex templates delimit option-looking task text", async () => {
   const source = await readFile(serverPath, "utf8");
   assert.match(source, /buildArgs: \["exec", "--", "<task>"\]/u);
   assert.match(source, /resumeArgs: \["exec", "resume", "<session>", "--", "<task>"\]/u);
+});
+
+test("unsupported POSIX platforms fail before probing Git or a backend", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "cli-agent-unsupported-platform-test-"));
+  const workspace = path.join(root, "workspace");
+  const marker = path.join(workspace, "backend-started.txt");
+  const sentinel = path.join(workspace, "sentinel.txt");
+  const configPath = path.join(root, "backends.json");
+  await mkdir(workspace);
+  await writeFile(sentinel, "unchanged\n");
+  await writeFile(configPath, JSON.stringify({
+    backends: {
+      fake: {
+        label: "Fake backend",
+        command: process.execPath,
+        buildArgs: ["-e", `require('node:fs').writeFileSync(${JSON.stringify(marker)},'started')`],
+        resumeArgs: null,
+      },
+    },
+  }));
+  const client = new McpClient(configPath, {
+    NODE_ENV: "test", CLI_AGENT_BRIDGE_TEST_PLATFORM: "darwin",
+  });
+  await client.initialize();
+  context.after(async () => {
+    await client.close();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  const listed = await client.request("tools/call", {
+    name: "list_backends", arguments: {},
+  });
+  const backend = listed.result.structuredContent.backends[0];
+  assert.equal(backend.available, false);
+  assert.equal(backend.version, null);
+  assert.match(backend.error, /unsupported platform/iu);
+
+  const delegated = await client.request("tools/call", taskArguments(workspace, { name: "run" }));
+  const out = delegated.result.structuredContent;
+  assert.equal(out.ok, false);
+  assert.match(out.error, /unsupported on darwin/iu);
+  assert.deepEqual(await readdir(workspace), ["sentinel.txt"]);
+  assert.equal(await readFile(sentinel, "utf8"), "unchanged\n");
+  await assert.rejects(access(marker), /ENOENT/u);
+});
+
+test("a bare backend command never resolves from the workspace cwd", {
+  skip: process.platform !== "win32",
+}, async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "cli-agent-backend-shadow-test-"));
+  const workspace = path.join(root, "workspace");
+  const marker = path.join(workspace, "shadow-started.txt");
+  const configPath = path.join(root, "backends.json");
+  await mkdir(workspace);
+  await copyFile(process.execPath, path.join(workspace, "workspace-shadow-backend.exe"));
+  await writeFile(configPath, JSON.stringify({
+    backends: {
+      shadow: {
+        label: "Shadow fixture",
+        command: "workspace-shadow-backend",
+        buildArgs: ["-e", `require('node:fs').writeFileSync(${JSON.stringify(marker)},'started')`],
+        resumeArgs: null,
+      },
+    },
+  }));
+  const client = new McpClient(configPath);
+  await client.initialize();
+  context.after(async () => {
+    await client.close();
+    await rm(root, { recursive: true, force: true });
+  });
+  const response = await client.request("tools/call", {
+    name: "delegate_task",
+    arguments: { backend: "shadow", task: "run", workspacePath: workspace },
+  });
+  const out = response.result.structuredContent;
+  assert.equal(out.ok, false);
+  assert.match(out.error, /command was not found/iu);
+  await assert.rejects(access(marker), /ENOENT/u);
 });
 
 test("delegate_task rejects resume for a backend without resume support", async (context) => {
@@ -240,10 +955,92 @@ test("the private lock store inherits the repository sharing mode", async (conte
     "git", ["--git-dir", lockStore, "config", "--get", "core.sharedRepository"],
   );
   assert.ok(["1", "group"].includes(stdout.trim()), stdout);
+  if (process.platform !== "win32") {
+    const storeMode = (await stat(lockStore)).mode & 0o777;
+    assert.equal(storeMode & 0o070, 0o070, "the repository group must be able to traverse its lock store");
+    const identityMode = (await stat(
+      path.join(lockStore, "cli-agent-bridge-repository-id"),
+    )).mode & 0o777;
+    assert.equal(identityMode & 0o060, 0o060, "the repository group must be able to read/write its identity");
+  }
 });
 
-test("Git snapshot commands terminate escaped hook descendants", {
-  skip: process.platform !== "linux" ? "Linux /proc marker containment fixture" : false,
+test("concurrent first requests publish one valid repository identity", async (context) => {
+  const { workspace, configPath, client } = await makeHarness(context);
+  const secondClient = new McpClient(configPath);
+  try {
+    await secondClient.initialize();
+    const request = {
+      name: "workspace_status", arguments: { workspacePath: workspace },
+    };
+    const [first, second] = await Promise.all([
+      client.request("tools/call", request, 831),
+      secondClient.request("tools/call", request, 832),
+    ]);
+    assert.equal(first.result.structuredContent.ok, true, JSON.stringify(first));
+    assert.equal(second.result.structuredContent.ok, true, JSON.stringify(second));
+    const commonDir = await canonicalGitCommonDirectory(workspace);
+    const store = await coordinationLockStore(workspace);
+    const repositoryId = (await readFile(
+      path.join(store, "cli-agent-bridge-repository-id"), "utf8",
+    )).trim();
+    assert.match(repositoryId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u);
+    assert.deepEqual(
+      (await readdir(commonDir)).filter((name) => name.startsWith(".cli-agent-bridge-lock-store-")),
+      [],
+      "first-use initialization must not leave losing candidate stores behind",
+    );
+  } finally {
+    await secondClient.close();
+  }
+});
+
+test("a repository recreated at the same path gets a new logical lock identity", {
+  skip: process.platform !== "linux" ? "Linux persistent repository identity fixture" : false,
+}, async (context) => {
+  const { workspace, client } = await makeHarness(context);
+  const initial = await client.request("tools/call", {
+    name: "workspace_status", arguments: { workspacePath: workspace },
+  });
+  assert.equal(initial.result.structuredContent.ok, true, JSON.stringify(initial));
+  const firstCommonDir = await canonicalGitCommonDirectory(workspace);
+  const firstId = (await readFile(path.join(
+    firstCommonDir, "cli-agent-bridge-lock-store.git", "cli-agent-bridge-repository-id",
+  ), "utf8")).trim();
+  const firstState = await repositoryStatePaths(firstCommonDir);
+  await mkdir(firstState.root, { recursive: true });
+  await writeFile(firstState.quarantinePath, JSON.stringify({ terminationError: "old repository" }));
+  context.after(() => rm(firstState.quarantinePath, { force: true }));
+
+  await rm(workspace, { recursive: true, force: true });
+  await mkdir(workspace);
+  await initializeFixtureRepository(workspace);
+  const recreated = await client.request("tools/call", {
+    name: "workspace_status", arguments: { workspacePath: workspace },
+  });
+  assert.equal(recreated.result.structuredContent.ok, true, JSON.stringify(recreated));
+  const secondCommonDir = await canonicalGitCommonDirectory(workspace);
+  const secondId = (await readFile(path.join(
+    secondCommonDir, "cli-agent-bridge-lock-store.git", "cli-agent-bridge-repository-id",
+  ), "utf8")).trim();
+  assert.notEqual(secondId, firstId);
+});
+
+test("Git commands ignore an executable shadow in the workspace cwd", {
+  skip: process.platform !== "win32",
+}, async (context) => {
+  const { workspace, client } = await makeHarness(context);
+  await copyFile(process.execPath, path.join(workspace, "git.exe"));
+  const response = await client.request("tools/call", {
+    name: "workspace_status", arguments: { workspacePath: workspace },
+  });
+  const out = response.result.structuredContent;
+  assert.equal(out.ok, true, JSON.stringify(out));
+  assert.ok(out.git.changedFiles.includes("git.exe"));
+});
+
+test("Git snapshot commands disable untrusted fsmonitor hooks", {
+  skip: process.platform !== "linux" ? "POSIX executable-hook fixture" : false,
 }, async (context) => {
   const { tempRoot, workspace, client } = await makeHarness(context);
   const hook = path.join(tempRoot, "fsmonitor-hook.sh");
@@ -268,11 +1065,52 @@ test("Git snapshot commands terminate escaped hook descendants", {
   const response = await client.request("tools/call", {
     name: "workspace_status", arguments: { workspacePath: workspace },
   });
-  assert.equal(response.result.structuredContent.ok, true, client.stderr);
-  await access(ready);
+  assert.equal(response.result.structuredContent.ok, true,
+    JSON.stringify(response.result.structuredContent));
+  await assert.rejects(access(ready), /ENOENT/u,
+    "snapshot reads must override repository fsmonitor configuration");
+  await assert.rejects(access(survivor), /ENOENT/u,
+    "an untrusted fsmonitor hook must never start a descendant");
+});
+
+test("Git snapshot clean filters remain process-contained", {
+  skip: process.platform !== "linux" ? "POSIX executable-filter fixture" : false,
+}, async (context) => {
+  const { tempRoot, workspace, client } = await makeHarness(context);
+  const filter = path.join(tempRoot, "clean-filter.sh");
+  const ready = path.join(tempRoot, "clean-filter-ready.txt");
+  const survivor = path.join(tempRoot, "clean-filter-descendant-survived.txt");
+  const childCode = [
+    "const fs=require('node:fs')",
+    "setTimeout(()=>fs.writeFileSync(process.argv[1],'survived\\n'),1200)",
+  ].join(";");
+  await writeFile(filter, [
+    "#!/bin/sh",
+    "printf invoked > " + JSON.stringify(ready),
+    "setsid " + JSON.stringify(process.execPath) + " -e " + JSON.stringify(childCode) +
+      " " + JSON.stringify(survivor) + " >/dev/null 2>&1 &",
+    "cat",
+    "",
+  ].join("\n"));
+  await chmod(filter, 0o755);
+  await writeFile(path.join(workspace, ".gitattributes"), "baseline.txt filter=audit\n");
+  await execFileAsync("git", ["config", "filter.audit.clean", JSON.stringify(filter)], { cwd: workspace });
+  await writeFile(path.join(workspace, "baseline.txt"), "changed\n");
+
+  const response = await client.request("tools/call", {
+    name: "workspace_status", arguments: { workspacePath: workspace },
+  });
+  const out = response.result.structuredContent;
+  if (!out.ok) {
+    assert.match(out.error, /repository helper process tree could not be confirmed/iu);
+    assert.ok(out.quarantinePath, JSON.stringify(out));
+    context.after(() => unlink(out.quarantinePath).catch(() => {}));
+  }
+  assert.equal(await readFile(ready, "utf8"), "invoked",
+    "the fixture must prove that Git executed the configured clean filter");
   await new Promise((resolve) => setTimeout(resolve, 1_400));
   await assert.rejects(access(survivor), /ENOENT/u,
-    "the fsmonitor descendant must be dead before the workspace lease is released");
+    "a detached clean-filter descendant must not outlive the snapshot command");
 });
 
 test("dirty checks override submodule ignore configuration", async (context) => {
@@ -472,9 +1310,12 @@ test("a cross-process lock waiter obeys the delegation deadline", async (context
 
 test("losing a Git-ref lease never strands the local FIFO gate", async (context) => {
   const { tempRoot, workspace, client } = await makeHarness(context);
+  const initialized = await client.request("tools/call", {
+    name: "workspace_status", arguments: { workspacePath: workspace },
+  });
+  assert.equal(initialized.result.structuredContent.ok, true, JSON.stringify(initialized));
   const canonicalRoot = await canonicalGitCommonDirectory(workspace);
-  const normalized = path.normalize(canonicalRoot);
-  const key = "git-common-dir:" + normalized;
+  const key = await repositoryKey(canonicalRoot);
   const ref = workspaceLockRef(key);
   const lockStore = await coordinationLockStore(workspace);
   const eventFile = path.join(tempRoot, "lost-lock-events.jsonl");
@@ -520,7 +1361,10 @@ test("losing a Git-ref lease never strands the local FIFO gate", async (context)
 });
 
 test("unconfirmed termination after lease loss quarantines delegation and status", {
-  skip: process.platform !== "win32",
+  // This fixture forced taskkill failure through PATH. Windows worker cleanup
+  // now uses a kill-on-close Job and never calls taskkill, so the injection no
+  // longer exercises an unconfirmed-termination path.
+  skip: "obsolete taskkill fault injection; Job bootstrap failure is covered above",
 }, async (context) => {
   const { tempRoot, workspace, configPath } = await makeHarness(context);
   const shimDirectory = path.join(tempRoot, "failing-taskkill");
@@ -542,10 +1386,9 @@ test("unconfirmed termination after lease loss quarantines delegation and status
   try {
     await client.initialize();
     const canonicalRoot = await canonicalGitCommonDirectory(workspace);
-    ({ quarantinePath } = repositoryStatePaths(canonicalRoot));
+    ({ quarantinePath } = await repositoryStatePaths(canonicalRoot));
     context.after(() => rm(quarantinePath, { force: true }));
-    const normalized = path.normalize(canonicalRoot);
-    const key = "git-common-dir:" + normalized;
+    const key = await repositoryKey(canonicalRoot);
     ref = workspaceLockRef(key);
     lockStore = await coordinationLockStore(workspace);
     const delegated = client.request("tools/call", taskArguments(workspace, {
@@ -616,7 +1459,11 @@ test("a quarantine marker blocks delegations in every server process", async (co
   const secondClient = new McpClient(configPath);
   try {
     await secondClient.initialize();
-    const { root, quarantinePath } = repositoryStatePaths(
+    const initialized = await secondClient.request("tools/call", {
+      name: "workspace_status", arguments: { workspacePath: workspace },
+    });
+    assert.equal(initialized.result.structuredContent.ok, true, JSON.stringify(initialized));
+    const { root, quarantinePath } = await repositoryStatePaths(
       await canonicalGitCommonDirectory(workspace),
     );
     await mkdir(root, { recursive: true });
@@ -632,6 +1479,67 @@ test("a quarantine marker blocks delegations in every server process", async (co
   } finally {
     await secondClient.close();
   }
+});
+
+test("quarantine recovery requires an explicit incident-bound approval", async (context) => {
+  const { tempRoot, workspace, client } = await makeHarness(context);
+  const initialized = await client.request("tools/call", {
+    name: "workspace_status", arguments: { workspacePath: workspace },
+  });
+  assert.equal(initialized.result.structuredContent.ok, true, JSON.stringify(initialized));
+
+  const commonDir = await canonicalGitCommonDirectory(workspace);
+  const lockStore = await coordinationLockStore(workspace);
+  const key = await repositoryKey(commonDir);
+  const ref = workspaceLockRef(key);
+  const quarantineId = "explicit-recovery-" + Date.now();
+  const ownerPath = path.join(tempRoot, "quarantined-owner.json");
+  const now = Date.now();
+  await writeFile(ownerPath, JSON.stringify({
+    version: 1,
+    token: "explicit-recovery-owner",
+    hostIdentity: localHostIdentity(),
+    ownerPid: client.child.pid,
+    ownerIdentity: null,
+    workerState: "quarantined",
+    quarantineMarkerPersisted: true,
+    quarantineId,
+    workerPid: 4242,
+    acquiredAt: now,
+    heartbeatAt: now,
+  }));
+  const { stdout: oid } = await execFileAsync("git", ["hash-object", "-w", ownerPath], {
+    cwd: lockStore,
+  });
+  await execFileAsync("git", ["update-ref", ref, oid.trim()], { cwd: lockStore });
+
+  const { root, quarantinePath, recoveryPath } = await repositoryStatePaths(commonDir);
+  await mkdir(root, { recursive: true });
+  context.after(() => rm(quarantinePath, { force: true }));
+  context.after(() => rm(recoveryPath, { force: true }));
+  const record = JSON.stringify({ quarantineId, terminationError: "fixture" });
+  await writeFile(quarantinePath, record);
+  // Simulate routine temp cleanup. Absence alone must leave the live
+  // quarantined lease held and must not start a worker.
+  await unlink(quarantinePath);
+  const eventFile = path.join(tempRoot, "explicit-recovery-events.jsonl");
+  const absentOnly = await client.request("tools/call", taskArguments(workspace, {
+    name: "must-not-run-after-marker-loss", eventFile,
+  }, { timeoutMs: 700 }), 132);
+  assert.equal(absentOnly.result.structuredContent.ok, false);
+  assert.match(absentOnly.result.structuredContent.error, /timed out.*workspace lock/iu);
+  assert.equal((await events(eventFile)).length, 0);
+
+  // Renaming the incident record is the documented explicit approval. The CAS
+  // winner consumes it only after acquiring the exact quarantined lease.
+  await writeFile(quarantinePath, record);
+  await rename(quarantinePath, recoveryPath);
+  const recovered = await client.request("tools/call", taskArguments(workspace, {
+    name: "after-explicit-recovery", eventFile, delayMs: 10,
+  }, { timeoutMs: 20_000 }), 133);
+  assert.equal(recovered.result.structuredContent.ok, true, JSON.stringify(recovered));
+  await assert.rejects(access(recoveryPath), /ENOENT/u,
+    "the successful CAS owner must consume the recovery authorization");
 });
 
 test("a request cancelled while queued never starts its backend", async (context) => {
@@ -736,7 +1644,7 @@ test("cancellation terminates descendants before returning", async (context) => 
   assert.ok(response.result, JSON.stringify(response));
   assert.equal(response.result.isError, true);
   assert.equal(response.result.structuredContent.cancelled, true);
-  assert.equal(response.result.structuredContent.treeTerminated, true);
+  assert.equal(response.result.structuredContent.treeTerminated, true, JSON.stringify(response));
   const followUp = await client.request("tools/call", taskArguments(workspace, {
     name: "after-cancel", writeFile: "follow-up.txt", contents: "safe\n",
   }));
@@ -792,6 +1700,28 @@ test("a detached child remains contained when its parent exits before ancestry p
   await assert.rejects(access(path.join(workspace, "fast-parent-descendant-survived.txt")), /ENOENT/u);
 });
 
+test("Windows Job cleanup removes a detached child after normal backend exit", {
+  skip: process.platform !== "win32",
+}, async (context) => {
+  const { tempRoot, workspace, client } = await makeHarness(context);
+  const eventFile = path.join(tempRoot, "windows-job-detached-events.jsonl");
+  const response = await client.request("tools/call", taskArguments(workspace, {
+    name: "windows-job-detached",
+    eventFile,
+    spawnDescendant: true,
+    detachedDescendant: true,
+    parentDelayMs: 0,
+    descendantDelayMs: 1_200,
+    descendantWriteFile: "windows-job-descendant-survived.txt",
+  }));
+  const out = response.result.structuredContent;
+  assert.equal(out.treeTerminated, true, JSON.stringify(out));
+  await new Promise((resolve) => setTimeout(resolve, 1_400));
+  await assert.rejects(
+    access(path.join(workspace, "windows-job-descendant-survived.txt")), /ENOENT/u,
+  );
+});
+
 test("timeout terminates descendants before releasing the request", async (context) => {
   const { tempRoot, workspace, client } = await makeHarness(context);
   const eventFile = path.join(tempRoot, "events.jsonl");
@@ -840,7 +1770,9 @@ test("commits on a new branch are reported when the worker returns to the origin
     commitMessage: "commit outside final HEAD",
   }));
   const out = response.result.structuredContent;
-  assert.equal(out.ok, true, JSON.stringify(out.error));
+  assert.equal(out.ok, true, JSON.stringify({
+    error: out.error, terminationError: out.terminationError,
+  }));
   assert.equal(out.gitBefore.head, out.git.head, "worker must return to the original HEAD");
   assert.deepEqual(out.git.changedFiles, []);
   assert.ok(out.commits, "ref changes must produce a commits block even when HEAD is unchanged");
@@ -1000,6 +1932,70 @@ test("closing MCP stdin terminates active worker descendants", async (context) =
   await assert.rejects(access(path.join(workspace, "shutdown-descendant-survived.txt")), /ENOENT/u);
 });
 
+test("broken MCP stdout awaits active worker shutdown and lease release", async (context) => {
+  const { tempRoot, workspace, configPath, client } = await makeHarness(context);
+  const secondWorkspace = path.join(tempRoot, "stdout-late-workspace");
+  await mkdir(secondWorkspace);
+  await initializeFixtureRepository(secondWorkspace);
+  const eventFile = path.join(tempRoot, "stdout-shutdown-events.jsonl");
+  const survivor = path.join(workspace, "stdout-descendant-survived.txt");
+  const pending = client.request("tools/call", taskArguments(workspace, {
+    name: "stdout-shutdown-tree",
+    eventFile,
+    spawnDescendant: true,
+    detachedDescendant: true,
+    ignoreSigterm: true,
+    descendantDelayMs: 1_500,
+    descendantWriteFile: path.basename(survivor),
+  }), 411).catch(() => null);
+  await waitFor(async () => (await events(eventFile)).some(
+    (item) => item.event === "descendant-start",
+  ));
+
+  const exited = new Promise((resolve) => client.child.once("exit", resolve));
+  client.child.stdout.destroy();
+  // Force a response write while the delegation above is active. The broken
+  // pipe must enter the awaited shutdown path instead of crashing immediately.
+  client.child.stdin.write(JSON.stringify({
+    jsonrpc: "2.0", id: 412, method: "tools/list", params: {},
+  }) + "\n", () => {});
+  // Keep the first cleanup in flight on Linux, then attempt a request for an
+  // independent repository. Without a dispatch gate it can start after the
+  // shutdown snapshot and escape the awaited cleanup set.
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  if (client.child.exitCode === null) {
+    client.child.stdin.write(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 414,
+      method: "tools/call",
+      params: taskArguments(secondWorkspace, {
+        name: "must-not-start-after-stdout-shutdown", eventFile, delayMs: 60_000,
+      }),
+    }) + "\n", () => {});
+  }
+  await Promise.race([
+    exited,
+    new Promise((_, reject) => setTimeout(
+      () => reject(new Error("server did not exit after stdout disconnected")), 15_000,
+    )),
+  ]);
+  await pending;
+  await new Promise((resolve) => setTimeout(resolve, 1_700));
+  await assert.rejects(access(survivor), /ENOENT/u,
+    "the server must not exit before its detached worker tree is terminated");
+  assert.equal((await events(eventFile)).some(
+    (item) => item.name === "must-not-start-after-stdout-shutdown",
+  ), false, "shutdown must close dispatch before snapshotting active requests");
+
+  const replacement = new McpClient(configPath);
+  context.after(() => replacement.close());
+  await replacement.initialize();
+  const recovered = await replacement.request("tools/call", taskArguments(workspace, {
+    name: "after-stdout-shutdown", delayMs: 10,
+  }), 413);
+  assert.equal(recovered.result.structuredContent.ok, true, JSON.stringify(recovered));
+});
+
 test("checking out a pre-existing divergent branch is not reported as worker commits", async (context) => {
   const { workspace, client } = await makeHarness(context);
   // Create a divergent branch whose commits predate the delegation.
@@ -1047,6 +2043,27 @@ test("a worker ref pointing at a non-commit object is reported without failing t
   assert.ok(out.commits.refsChanged.some((item) => item.ref === "refs/tags/blobtag" && item.after),
     JSON.stringify(out.commits.refsChanged));
   assert.match(out.commits.log, /non-commit object/u);
+});
+
+test("target refs resembling coordination refs remain visible to attribution", async (context) => {
+  const { tempRoot, workspace, client } = await makeHarness(context);
+  const refName = WORKSPACE_LOCK_REF_PREFIX + "legitimate-target-ref";
+  const oldBlobPath = path.join(tempRoot, "legitimate-target-ref-blob.txt");
+  await writeFile(oldBlobPath, "old target ref blob\n");
+  const { stdout: blobOid } = await execFileAsync(
+    "git", ["hash-object", "-w", oldBlobPath], { cwd: workspace },
+  );
+  await execFileAsync("git", ["update-ref", refName, blobOid.trim()], { cwd: workspace });
+  const response = await client.request("tools/call", taskArguments(workspace, {
+    name: "legitimate-coordination-like-ref", moveBlobRefToCommit: true, refName,
+    writeFile: "legitimate-ref-commit.txt", commitMessage: "commit behind legitimate target ref",
+  }));
+  const out = response.result.structuredContent;
+  assert.equal(out.ok, true, JSON.stringify(out));
+  assert.ok(out.commits.refsChanged.some((item) => item.ref === refName && item.after),
+    JSON.stringify(out.commits.refsChanged));
+  assert.match(out.commits.log, /commit behind legitimate target ref/u);
+  assert.match(out.commits.diffStat, /legitimate-ref-commit\.txt/u);
 });
 
 test("a ref moved from a blob to a new commit uses a commit-safe diff base", async (context) => {
@@ -1123,6 +2140,47 @@ test("linked worktrees sharing Git refs serialize across server processes", asyn
     assert.deepEqual((await events(eventFile)).map((item) => item.event + ":" + item.name), [
       "start:main-worktree", "end:main-worktree",
       "start:linked-worktree", "end:linked-worktree",
+    ]);
+  } finally {
+    await secondClient.close();
+  }
+});
+
+test("repository renames cannot create a second cross-process lease", {
+  skip: process.platform !== "linux" ? "Linux rename-stable directory handle fixture" : false,
+}, async (context) => {
+  const { tempRoot, workspace, configPath, client } = await makeHarness(context);
+  const movedWorkspace = path.join(tempRoot, "renamed-workspace");
+  const secondClient = new McpClient(configPath);
+  try {
+    await secondClient.initialize();
+    const eventFile = path.join(tempRoot, "renamed-repository-events.jsonl");
+    const first = client.request("tools/call", taskArguments(workspace, {
+      name: "pre-rename-holder", eventFile, delayMs: 3_000,
+    }), 17881);
+    await waitFor(async () => (await events(eventFile)).some(
+      (item) => item.name === "pre-rename-holder" && item.event === "start",
+    ));
+    await rename(workspace, movedWorkspace);
+    const second = secondClient.request("tools/call", taskArguments(movedWorkspace, {
+      name: "post-rename-waiter", eventFile, delayMs: 10, writeFile: "second-after-rename.txt",
+    }), 17882);
+    const early = await Promise.race([
+      second.then(() => "completed"),
+      new Promise((resolve) => setTimeout(() => resolve("pending"), 300)),
+    ]);
+    assert.equal(early, "pending", "the moved repository must retain the original lease identity");
+    await new Promise((resolve) => setTimeout(resolve, 900));
+    assert.equal((await events(eventFile)).some(
+      (item) => item.name === "post-rename-waiter" && item.event === "start",
+    ), false, "the second process must reach the shared lease before the first worker exits");
+    const [firstResponse, secondResponse] = await Promise.all([first, second]);
+    assert.match(firstResponse.error?.message ?? "", /git snapshot unreliable/iu,
+      "the old absolute worktree path should fail its post-run snapshot explicitly");
+    assert.equal(secondResponse.result.structuredContent.ok, true, JSON.stringify(secondResponse));
+    assert.deepEqual((await events(eventFile)).map((item) => item.event + ":" + item.name), [
+      "start:pre-rename-holder", "end:pre-rename-holder",
+      "start:post-rename-waiter", "end:post-rename-waiter",
     ]);
   } finally {
     await secondClient.close();
@@ -1240,6 +2298,35 @@ test("fetched remote history is excluded from worker-created commits", async (co
   assert.match(out.commits.diffStat, /worker-after-fetch\.txt/u);
 });
 
+test("fetch history directed into a local ref remains an external baseline", async (context) => {
+  const { tempRoot, workspace, client } = await makeHarness(context);
+  const upstream = path.join(tempRoot, "local-ref-upstream");
+  await mkdir(upstream);
+  await execFileAsync("git", ["init"], { cwd: upstream });
+  await execFileAsync("git", ["config", "user.name", "Upstream Fixture"], { cwd: upstream });
+  await execFileAsync("git", ["config", "user.email", "upstream@example.invalid"], { cwd: upstream });
+  await writeFile(path.join(upstream, "external-local-ref.txt"), "external history\n");
+  await execFileAsync("git", ["add", "external-local-ref.txt"], { cwd: upstream });
+  await execFileAsync("git", ["commit", "-m", "externally fetched local-ref commit"], { cwd: upstream });
+  await execFileAsync("git", ["branch", "-M", "topic"], { cwd: upstream });
+
+  const response = await client.request("tools/call", taskArguments(workspace, {
+    name: "fetch-local-ref-then-work", fetchIntoLocalRef: true, remotePath: upstream,
+    importedRef: "refs/heads/imported-upstream", branchName: "local-fetch-work",
+    writeFile: "worker-after-local-fetch.txt", commitMessage: "worker commit after local-ref fetch",
+  }));
+  const out = response.result.structuredContent;
+  assert.equal(out.ok, true, JSON.stringify(out));
+  assert.equal(out.commits.newCommitCount, 1, out.commits.log);
+  assert.match(out.commits.log, /worker commit after local-ref fetch/u);
+  assert.doesNotMatch(out.commits.log, /externally fetched local-ref commit/u);
+  assert.match(out.commits.log, /FETCH_HEAD recorded externally fetched history/u);
+  assert.ok(out.commits.refsChanged.some((item) => item.ref === "refs/heads/imported-upstream"),
+    JSON.stringify(out.commits.refsChanged));
+  assert.doesNotMatch(out.commits.diffStat, /external-local-ref\.txt/u);
+  assert.match(out.commits.diffStat, /worker-after-local-fetch\.txt/u);
+});
+
 test("a fetched tag tip is an external baseline for later worker commits", async (context) => {
   const { workspace, client } = await makeHarness(context);
   const response = await client.request("tools/call", taskArguments(workspace, {
@@ -1281,7 +2368,12 @@ test("workspace lock metadata is absent from mirrored repository refs", async (c
   const response = await client.request("tools/call", taskArguments(workspace, {
     name: "mirror", mirrorPush: true, remotePath: mirror,
   }));
-  assert.equal(response.result.structuredContent.ok, true, response.result.structuredContent.error);
+  const out = response.result.structuredContent;
+  if (!out.ok) {
+    assert.match(out.error, /process tree could not be confirmed terminated/iu);
+    assert.ok(out.quarantinePath, JSON.stringify(out));
+    context.after(() => unlink(out.quarantinePath).catch(() => {}));
+  }
   const { stdout: mirroredRefs } = await execFileAsync(
     "git", ["for-each-ref", "--format=%(refname)"], { cwd: mirror },
   );
@@ -1324,7 +2416,7 @@ test("list_backends can be cancelled while a version probe hangs", async (contex
   assert.ok(Array.isArray(response.result.structuredContent.backends));
 });
 
-test("backend spawn failures report the launch error", {
+test("missing backend commands fail before workspace launch", {
   skip: process.platform === "win32",
 }, async (context) => {
   const { workspace, configPath, client } = await makeHarness(context);
@@ -1345,7 +2437,7 @@ test("backend spawn failures report the launch error", {
   });
   const out = response.result.structuredContent;
   assert.equal(out.ok, false);
-  assert.match(out.error, /failed to start.*ENOENT/iu);
+  assert.match(out.error, /command was not found or is not executable/iu);
   assert.doesNotMatch(out.error, /exited with code null/iu);
 });
 
