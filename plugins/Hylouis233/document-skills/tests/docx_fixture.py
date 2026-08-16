@@ -128,6 +128,17 @@ def iter_part_blocks(root, parent):
             yield "paragraph", Paragraph(child, parent)
         elif child.tag == qn("w:tbl"):
             yield "table", Table(child, parent)
+        elif child.tag == qn("w:altChunk"):
+            relationship_id = child.get(qn("r:id"))
+            part = getattr(parent, "part", None)
+            relationship = None if part is None else part.rels.get(relationship_id)
+            yield "unreadable", {
+                "kind": "altChunk",
+                "relationship_id": relationship_id,
+                "target": None if relationship is None else relationship.target_ref,
+                "content_type": None if relationship is None or relationship.is_external
+                else relationship.target_part.content_type,
+            }
         else:
             yield from iter_part_blocks(child, parent)
 
@@ -153,7 +164,12 @@ def table_content(table):
         for cell in row.cells:
             items = []
             for kind, block in iter_part_blocks(cell._tc, cell):
-                items.append(paragraph_text(block) if kind == "paragraph" else table_content(block))
+                if kind == "paragraph":
+                    items.append(paragraph_text(block))
+                elif kind == "table":
+                    items.append(table_content(block))
+                else:
+                    items.append(block)
             rendered_cells.append(items)
         rows.append(rendered_cells)
     return rows
@@ -180,6 +196,14 @@ inline_paragraph = sdt_doc.add_paragraph("before-")
 inline_run = inline_paragraph.add_run("inline한")
 inline_paragraph.add_run("-after")
 wrap_in_sdt(inline_run._r)
+chunk_relationship = sdt_doc.part.relate_to(
+    "https://example.invalid/imported.html",
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/aFChunk",
+    is_external=True,
+)
+alt_chunk = OxmlElement("w:altChunk")
+alt_chunk.set(qn("r:id"), chunk_relationship)
+sdt_doc.element.body.insert(len(sdt_doc.element.body) - 1, alt_chunk)
 sdt_doc.save("content-control.docx")
 sdt_reopened = Document("content-control.docx")
 check("doc.paragraphs omits block content-control text (negative control)",
@@ -189,7 +213,7 @@ check("doc.tables omits a table wrapped by a block content control (negative con
       len(sdt_reopened.tables) == 0)
 check("block walker preserves document order across content controls",
       [kind for kind, _ in walked_blocks]
-      == ["paragraph", "paragraph", "table", "paragraph"], walked_blocks)
+      == ["paragraph", "paragraph", "table", "paragraph", "unreadable"], walked_blocks)
 walked_paragraphs = [block for kind, block in walked_blocks if kind == "paragraph"]
 walked_text = [paragraph_text(paragraph) for paragraph in walked_paragraphs]
 check("content-control traversal emits the nested paragraph", "inside content control" in walked_text, walked_text)
@@ -204,6 +228,14 @@ check("table text is emitted exactly once, not again as prose",
       sum(item.count("table한") for item in all_emitted) == 1, all_emitted)
 check("nested-table text is emitted exactly once",
       sum(item.count("nested한") for item in all_emitted) == 1, all_emitted)
+unreadable_parts = [block for kind, block in walked_blocks if kind == "unreadable"]
+check("altChunk content is reported instead of silently omitted",
+      unreadable_parts == [{
+          "kind": "altChunk",
+          "relationship_id": chunk_relationship,
+          "target": "https://example.invalid/imported.html",
+          "content_type": None,
+      }], unreadable_parts)
 
 # Per-run glyph validation must not let a different referenced font hide a missing glyph.
 fixture_cmaps = {"CJK Face": {ord("漢")}, "Latin Face": {ord("A")}}

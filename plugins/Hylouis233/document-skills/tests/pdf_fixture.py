@@ -257,7 +257,6 @@ writer = PdfWriter()
 writer.append(reader)
 stamp_box = stamp.cropbox
 for page in writer.pages:
-    page.transfer_rotation_to_content()
     destination = page.cropbox
     scale = min(float(destination.width) / float(stamp_box.width),
                 float(destination.height) / float(stamp_box.height))
@@ -412,12 +411,26 @@ offset_page.cropbox.lower_left = (100, 200)
 offset_page.cropbox.upper_right = (300, 500)
 rotated_page = small_source.add_blank_page(width=240, height=160)
 rotated_page.rotate(90)
+from pypdf.generic import ArrayObject, DictionaryObject, FloatObject, NameObject
+rotated_link = DictionaryObject({
+    NameObject("/Type"): NameObject("/Annot"),
+    NameObject("/Subtype"): NameObject("/Link"),
+    NameObject("/Rect"): ArrayObject([FloatObject(value) for value in (20, 30, 100, 60)]),
+    NameObject("/Border"): ArrayObject([FloatObject(0), FloatObject(0), FloatObject(0)]),
+})
+rotated_page[NameObject("/Annots")] = ArrayObject([small_source._add_object(rotated_link)])
 cropped_page = small_source.add_blank_page(width=400, height=500)
 cropped_page.cropbox.lower_left = (250, 300)
 cropped_page.cropbox.upper_right = (390, 480)
 mixed_writer.append(small_source)
 with open("mixed.pdf", "wb") as f:
     mixed_writer.write(f)
+
+def first_annotation_rect(page):
+    return tuple(float(value) for value in page["/Annots"][0].get_object()["/Rect"])
+
+mixed_rotated_page = R2("mixed.pdf").pages[4]
+rotated_geometry_before = (mixed_rotated_page.rotation, first_annotation_rect(mixed_rotated_page))
 
 # Negative control: a plain merge keeps the A4 stamp's coordinates, so the text
 # lands outside the small page and cannot be extracted.
@@ -476,7 +489,6 @@ stamp_page.transfer_rotation_to_content()
 stamp_box2 = stamp_page.cropbox
 sw2, sh2 = float(stamp_box2.width), float(stamp_box2.height)
 for page in scaled_writer.pages:
-    page.transfer_rotation_to_content()
     destination = page.cropbox
     dw, dh = float(destination.width), float(destination.height)
     scale = min(dw / sw2, dh / sh2)
@@ -496,7 +508,7 @@ offset_spans = stamp_bboxes("scaled-stamped.pdf", 3)
 rotated_spans = stamp_bboxes("scaled-stamped.pdf", 4)
 cropped_spans = stamp_bboxes("scaled-stamped.pdf", 5)
 check("scaled stamp lands inside the non-zero-origin page", bool(offset_spans), offset_spans)
-check("scaled stamp lands inside the normalized 90-degree page", bool(rotated_spans), rotated_spans)
+check("scaled stamp lands inside the rotated page without normalizing it", bool(rotated_spans), rotated_spans)
 cropped_rect = fitz.open("scaled-stamped.pdf")[5].rect
 check("scaled stamp lands inside the offset visible crop box",
       bool(cropped_spans)
@@ -506,10 +518,16 @@ check("scaled stamp lands inside the offset visible crop box",
           and bbox[3] <= cropped_rect.height + 0.5
           for bbox in cropped_spans
       ), cropped_spans)
-check("mixed-size pages keep their visible dimensions after rotation normalization",
+check("mixed-size pages keep their original media boxes",
       [(round(float(p.mediabox.width)), round(float(p.mediabox.height)))
        for p in scaled_check.pages]
-      == [(595, 842), (595, 842), (200, 300), (200, 300), (160, 240), (400, 500)])
+      == [(595, 842), (595, 842), (200, 300), (200, 300), (240, 160), (400, 500)])
+scaled_rotated_page = scaled_check.pages[4]
+check("watermarking preserves rotated-page annotation geometry",
+      (scaled_rotated_page.rotation, first_annotation_rect(scaled_rotated_page))
+      == rotated_geometry_before,
+      ((scaled_rotated_page.rotation, first_annotation_rect(scaled_rotated_page)),
+       rotated_geometry_before))
 
 
 # ---- SKILL.md overflow check: off-page text is a defect -------------------------

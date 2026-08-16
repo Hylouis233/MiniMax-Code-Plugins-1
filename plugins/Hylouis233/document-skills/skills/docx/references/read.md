@@ -27,6 +27,17 @@ def iter_part_blocks(root, parent):
             yield "paragraph", Paragraph(child, parent)
         elif child.tag == qn("w:tbl"):
             yield "table", Table(child, parent)
+        elif child.tag == qn("w:altChunk"):
+            relationship_id = child.get(qn("r:id"))
+            part = getattr(parent, "part", None)
+            relationship = None if part is None else part.rels.get(relationship_id)
+            yield "unreadable", {
+                "kind": "altChunk",
+                "relationship_id": relationship_id,
+                "target": None if relationship is None else relationship.target_ref,
+                "content_type": None if relationship is None or relationship.is_external
+                else relationship.target_part.content_type,
+            }
         else:
             yield from iter_part_blocks(child, parent)
 
@@ -98,8 +109,10 @@ print("content controls:", len(content_controls), "top-level blocks:", len(block
 for kind, block in blocks:
     if kind == "paragraph":
         print(block.style.name, "|", paragraph_text(block))
-    else:
+    elif kind == "table":
         print("table |", table_content(block))
+    else:
+        print("unreadable |", block)
 ```
 
 Notes:
@@ -110,6 +123,10 @@ Notes:
   when a table is yielded, so table text is not also emitted as prose; `table_content()` handles
   nested tables recursively and emits `column`, `colspan`, and `vMerge` metadata for physical
   cells instead of duplicating merge-origin text through `row.cells`.
+  Imported `w:altChunk` HTML/RTF/document parts are not modeled by python-docx; the traversal
+  reports their relationship target and content type as `unreadable` instead of silently
+  presenting an incomplete extraction. Convert them with a trusted office renderer before
+  claiming their content was read.
   Text boxes, headers, footers, and footnotes still require their own collections
   (`section.header/.footer`) or raw XML.
 - For revision/comment metadata, inspect the XML parts directly: `word/comments.xml`,

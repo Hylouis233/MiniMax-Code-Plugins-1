@@ -74,6 +74,17 @@ def series_content(series):
         content["bubble_points"] = bubble_points
     return content
 
+def chart_axis_titles(chart):
+    """Return titles for axes the chart actually exposes (pie charts have none)."""
+    titles = {}
+    for label, attribute in (("category", "category_axis"), ("value", "value_axis")):
+        try:
+            axis = getattr(chart, attribute)
+        except (AttributeError, ValueError):
+            continue
+        titles[label] = axis.axis_title.text_frame.text if axis.has_title else ""
+    return titles
+
 prs = Presentation("input.pptx")
 print("slide size:", prs.slide_width, prs.slide_height)
 for i, slide in enumerate(prs.slides):
@@ -104,7 +115,11 @@ for i, slide in enumerate(prs.slides):
             ]
             series = [series_content(item) for item in items]
             plots.append({"kind": type(plot).__name__, "categories": categories, "series": series})
-        charts.append({"title": chart_title, "plots": plots})
+        charts.append({
+            "title": chart_title,
+            "axis_titles": chart_axis_titles(chart),
+            "plots": plots,
+        })
     pictures = [
         content for sh in shapes
         if (content := picture_content(sh)) is not None

@@ -64,6 +64,10 @@ chart = slide.shapes.add_chart(
 ).chart
 chart.has_title = True
 chart.chart_title.text_frame.text = "Units by region"
+chart.category_axis.has_title = True
+chart.category_axis.axis_title.text_frame.text = "Region"
+chart.value_axis.has_title = True
+chart.value_axis.axis_title.text_frame.text = "Units sold"
 
 xy_data = XyChartData()
 xy_series = xy_data.add_series("Trend")
@@ -297,6 +301,17 @@ def series_content(series):
     return content
 
 
+def chart_axis_titles(chart):
+    titles = {}
+    for label, attribute in (("category", "category_axis"), ("value", "value_axis")):
+        try:
+            axis = getattr(chart, attribute)
+        except (AttributeError, ValueError):
+            continue
+        titles[label] = axis.axis_title.text_frame.text if axis.has_title else ""
+    return titles
+
+
 def extract_slide_content(slide):
     shapes = list(iter_shapes(slide.shapes))
     text = [sh.text_frame.text for sh in shapes if sh.has_text_frame and sh.text_frame.text]
@@ -322,7 +337,11 @@ def extract_slide_content(slide):
             ]
             series = [series_content(item) for item in items]
             plots.append({"kind": type(plot).__name__, "categories": categories, "series": series})
-        charts.append({"title": chart_title, "plots": plots})
+        charts.append({
+            "title": chart_title,
+            "axis_titles": chart_axis_titles(chart),
+            "plots": plots,
+        })
     notes = slide.notes_slide.notes_text_frame.text if slide.has_notes_slide else ""
     pictures = [
         info for shape in shapes
@@ -344,6 +363,9 @@ check(
     == [{"name": "Units", "values": [120.0, 80.0]}],
     content["charts"],
 )
+check("content inventory emits category and value axis titles",
+      content["charts"][0]["axis_titles"]
+      == {"category": "Region", "value": "Units sold"}, content["charts"][0])
 chart_by_title = {item["title"]: item for item in content["charts"]}
 check("content inventory emits XY x/y points",
       chart_by_title["XY trend"]["plots"][0]["series"][0]["x_points"]

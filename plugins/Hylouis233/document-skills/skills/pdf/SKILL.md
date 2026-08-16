@@ -61,6 +61,12 @@ if r.is_encrypted:
     if not password:
         raise RuntimeError("set PDF_PASSWORD so the encrypted output can be postchecked")
     r = pypdf.PdfReader(output_path, password=password)  # wrong passwords fail here
+
+def require(condition, message):
+    # Mandatory verification must remain active under python -O.
+    if not condition:
+        raise ValueError(message)
+
 page_count = len(r.pages)
 page_texts = {
     number: (page.extract_text() or "").strip()
@@ -82,13 +88,13 @@ missing_text_pages = [
     and not text
     and widget_count(r.pages[number - 1]) == 0
 ]
-assert not missing_text_pages, f"pages without extractable text: {missing_text_pages}"
+require(not missing_text_pages, f"pages without extractable text: {missing_text_pages}")
 # Add task-specific checks when exact copy matters, for example
 # {1: ("Report title",), 2: ("Conclusion",)}. Per-page text presence is enforced above.
 expected_strings_by_page = {}
 for page_number, expected_strings in expected_strings_by_page.items():
     missing = [value for value in expected_strings if value not in page_texts[page_number]]
-    assert not missing, f"page {page_number} is missing {missing}"
+    require(not missing, f"page {page_number} is missing {missing}")
 # Compare width/height to the exact size used at creation with a small point tolerance.
 # ReportLab A4 is about (595.2756, 841.8898), not the rounded prose value (595.27, 841.89).
 expected_page_size = (595.2756, 841.8898)  # replace for Letter or a task-specific size
@@ -103,7 +109,7 @@ size_mismatches = [
     if any(abs(value - expected) > page_size_tolerance
            for value, expected in zip(actual, expected_page_size))
 ]
-assert not size_mismatches, f"unexpected page sizes: {size_mismatches}"
+require(not size_mismatches, f"unexpected page sizes: {size_mismatches}")
 
 # Overflow is a defect (shared rule 4): text that runs past the page box is
 # clipped or off-page even though every check above still passes. Plain block
@@ -135,7 +141,7 @@ for page in overflow_doc:
     if beyond_box:
         overflow_pages.append(page.number + 1)
 overflow_doc.close()
-assert not overflow_pages, f"text blocks extend past the page box on pages: {overflow_pages}"
+require(not overflow_pages, f"text blocks extend past the page box on pages: {overflow_pages}")
 # The page box is the hard bound. When the task declares specific margins,
 # additionally check key blocks against them (or render and inspect visually) -
 # content inside the box but past a declared margin is a softer, task-specific

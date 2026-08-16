@@ -50,12 +50,14 @@ writer.append(reader)                 # clone pages plus catalog entries such as
 
 # A plain merge_page() overlays the stamp in its own coordinates, so on a page
 # with different dimensions, origin, or rotation the stamp can be clipped or
-# land entirely off-page. Normalize /Rotate into content, then scale each copy
-# to the visible destination box and include both boxes' non-zero origins.
+# land entirely off-page. Normalize only the stamp, then scale each copy to the
+# destination crop box and include both boxes' non-zero origins. Keep the
+# destination page's /Rotate value intact: transfer_rotation_to_content() does
+# not transform annotation rectangles, so normalizing a page that has widgets,
+# links, or other annotations can displace its interactive geometry.
 stamp_box = stamp.cropbox
 sw, sh = float(stamp_box.width), float(stamp_box.height)
 for page in writer.pages:
-    page.transfer_rotation_to_content()
     destination = page.cropbox
     dw, dh = float(destination.width), float(destination.height)
     scale = min(dw / sw, dh / sh)

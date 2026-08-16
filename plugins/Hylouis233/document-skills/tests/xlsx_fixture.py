@@ -303,7 +303,15 @@ def cell_formula_references(workbook):
 def formula_may_intersect_rows(owner_sheet, formula, shifted_sheet, start_row):
     if not isinstance(formula, str) or not formula.startswith("="):
         return True
-    for token in Tokenizer(formula).items:
+    tokens = Tokenizer(formula).items
+    unmodeled_reference_functions = {"indirect", "offset", "address"}
+    if any(
+        token.type == "FUNC" and token.subtype == "OPEN"
+        and token.value.rstrip("(").casefold() in unmodeled_reference_functions
+        for token in tokens
+    ):
+        return True
+    for token in tokens:
         if token.type != "OPERAND" or token.subtype != "RANGE":
             continue
         reference = token.value
@@ -385,6 +393,10 @@ check("sheet qualifiers are matched case-insensitively",
       formula_may_intersect_rows("Summary", "=SUM(data!A5:A6)", "Data", 5))
 check("a genuinely different sheet remains outside the shifted rows",
       not formula_may_intersect_rows("Summary", "=SUM(Archive!A5:A6)", "Data", 5))
+check("INDIRECT string references require a manual structural rewrite plan",
+      formula_may_intersect_rows("Data", '=SUM(INDIRECT("A5:A6"))', "Data", 5))
+check("OFFSET numeric row references require a manual structural rewrite plan",
+      formula_may_intersect_rows("Data", "=SUM(OFFSET(A1,4,0,2,1))", "Data", 5))
 
 stale_wb = openpyxl.Workbook()
 stale_ws = stale_wb.active

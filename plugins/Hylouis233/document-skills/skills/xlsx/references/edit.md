@@ -91,7 +91,17 @@ def formula_may_intersect_rows(owner_sheet, formula, shifted_sheet, start_row):
     """Fail closed unless every range token is provably above/outside the shifted rows."""
     if not isinstance(formula, str) or not formula.startswith("="):
         return True
-    for token in Tokenizer(formula).items:
+    tokens = Tokenizer(formula).items
+    # These functions can manufacture references from strings or numeric
+    # offsets that the RANGE-token audit below cannot see or rewrite safely.
+    unmodeled_reference_functions = {"indirect", "offset", "address"}
+    if any(
+        token.type == "FUNC" and token.subtype == "OPEN"
+        and token.value.rstrip("(").casefold() in unmodeled_reference_functions
+        for token in tokens
+    ):
+        return True
+    for token in tokens:
         if token.type != "OPERAND" or token.subtype != "RANGE":
             continue
         reference = token.value
