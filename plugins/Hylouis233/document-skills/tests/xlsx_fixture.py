@@ -219,25 +219,41 @@ check(
 # ---- edit.md structural audit includes non-cell dependencies ------------------
 from openpyxl.chart import BarChart, Reference
 from openpyxl.formula import Tokenizer
-from openpyxl.formatting.rule import CellIsRule, FormulaRule
+from openpyxl.formatting.rule import CellIsRule, ColorScaleRule, DataBarRule, FormulaRule
 from openpyxl.utils.cell import range_boundaries
 from openpyxl.workbook.defined_name import DefinedName
 from openpyxl.worksheet.datavalidation import DataValidation
 from openpyxl.worksheet.table import Table
 
 
-def non_cell_references(workbook):
-    refs = []
-    defined_names = workbook.defined_names
-    defined_name_items = (
-        defined_names.values()
-        if hasattr(defined_names, "values")
-        else defined_names.definedName
+def formula_text(value):
+    if isinstance(value, str):
+        return value
+    if text := getattr(value, "text", None):
+        return text
+    fields = ("ref", "r1", "r2", "dt2D", "dtr", "ca", "del1", "del2")
+    details = ", ".join(
+        f"{name}={getattr(value, name)!r}" for name in fields if hasattr(value, name)
     )
-    for item in defined_name_items:
+    return f"{type(value).__name__}({details})"
+
+
+def defined_name_values(workbook):
+    names = workbook.defined_names
+    return names.values() if hasattr(names, "values") else names.definedName
+
+
+def structural_references(workbook):
+    refs = []
+    for item in defined_name_values(workbook):
         refs.append(("defined name", item.name, item.attr_text))
     for sheet in workbook.worksheets:
         owner = sheet.title
+        for row in sheet.iter_rows():
+            for cell in row:
+                if cell.data_type == "f":
+                    refs.append(("cell formula", f"{owner}!{cell.coordinate}",
+                                 formula_text(cell.value)))
         for table in sheet.tables.values():
             refs.append(("table", owner + "!" + table.name, table.ref))
         for merged_range in sheet.merged_cells.ranges:
@@ -279,7 +295,7 @@ def cell_formula_references(workbook):
                         "cell formula",
                         sheet.title,
                         cell.coordinate,
-                        getattr(value, "text", None) or str(value),
+                        formula_text(value),
                     ))
     return refs
 
@@ -307,7 +323,6 @@ def formula_may_intersect_rows(owner_sheet, formula, shifted_sheet, start_row):
             return True
     return False
 
-
 class LegacyDefinedNames:
     """Minimal openpyxl 3.0-style DefinedNameList surface."""
     definedName = [DefinedName("LegacyRange", attr_text="'Legacy'!$A$1")]
@@ -320,7 +335,7 @@ class LegacyWorkbook:
 
 check(
     "structural audit supports openpyxl 3.0 DefinedNameList",
-    non_cell_references(LegacyWorkbook())
+    structural_references(LegacyWorkbook())
     == [("defined name", "LegacyRange", "'Legacy'!$A$1")],
 )
 
@@ -346,11 +361,12 @@ audit_ws.conditional_formatting.add("A2:A3", FormulaRule(formula=["A2>0"]))
 chart = BarChart()
 chart.add_data(Reference(audit_ws, min_col=1, min_row=1, max_row=3), titles_from_data=True)
 audit_ws.add_chart(chart, "C1")
-reference_kinds = {kind for kind, _, _ in non_cell_references(audit_wb)}
+audit_references = structural_references(audit_wb)
+reference_kinds = {kind for kind, _, _ in audit_references}
 formula_references = cell_formula_references(audit_wb)
 check(
     "structural audit covers names, tables, filters, validation, formatting, and charts",
-    {"defined name", "table", "merged range", "auto filter", "print area",
+    {"defined name", "cell formula", "table", "merged range", "auto filter", "print area",
      "print title rows", "print title columns", "data validation range",
      "data validation formula", "conditional formatting range",
      "conditional formatting formula", "chart series"} <= reference_kinds,
@@ -396,6 +412,18 @@ safe_reopened = openpyxl.load_workbook("audited-structural-edit.xlsx", data_only
 check("audited non-intersecting formula path reaches save",
       safe_reopened["Data"]["D2"].value == "=C2*1.08")
 
+legacy_name = DefinedName("LegacyName", attr_text="Audit!$A$1")
+legacy_names = type("LegacyDefinedNames", (), {"definedName": [legacy_name]})()
+legacy_workbook = type("LegacyWorkbook", (), {"defined_names": legacy_names})()
+check("defined-name adapter supports openpyxl 3.0 collections",
+      list(defined_name_values(legacy_workbook)) == [legacy_name])
+
+formula_only = openpyxl.Workbook()
+formula_only.active["A1"] = "=Data!A5"
+check("structural guard sees formulas before row insertion",
+      any(reference[0] == "cell formula"
+          for reference in structural_references(formula_only)))
+
 # and the edit itself still works after the warning path
 wb2 = openpyxl.load_workbook("plain.xlsx")
 wb2["Data"]["B2"] = "=B2*1"  # formula stays a formula
@@ -412,7 +440,7 @@ format_matches = all(
 check("task-specific number format mapping is verified", format_matches)
 
 # ---- read.md snippet: multi-sheet profiles cover every sheet ----------------------
-from openpyxl.worksheet.formula import ArrayFormula
+from openpyxl.worksheet.formula import ArrayFormula, DataTableFormula
 
 wb_h = openpyxl.Workbook()
 wb_h.active.title = "First"
@@ -421,11 +449,12 @@ wb_h.active["A2"] = ArrayFormula("A2:A3", "=ROW(A2:A3)")
 second = wb_h.create_sheet("Second")
 second["A1"] = "plain"
 second["A2"] = "=2+2"
+second["B1"] = DataTableFormula(ref="B1:B2", r1="C1")
 wb_h.save("multi.xlsx")
 formula_wb = openpyxl.load_workbook("multi.xlsx", read_only=True, data_only=False)
 value_wb = openpyxl.load_workbook("multi.xlsx", read_only=True, data_only=True)
 profiled = list(value_wb.sheetnames)
-uncached = {(sn, fc.coordinate, getattr(fc.value, "text", None) or str(fc.value))
+uncached = {(sn, fc.coordinate, formula_text(fc.value))
             for sn in profiled
             for frow, vrow in zip(formula_wb[sn].iter_rows(), value_wb[sn].iter_rows())
             for fc, vc in zip(frow, vrow)
@@ -433,6 +462,10 @@ uncached = {(sn, fc.coordinate, getattr(fc.value, "text", None) or str(fc.value)
 check("multi-sheet profile iterates every sheet", profiled == ["First", "Second"], profiled)
 check("uncached formulas found on both sheets", {item[0] for item in uncached} == {"First", "Second"}, uncached)
 check("array-formula objects are detected by data_type", ("First", "A2", "=ROW(A2:A3)") in uncached, uncached)
+data_table_entry = next(item for item in uncached if item[:2] == ("Second", "B1"))
+check("data-table formulas have stable diagnostic text",
+      data_table_entry[2].startswith("DataTableFormula(ref='B1:B2', r1='C1'")
+      and "0x" not in data_table_entry[2], data_table_entry)
 
 # csv.md: value export uses the cached-value workbook and reports every missing cache.
 missing_caches = []
@@ -505,12 +538,53 @@ check("prefix markers are provably blind to custom prefixes (negative control)",
       not any(marker in custom_prefix_sheet for marker in legacy_prefix_markers))
 
 # ---- formatting.md guard: header-only sheets skip conditional formatting ---------
+def add_demo_formatting(sheet):
+    last = sheet.max_row
+    if last < 2:
+        return 0
+    sheet.conditional_formatting.add(
+        f"D2:D{last}", CellIsRule(operator="lessThan", formula=["0"]),
+    )
+    sheet.conditional_formatting.add(
+        f"A2:F{last}", FormulaRule(formula=["$D2<0"]),
+    )
+    sheet.conditional_formatting.add(
+        f"C2:C{last}",
+        ColorScaleRule(start_type="min", start_color="FFFFFF",
+                       end_type="max", end_color="63BE7B"),
+    )
+    sheet.conditional_formatting.add(
+        f"E2:E{last}", DataBarRule(start_type="min", end_type="max", color="638EC6"),
+    )
+    return 4
+
+
 header_wb = openpyxl.Workbook()
 header_ws = header_wb.active
-header_ws.append(["Qty", "Note"])
-guard_last = header_ws.max_row
-if guard_last < 2:
-    pass  # guarded route: skip building rules
+header_ws.append(["A", "B", "C", "D", "E", "F"])
+try:
+    header_ws.conditional_formatting.add(
+        "D2:D1", CellIsRule(operator="lessThan", formula=["0"]),
+    )
+    inverted_range_rejected = False
+except (TypeError, ValueError):
+    inverted_range_rejected = True
+check("unguarded header-only range is rejected (negative control)", inverted_range_rejected)
+check("header-only guard skips all four formatting rules", add_demo_formatting(header_ws) == 0)
+header_wb.save("header-only-formatting.xlsx")
+header_reopened = openpyxl.load_workbook("header-only-formatting.xlsx")
+check("header-only workbook saves and reopens with no conditional formatting",
+      len(header_reopened.active.conditional_formatting) == 0)
+
+data_wb = openpyxl.Workbook()
+data_ws = data_wb.active
+data_ws.append(["A", "B", "C", "D", "E", "F"])
+data_ws.append([1, 2, 3, -1, 5, 6])
+check("data rows receive all four formatting rules", add_demo_formatting(data_ws) == 4)
+data_wb.save("data-formatting.xlsx")
+data_reopened = openpyxl.load_workbook("data-formatting.xlsx")
+check("all four formatting rules survive save/reopen",
+      len(data_reopened.active.conditional_formatting) == 4)
 
 
 # ---- read.md: implausible <dimension> is reset before streaming ------------------

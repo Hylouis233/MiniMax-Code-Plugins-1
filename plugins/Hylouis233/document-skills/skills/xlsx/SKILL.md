@@ -67,6 +67,18 @@ expected_number_formats = {
     # "Sales": {"D2": "#,##0.00", "E2": "yyyy-mm-dd"},
 }
 wb = openpyxl.load_workbook(output_path)
+
+def formula_text(value):
+    if isinstance(value, str):
+        return value
+    if text := getattr(value, "text", None):
+        return text
+    fields = ("ref", "r1", "r2", "dt2D", "dtr", "ca", "del1", "del2")
+    details = ", ".join(
+        f"{name}={getattr(value, name)!r}" for name in fields if hasattr(value, name)
+    )
+    return f"{type(value).__name__}({details})"
+
 print("sheets:", wb.sheetnames)
 missing = set(expected_sheets) - set(wb.sheetnames)
 assert not missing, f"missing expected sheets: {sorted(missing)}"
@@ -76,7 +88,7 @@ print("calcMode:", getattr(calc, "calcMode", None),
 for ws in wb.worksheets:
     print(f"{ws.title} dims:", ws.dimensions)
     formulas = [
-        (c.coordinate, getattr(c.value, "text", None) or str(c.value))
+        (c.coordinate, formula_text(c.value))
         for row in ws.iter_rows() for c in row if c.data_type == "f"
     ]
     print(f"{ws.title} formula cells:", formulas[:10])

@@ -22,6 +22,14 @@ def check(name, cond, extra=""):
         failures.append(name)
 
 
+def open_pdf(path, password=None):
+    reader = pypdf.PdfReader(path)
+    if reader.is_encrypted:
+        if not password or reader.decrypt(password) == 0:
+            raise RuntimeError(f"valid password required for {path}")
+    return reader
+
+
 # ---- build a 2-page A4 PDF with one AcroForm text field on page 1 -------------
 c = canvas.Canvas("form.pdf", pagesize=A4)
 c.setFont("Helvetica", 16)
@@ -55,6 +63,15 @@ probe = pypdf.PdfReader("encrypted.pdf")
 check("encrypted fixture is detected before page access", probe.is_encrypted)
 encrypted_r = pypdf.PdfReader("encrypted.pdf", password="fixture-password")
 check("password-authenticated postcheck can access every page", len(encrypted_r.pages) == 2)
+try:
+    open_pdf("encrypted.pdf")
+    transform_rejected_missing_password = False
+except RuntimeError:
+    transform_rejected_missing_password = True
+check("PDF transforms reject encrypted input without a password",
+      transform_rejected_missing_password)
+check("PDF transforms authenticate before page access",
+      len(open_pdf("encrypted.pdf", "fixture-password").pages) == 2)
 encrypted_extract = fitz.open("encrypted.pdf")
 check("PyMuPDF extraction detects that authentication is required", encrypted_extract.needs_pass)
 check("PyMuPDF rejects the wrong extraction password", encrypted_extract.authenticate("wrong") == 0)
@@ -162,7 +179,7 @@ check(
 )
 
 # ---- transform.md watermark snippet -------------------------------------------
-from pypdf import PdfReader as R2
+from pypdf import PdfReader as R2, Transformation
 
 stamp_src = canvas.Canvas("stamp.pdf", pagesize=A4)
 stamp_src.setFont("Helvetica", 40)
@@ -171,14 +188,27 @@ stamp_src.drawString(160, 400, "DRAFT")
 stamp_src.save()
 
 stamp = R2("stamp.pdf").pages[0]
+stamp.transfer_rotation_to_content()
 stamp_text = (stamp.extract_text() or "").strip()
 reader = R2("form.pdf")
-expected_sizes = [(round(float(p.mediabox.width), 2), round(float(p.mediabox.height), 2)) for p in reader.pages]
 expected_fields = reader.get_fields() or {}
 writer = PdfWriter()
 writer.append(reader)
+stamp_box = stamp.cropbox
 for page in writer.pages:
-    page.merge_page(stamp)
+    page.transfer_rotation_to_content()
+    destination = page.cropbox
+    scale = min(float(destination.width) / float(stamp_box.width),
+                float(destination.height) / float(stamp_box.height))
+    tx = (float(destination.left)
+          + (float(destination.width) - float(stamp_box.width) * scale) / 2
+          - float(stamp_box.left) * scale)
+    ty = (float(destination.bottom)
+          + (float(destination.height) - float(stamp_box.height) * scale) / 2
+          - float(stamp_box.bottom) * scale)
+    page.merge_transformed_page(stamp, Transformation().scale(scale).translate(tx, ty))
+expected_sizes = [(round(float(p.mediabox.width), 2), round(float(p.mediabox.height), 2))
+                  for p in writer.pages]
 with open("watermarked.pdf", "wb") as f:
     writer.write(f)
 
@@ -191,6 +221,28 @@ check(
 check("watermarking preserves the AcroForm catalog and fields",
       set(expected_fields) <= set(verify.get_fields() or {}), verify.get_fields())
 check("stamp text present on every page", all(stamp_text in (p.extract_text() or "") for p in verify.pages))
+
+# ---- inspect.md blank-page predicate includes widgets and annotations -----------
+form_only_canvas = canvas.Canvas("form-only.pdf", pagesize=A4)
+form_only_canvas.acroForm.textfield(
+    name="widget_only", x=72, y=740, width=260, height=20, borderWidth=0
+)
+form_only_canvas.showPage()
+form_only_canvas.save()
+form_only_doc = fitz.open("form-only.pdf")
+form_only_page = form_only_doc[0]
+form_only_widgets = list(form_only_page.widgets() or ())
+form_only_annotations = list(form_only_page.annots() or ())
+form_only_is_blank = (
+    not form_only_page.get_text().strip()
+    and not form_only_page.get_images()
+    and not form_only_page.get_drawings()
+    and not form_only_page.get_links()
+    and not form_only_widgets
+    and not form_only_annotations
+)
+check("form-only page exposes a widget", len(form_only_widgets) == 1)
+check("form-only page is not classified as blank", not form_only_is_blank)
 
 # ---- extract.md CMYK conversion snippet ---------------------------------------
 pix = fitz.Pixmap(fitz.csCMYK, fitz.IRect(0, 0, 24, 24))  # CMYK pixmap like a CMYK PDF image
@@ -286,13 +338,19 @@ if detected.tables:
     check("find_tables extracts data rows", extracted_rows[2] == ["South", "340"], extracted_rows)
 
 
-# ---- transform.md: stamps are scaled to each destination page --------------------
-from pypdf import Transformation
+# ---- transform.md: stamps fit non-zero-origin and rotated destination pages ------
 
 mixed_writer = PdfWriter()
 mixed_writer.append(open_pdf("form.pdf"))
 small_source = PdfWriter()
 small_source.add_blank_page(width=200, height=300)
+offset_page = small_source.add_blank_page(width=200, height=300)
+offset_page.mediabox.lower_left = (100, 200)
+offset_page.mediabox.upper_right = (300, 500)
+offset_page.cropbox.lower_left = (100, 200)
+offset_page.cropbox.upper_right = (300, 500)
+rotated_page = small_source.add_blank_page(width=240, height=160)
+rotated_page.rotate(90)
 mixed_writer.append(small_source)
 with open("mixed.pdf", "wb") as f:
     mixed_writer.write(f)
@@ -328,12 +386,16 @@ check("plain merge pushes the stamp outside the small page (negative control)",
 scaled_writer = PdfWriter()
 scaled_writer.append(open_pdf("mixed.pdf"))
 stamp_page = R2("stamp.pdf").pages[0]
-sw2, sh2 = float(stamp_page.mediabox.width), float(stamp_page.mediabox.height)
+stamp_page.transfer_rotation_to_content()
+stamp_box2 = stamp_page.cropbox
+sw2, sh2 = float(stamp_box2.width), float(stamp_box2.height)
 for page in scaled_writer.pages:
-    dw, dh = float(page.mediabox.width), float(page.mediabox.height)
+    page.transfer_rotation_to_content()
+    destination = page.cropbox
+    dw, dh = float(destination.width), float(destination.height)
     scale = min(dw / sw2, dh / sh2)
-    tx = (dw - sw2 * scale) / 2 - float(stamp_page.mediabox.left) * scale
-    ty = (dh - sh2 * scale) / 2 - float(stamp_page.mediabox.bottom) * scale
+    tx = float(destination.left) + (dw - sw2 * scale) / 2 - float(stamp_box2.left) * scale
+    ty = float(destination.bottom) + (dh - sh2 * scale) / 2 - float(stamp_box2.bottom) * scale
     page.merge_transformed_page(stamp_page, Transformation().scale(scale).translate(tx, ty))
 with open("scaled-stamped.pdf", "wb") as f:
     scaled_writer.write(f)
@@ -344,8 +406,14 @@ scaled_spans = stamp_bboxes("scaled-stamped.pdf", 2)
 check("scaled stamp lands inside the mixed-size small page",
       bool(scaled_spans) and all(bbox[1] < 300 and bbox[3] <= 300.5 for bbox in scaled_spans),
       scaled_spans)
-check("mixed-size pages keep their original dimensions",
-      [round(float(p.mediabox.width)) for p in scaled_check.pages] == [595, 595, 200])
+offset_spans = stamp_bboxes("scaled-stamped.pdf", 3)
+rotated_spans = stamp_bboxes("scaled-stamped.pdf", 4)
+check("scaled stamp lands inside the non-zero-origin page", bool(offset_spans), offset_spans)
+check("scaled stamp lands inside the normalized 90-degree page", bool(rotated_spans), rotated_spans)
+check("mixed-size pages keep their visible dimensions after rotation normalization",
+      [(round(float(p.mediabox.width)), round(float(p.mediabox.height)))
+       for p in scaled_check.pages]
+      == [(595, 842), (595, 842), (200, 300), (200, 300), (160, 240)])
 
 
 # ---- SKILL.md overflow check: off-page text is a defect -------------------------

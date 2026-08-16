@@ -14,7 +14,7 @@ Route by job, use one tool per job, verify the artifact.
 python -c "import reportlab, pypdf, fitz; print('reportlab', reportlab.Version, '| pypdf ok | pymupdf ok')"
 ```
 
-- `reportlab` - creation (preferred: real text, real structure).
+- `reportlab` - creation (preferred: selectable text, controlled layout).
 - `pypdf` - page-level transforms: split, merge, rotate, encrypt, form fields.
 - `pymupdf` (`fitz`) - extraction (text with coordinates, tables, images), rasterization,
   page-level inspection.

@@ -5,7 +5,9 @@
 #   python pptx_fixture.py  (deps: python-pptx)
 #   python xlsx_fixture.py  (deps: openpyxl)
 #   python docx_fixture.py  (deps: python-docx, pymupdf, soffice on PATH)
+import copy
 import sys
+import xml.etree.ElementTree as ET
 import zipfile
 
 from lxml import etree
@@ -61,9 +63,100 @@ chart = slide.shapes.add_chart(
 ).chart
 chart.has_title = True
 chart.chart_title.text_frame.text = "Units by region"
+
+xy_data = XyChartData()
+xy_series = xy_data.add_series("Trend")
+xy_series.add_data_point(1, 2)
+xy_series.add_data_point(3, 4)
+xy_chart = slide.shapes.add_chart(
+    XL_CHART_TYPE.XY_SCATTER, Inches(7.2), Inches(4.7), Inches(2), Inches(2), xy_data,
+).chart
+xy_chart.has_title = True
+xy_chart.chart_title.text_frame.text = "XY trend"
+
+bubble_data = BubbleChartData()
+bubble_series = bubble_data.add_series("Risk")
+bubble_series.add_data_point(3, 4, 5)
+bubble_chart = slide.shapes.add_chart(
+    XL_CHART_TYPE.BUBBLE, Inches(5), Inches(4.7), Inches(2), Inches(2), bubble_data,
+).chart
+bubble_chart.has_title = True
+bubble_chart.chart_title.text_frame.text = "Bubble risk"
 slide.notes_slide.notes_text_frame.text = "Speaker note: explain the regional split."
 
 prs.save("input.pptx")
+
+# ---- analyze.md bounded package check rejects archive bombs before expansion ---
+MAX_XML_PART = 20 * 1024 * 1024
+MAX_ENTRY = 100 * 1024 * 1024
+MAX_TOTAL_UNCOMPRESSED = 500 * 1024 * 1024
+MAX_COMPRESSION_RATIO = 200
+safe_xml_parser = etree.XMLParser(
+    load_dtd=False,
+    resolve_entities=False,
+    no_network=True,
+    huge_tree=False,
+    recover=False,
+)
+
+
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def validate_pptx_package(path):
+    with zipfile.ZipFile(path) as archive:
+        infos = archive.infolist()
+        names = {info.filename for info in infos}
+        require(len(names) == len(infos), "duplicate archive member names are unsafe")
+        require("[Content_Types].xml" in names and "ppt/presentation.xml" in names,
+                "required PPTX package parts are missing")
+        require(sum(info.file_size for info in infos) <= MAX_TOTAL_UNCOMPRESSED,
+                "declared archive size exceeds the review limit")
+        actual_total = 0
+        for info in infos:
+            require(info.file_size <= MAX_ENTRY, f"oversized part: {info.filename}")
+            require(info.file_size / max(info.compress_size, 1) <= MAX_COMPRESSION_RATIO,
+                    f"suspicious compression ratio: {info.filename}")
+            is_xml = info.filename.endswith((".xml", ".rels"))
+            if is_xml:
+                require(info.file_size <= MAX_XML_PART, f"oversized XML part: {info.filename}")
+            chunks = []
+            actual_size = 0
+            with archive.open(info) as stream:
+                while chunk := stream.read(64 * 1024):
+                    actual_size += len(chunk)
+                    actual_total += len(chunk)
+                    require(actual_size <= MAX_ENTRY,
+                            f"part exceeded read limit: {info.filename}")
+                    require(actual_total <= MAX_TOTAL_UNCOMPRESSED,
+                            "archive exceeded total read limit")
+                    if is_xml:
+                        chunks.append(chunk)
+            require(actual_size == info.file_size, f"size mismatch: {info.filename}")
+            if is_xml:
+                etree.fromstring(b"".join(chunks), parser=safe_xml_parser)
+
+
+try:
+    validate_pptx_package("input.pptx")
+    healthy_pptx_passed = True
+except Exception:
+    healthy_pptx_passed = False
+check("bounded PPTX check accepts an ordinary deck", healthy_pptx_passed)
+with zipfile.ZipFile("compressed-bomb.pptx", "w", zipfile.ZIP_DEFLATED) as archive:
+    archive.writestr("[Content_Types].xml", "<Types/>")
+    archive.writestr(
+        "ppt/presentation.xml",
+        '<p:presentation xmlns:p="urn:test">' + (" " * 2_000_000) + "</p:presentation>",
+    )
+try:
+    validate_pptx_package("compressed-bomb.pptx")
+    pptx_bomb_rejected = False
+except ValueError:
+    pptx_bomb_rejected = True
+check("PPTX compression bomb is rejected before XML expansion", pptx_bomb_rejected)
 
 # ---- edit.md snippet: single-shape run replace keeps styling and hyperlink -----
 prs = Presentation("input.pptx")
@@ -114,6 +207,8 @@ check("cell.text assignment is proven lossy (negative control)", not any(r.font.
 
 # ---- analyze.md snippet: grouped-shape walker ----------------------------------
 from pptx.oxml import parse_xml
+from pptx.oxml.ns import qn
+from pptx.oxml.xmlchemy import OxmlElement
 
 prs6 = Presentation()
 slide6 = prs6.slides.add_slide(prs6.slide_layouts[5])
@@ -141,11 +236,36 @@ def iter_shapes(shapes):
             yield shape
 
 
-def cached_numeric_values(series, element_name):
+def cached_numeric_points(source):
+    if source is None:
+        return None
+    point_counts = source.xpath("./c:numRef/c:numCache/c:ptCount | ./c:numLit/c:ptCount")
+    if not point_counts:
+        return None
+    points = source.xpath("./c:numRef/c:numCache/c:pt | ./c:numLit/c:pt")
     return [
-        node.text for node in
-        series._element.xpath(f"./c:{element_name}//c:pt/c:v")
+        (int(point.get("idx")), float(value.text))
+        for point in points
+        if point.get("idx") is not None and (value := point.find(qn("c:v"))) is not None
     ]
+
+
+def series_content(series):
+    x_source = getattr(series._element, "xVal", None)
+    if x_source is None:
+        return {"name": series.name, "values": list(series.values)}
+    x_points = cached_numeric_points(x_source)
+    y_points = cached_numeric_points(getattr(series._element, "yVal", None))
+    if x_points is None or y_points is None:
+        return {"name": series.name, "points": None, "cache_status": "unavailable"}
+    content = {"name": series.name, "x_points": x_points, "y_points": y_points}
+    size_source = getattr(series._element, "bubbleSize", None)
+    if size_source is not None:
+        bubble_points = cached_numeric_points(size_source)
+        if bubble_points is None:
+            return {"name": series.name, "points": None, "cache_status": "unavailable"}
+        content["bubble_points"] = bubble_points
+    return content
 
 
 def extract_slide_content(slide):
@@ -172,29 +292,13 @@ def extract_slide_content(slide):
         )
         plots = []
         for plot in chart.plots:
-            plot_kind = type(plot).__name__
-            if plot_kind in {"XyPlot", "BubblePlot"}:
-                series = []
-                for item in plot.series:
-                    values = {
-                        "name": item.name,
-                        "x_values": cached_numeric_values(item, "xVal"),
-                        "y_values": cached_numeric_values(item, "yVal"),
-                    }
-                    if plot_kind == "BubblePlot":
-                        values["bubble_sizes"] = cached_numeric_values(item, "bubbleSize")
-                    series.append(values)
-                plots.append({"kind": plot_kind, "series": series})
-            else:
-                categories = [
-                    [str(level) for level in label]
-                    for label in plot.categories.flattened_labels
-                ]
-                series = [
-                    {"name": item.name, "values": list(item.values)}
-                    for item in plot.series
-                ]
-                plots.append({"kind": plot_kind, "categories": categories, "series": series})
+            items = list(plot.series)
+            has_xy_values = any(getattr(item._element, "xVal", None) is not None for item in items)
+            categories = [] if has_xy_values else [
+                [str(level) for level in label] for label in plot.categories.flattened_labels
+            ]
+            series = [series_content(item) for item in items]
+            plots.append({"kind": type(plot).__name__, "categories": categories, "series": series})
         charts.append({"title": chart_title, "plots": plots})
     notes = slide.notes_slide.notes_text_frame.text if slide.has_notes_slide else ""
     return {"text": text, "tables": tables, "charts": charts, "notes": notes}
@@ -212,6 +316,17 @@ check(
     == [{"name": "Units", "values": [120.0, 80.0]}],
     content["charts"],
 )
+chart_by_title = {item["title"]: item for item in content["charts"]}
+check("content inventory emits XY x/y points",
+      chart_by_title["XY trend"]["plots"][0]["series"][0]["x_points"]
+      == [(0, 1.0), (1, 3.0)]
+      and chart_by_title["XY trend"]["plots"][0]["series"][0]["y_points"]
+      == [(0, 2.0), (1, 4.0)])
+check("content inventory emits bubble x/y/size points",
+      chart_by_title["Bubble risk"]["plots"][0]["series"][0]["x_points"] == [(0, 3.0)]
+      and chart_by_title["Bubble risk"]["plots"][0]["series"][0]["y_points"] == [(0, 4.0)]
+      and chart_by_title["Bubble risk"]["plots"][0]["series"][0]["bubble_points"]
+      == [(0, 5.0)])
 check("content inventory emits notes text", "regional split" in content["notes"], content["notes"])
 
 merge_prs = Presentation()
@@ -255,8 +370,8 @@ check(
     "scatter inventory emits x and y caches without category access",
     any(
         plot["kind"] == "XyPlot"
-        and plot["series"][0]["x_values"] == ["1", "3"]
-        and plot["series"][0]["y_values"] == ["2", "4"]
+        and plot["series"][0]["x_points"] == [(0, 1.0), (1, 3.0)]
+        and plot["series"][0]["y_points"] == [(0, 2.0), (1, 4.0)]
         for plot in xy_plots
     ),
     xy_plots,
@@ -265,13 +380,32 @@ check(
     "bubble inventory emits x, y, and bubble-size caches",
     any(
         plot["kind"] == "BubblePlot"
-        and plot["series"][0]["x_values"] == ["5"]
-        and plot["series"][0]["y_values"] == ["6"]
-        and plot["series"][0]["bubble_sizes"] == ["7"]
+        and plot["series"][0]["x_points"] == [(0, 5.0)]
+        and plot["series"][0]["y_points"] == [(0, 6.0)]
+        and plot["series"][0]["bubble_points"] == [(0, 7.0)]
         for plot in xy_plots
     ),
     xy_plots,
 )
+
+# Missing caches and missing ptCount are unavailable, not a proven empty series.
+xy_plot = next(plot for chart in Presentation("xy-bubble.pptx").slides[0].shapes
+               if chart.has_chart for plot in chart.chart.plots
+               if type(plot).__name__ == "XyPlot")
+xy_item = list(xy_plot.series)[0]
+x_source = xy_item._element.xVal
+missing_cache = copy.deepcopy(x_source)
+missing_cache_ref = missing_cache.find(qn("c:numRef"))
+missing_cache_ref.remove(missing_cache_ref.find(qn("c:numCache")))
+check("numeric cache without numCache reports unavailable", cached_numeric_points(missing_cache) is None)
+missing_count = copy.deepcopy(x_source)
+missing_count_cache = missing_count.find(qn("c:numRef") + "/" + qn("c:numCache"))
+missing_count_cache.remove(missing_count_cache.find(qn("c:ptCount")))
+check("numeric cache without ptCount reports unavailable", cached_numeric_points(missing_count) is None)
+actual_cache = x_source.xpath("./c:numRef/c:numCache")[0]
+x_source.xpath("./c:numRef")[0].remove(actual_cache)
+check("XY series with an unavailable cache is explicit",
+      series_content(xy_item).get("cache_status") == "unavailable", series_content(xy_item))
 
 
 sp_element = slide6.shapes[-1]._element  # the textbox; layout 5 still carries a Title placeholder
@@ -348,8 +482,25 @@ check("locator reaches wording stored only in a table cell", len(table_candidate
 check("table-cell locator retains row and column",
       table_candidates[0][1].endswith("/table[0,1]"), table_candidates[0][1])
 
+duplicate_prs = Presentation("input.pptx")
+duplicate_shape = next(shape for shape in duplicate_prs.slides[0].shapes if shape.has_table)
+duplicate_shape.table.cell(1, 0).text = old_cell
+all_table_candidates = [
+    (i, location, text_frame)
+    for i, slide_item in enumerate(duplicate_prs.slides)
+    for path, shape in iter_shapes_with_path(slide_item.shapes)
+    for location, text_frame in iter_text_targets(path, shape)
+    if old_cell in text_frame.text
+]
+target_location = f"{duplicate_shape.name}/table[0,1]"
+selected_table_candidates = [
+    candidate for candidate in all_table_candidates if candidate[1] == target_location
+]
+check("duplicate table text requires a location selector", len(all_table_candidates) == 2)
+check("table location selector chooses one row/column",
+      len(selected_table_candidates) == 1, [item[1] for item in all_table_candidates])
+
 # ---- analyze.md snippet: per-master, script-aware theme font resolution --------
-import xml.etree.ElementTree as ET
 
 prs7 = Presentation("input.pptx")
 theme_cache = {}
@@ -389,36 +540,111 @@ def theme_faces_for_slide(slide):
     return cache_key, theme_cache[cache_key]
 
 
+EAST_ASIAN_SCRIPTS = {"Hans", "Hant", "Jpan", "Hang"}
+COMPLEX_SCRIPTS = {"Arab", "Hebr", "Deva", "Beng", "Taml", "Thai"}
+
+
+def character_tags(character):
+    codepoint = ord(character)
+    if 0x3040 <= codepoint <= 0x30FF:
+        return ["Jpan"]
+    if 0x1100 <= codepoint <= 0x11FF or 0xAC00 <= codepoint <= 0xD7AF:
+        return ["Hang"]
+    if 0x2F00 <= codepoint <= 0x9FFF:
+        return ["Hans", "Hant", "Jpan", "Hang"]
+    for tag, start, end in (
+        ("Cyrl", 0x0400, 0x052F), ("Hebr", 0x0590, 0x05FF),
+        ("Arab", 0x0600, 0x06FF), ("Deva", 0x0900, 0x097F),
+        ("Beng", 0x0980, 0x09FF), ("Taml", 0x0B80, 0x0BFF),
+        ("Thai", 0x0E00, 0x0E7F),
+    ):
+        if start <= codepoint <= end:
+            return [tag]
+    return []
+
+
 def script_tags(text):
     tags = []
     for character in text:
-        codepoint = ord(character)
-        if 0x3040 <= codepoint <= 0x30FF:
-            tags.append("Jpan")
-        elif 0xAC00 <= codepoint <= 0xD7AF:
-            tags.append("Hang")
-        elif 0x2E80 <= codepoint <= 0x9FFF:
-            tags.extend(("Hans", "Hant", "Jpan", "Hang"))
-        elif 0x0400 <= codepoint <= 0x052F:
-            tags.append("Cyrl")
-        elif 0x0590 <= codepoint <= 0x05FF:
-            tags.append("Hebr")
-        elif 0x0600 <= codepoint <= 0x06FF:
-            tags.append("Arab")
-        elif 0x0900 <= codepoint <= 0x097F:
-            tags.append("Deva")
+        tags.extend(character_tags(character))
     return list(dict.fromkeys(tags))
 
 
-def theme_candidates(role_fonts, text):
-    faces = [role_fonts["latin"]]
-    tags = script_tags(text)
-    if any(tag in ("Hans", "Hant", "Jpan", "Hang") for tag in tags):
-        faces.append(role_fonts["eastAsia"])
-    if any(tag in ("Arab", "Hebr", "Deva") for tag in tags):
-        faces.append(role_fonts["complexScript"])
-    faces.extend(role_fonts["scripts"].get(tag, "") for tag in tags)
-    return [face for face in dict.fromkeys(faces) if face]
+def required_slots(text):
+    slots = []
+    for character in text:
+        tags = set(character_tags(character))
+        slot = "eastAsia" if tags & EAST_ASIAN_SCRIPTS else (
+            "complexScript" if tags & COMPLEX_SCRIPTS else "latin"
+        )
+        if slot not in slots:
+            slots.append(slot)
+    return slots or ["latin"]
+
+
+def raw_font_slots(rpr):
+    slots = {}
+    if rpr is None:
+        return slots
+    for slot, tag in (("latin", "a:latin"), ("eastAsia", "a:ea"),
+                      ("complexScript", "a:cs")):
+        child = rpr.find(qn(tag))
+        if child is not None and child.get("typeface"):
+            slots[slot] = child.get("typeface")
+    return slots
+
+
+THEME_TOKENS = {
+    "+mj-lt": ("major", "latin"), "+mj-ea": ("major", "eastAsia"),
+    "+mj-cs": ("major", "complexScript"), "+mn-lt": ("minor", "latin"),
+    "+mn-ea": ("minor", "eastAsia"), "+mn-cs": ("minor", "complexScript"),
+}
+
+
+def expand_theme_token(face, theme_fonts):
+    role_slot = THEME_TOKENS.get(face)
+    return theme_fonts[role_slot[0]][role_slot[1]] if role_slot else face
+
+
+def font_candidates(run, paragraph, theme_fonts, role):
+    run_slots = raw_font_slots(run._r.rPr)
+    ppr = paragraph._p.pPr
+    paragraph_slots = raw_font_slots(None if ppr is None else ppr.defRPr)
+    tags = script_tags(run.text)
+    candidates = []
+    for slot in required_slots(run.text):
+        fallback_role = role
+        explicit_source = None
+        face = run_slots.get(slot)
+        if face:
+            explicit_source = "run"
+        else:
+            face = paragraph_slots.get(slot)
+            if face:
+                explicit_source = "paragraph defaults"
+        if face:
+            resolved = expand_theme_token(face, theme_fonts)
+            if resolved:
+                candidates.append((slot, resolved, explicit_source))
+                continue
+            if face in THEME_TOKENS:
+                fallback_role = THEME_TOKENS[face][0]
+            else:
+                continue
+        role_fonts = theme_fonts[fallback_role]
+        slot_tags = [
+            tag for tag in tags
+            if (slot == "eastAsia" and tag in EAST_ASIAN_SCRIPTS)
+            or (slot == "complexScript" and tag in COMPLEX_SCRIPTS)
+            or (slot == "latin" and tag not in EAST_ASIAN_SCRIPTS | COMPLEX_SCRIPTS)
+        ]
+        candidates.extend(
+            (slot, role_fonts["scripts"][tag], f"{fallback_role} theme script {tag}")
+            for tag in slot_tags if role_fonts["scripts"].get(tag)
+        )
+        if role_fonts.get(slot):
+            candidates.append((slot, role_fonts[slot], f"{fallback_role} theme {slot}"))
+    return list(dict.fromkeys(candidates))
 
 
 master_name, theme_fonts = theme_faces_for_slide(prs7.slides[0])
@@ -475,19 +701,11 @@ check(
 _, script_fonts = theme_faces_for_slide(stub_slide(
     "/ppt/slideMasters/scripts.xml", "Latin Theme", "Latin Body",
     east_asian="East Asian Theme", complex_script="Complex Script Theme",
-    scripts={"Hans": "Simplified Chinese Theme", "Cyrl": "Cyrillic Theme"},
+    scripts={
+        "Hans": "Simplified Chinese Theme", "Cyrl": "Cyrillic Theme",
+        "Thai": "Thai Theme",
+    },
 ))
-check(
-    "CJK inherited-font triage includes east-Asian and script-specific faces",
-    {"East Asian Theme", "Simplified Chinese Theme"}
-    <= set(theme_candidates(script_fonts["major"], "汉字")),
-    theme_candidates(script_fonts["major"], "汉字"),
-)
-check(
-    "non-Latin inherited-font triage uses script mappings",
-    "Cyrillic Theme" in theme_candidates(script_fonts["minor"], "текст"),
-    theme_candidates(script_fonts["minor"], "текст"),
-)
 
 check(
     "unstyled runs report as inherited, not as a concrete face",
@@ -502,78 +720,57 @@ paragraph_run.text = "paragraph default"
 explicit_run = font_paragraph.add_run()
 explicit_run.text = "run override"
 explicit_run.font.name = "Run Face"
-detected_faces = []
-for run in font_paragraph.runs:
-    if run.font.name:
-        detected_faces.append((run.font.name, "run"))
-    elif font_paragraph.font.name:
-        detected_faces.append((font_paragraph.font.name, "paragraph defaults"))
-check("font triage reports the run face and source", ("Run Face", "run") in detected_faces, detected_faces)
+cjk_theme_run = font_paragraph.add_run()
+cjk_theme_run.text = "汉字"
+thai_theme_run = font_paragraph.add_run()
+thai_theme_run.text = "ไทย"
+mixed_run = font_paragraph.add_run()
+mixed_run.text = "A汉ก"
+mixed_run.font.name = "Latin Explicit"
+for tag, face in (("a:ea", "East Explicit"), ("a:cs", "Complex Explicit")):
+    node = OxmlElement(tag)
+    node.set("typeface", face)
+    mixed_run._r.get_or_add_rPr().append(node)
+token_run = font_paragraph.add_run()
+token_run.text = "汉"
+token_ea = OxmlElement("a:ea")
+token_ea.set("typeface", "+mj-ea")
+token_run._r.get_or_add_rPr().append(token_ea)
+
+token_fallback_fonts = {
+    "major": {"latin": "Major Latin", "eastAsia": "", "complexScript": "",
+              "scripts": {"Hans": "Major Hans"}},
+    "minor": {"latin": "Minor Latin", "eastAsia": "Minor East", "complexScript": "",
+              "scripts": {"Hans": "Minor Hans"}},
+}
+
+detected_faces = {
+    run.text: font_candidates(run, font_paragraph, script_fonts, "minor")
+    for run in font_paragraph.runs
+}
+check("font triage reports the run face and source",
+      ("latin", "Run Face", "run") in detected_faces["run override"], detected_faces)
 check(
     "font triage reports the paragraph face and source",
-    ("Paragraph Face", "paragraph defaults") in detected_faces,
+    ("latin", "Paragraph Face", "paragraph defaults")
+    in detected_faces["paragraph default"],
     detected_faces,
 )
-
-# ---- analyze.md bounded ZIP/XML health check ----------------------------------
-MAX_XML_PART = 20 * 1024 * 1024
-MAX_ENTRY = 100 * 1024 * 1024
-MAX_TOTAL_UNCOMPRESSED = 500 * 1024 * 1024
-MAX_COMPRESSION_RATIO = 200
-safe_xml_parser = etree.XMLParser(
-    load_dtd=False,
-    resolve_entities=False,
-    no_network=True,
-    huge_tree=False,
-    recover=False,
+check(
+    "CJK inherited-font triage includes east-Asian and script-specific faces",
+    {"East Asian Theme", "Simplified Chinese Theme"}
+    <= {face for _, face, _ in detected_faces["汉字"]}, detected_faces["汉字"],
 )
-
-
-def validate_pptx_package(path):
-    with zipfile.ZipFile(path) as archive:
-        infos = archive.infolist()
-        names = {info.filename for info in infos}
-        assert len(names) == len(infos)
-        assert "[Content_Types].xml" in names and "ppt/presentation.xml" in names
-        assert sum(info.file_size for info in infos) <= MAX_TOTAL_UNCOMPRESSED
-        actual_total = 0
-        for info in infos:
-            assert info.file_size <= MAX_ENTRY
-            assert info.file_size / max(info.compress_size, 1) <= MAX_COMPRESSION_RATIO
-            is_xml = info.filename.endswith((".xml", ".rels"))
-            if is_xml:
-                assert info.file_size <= MAX_XML_PART
-            chunks = []
-            actual_size = 0
-            with archive.open(info) as stream:
-                while chunk := stream.read(64 * 1024):
-                    actual_size += len(chunk)
-                    actual_total += len(chunk)
-                    assert actual_size <= MAX_ENTRY
-                    assert actual_total <= MAX_TOTAL_UNCOMPRESSED
-                    if is_xml:
-                        chunks.append(chunk)
-            assert actual_size == info.file_size
-            if is_xml:
-                etree.fromstring(b"".join(chunks), parser=safe_xml_parser)
-
-
-try:
-    validate_pptx_package("input.pptx")
-    healthy_package_passed = True
-except Exception:
-    healthy_package_passed = False
-check("bounded package health check accepts an ordinary PPTX", healthy_package_passed)
-
-with zipfile.ZipFile("compressed-bomb.pptx", "w", zipfile.ZIP_DEFLATED) as archive:
-    archive.writestr("[Content_Types].xml", "<Types/>")
-    archive.writestr("ppt/presentation.xml", "<presentation>" + (" " * 2_000_000) + "</presentation>")
-try:
-    validate_pptx_package("compressed-bomb.pptx")
-    archive_bomb_rejected = False
-except (AssertionError, ValueError):
-    archive_bomb_rejected = True
-check("PPTX compression bomb is rejected before XML expansion", archive_bomb_rejected)
+check("Thai inherited-font triage uses its script mapping",
+      "Thai Theme" in {face for _, face, _ in detected_faces["ไทย"]}, detected_faces["ไทย"])
+check("explicit Latin/East-Asian/complex-script slots resolve independently",
+      {(slot, face) for slot, face, _ in detected_faces["A汉ก"]}
+      == {("latin", "Latin Explicit"), ("eastAsia", "East Explicit"),
+          ("complexScript", "Complex Explicit")}, detected_faces["A汉ก"])
+check("empty +mj-ea generic face falls back to the major script mapping",
+      ("eastAsia", "Major Hans", "major theme script Hans")
+      in font_candidates(token_run, font_paragraph, token_fallback_fonts, "minor"),
+      font_candidates(token_run, font_paragraph, token_fallback_fonts, "minor"))
 
 
 # ---- analyze.md snippet: sparse cache points keep their idx ----------------------

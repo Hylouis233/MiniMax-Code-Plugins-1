@@ -17,6 +17,7 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.table import Table
 from docx.text.paragraph import Paragraph
+from docx.text.run import Run
 from lxml import etree
 
 failures = []
@@ -50,31 +51,48 @@ MAX_TOTAL_UNCOMPRESSED = 500 * 1024 * 1024
 MAX_COMPRESSION_RATIO = 200
 
 
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
 def validate_docx_package(path):
     with zipfile.ZipFile(path) as archive:
         infos = archive.infolist()
         names = {info.filename for info in infos}
-        assert len(names) == len(infos)
-        assert "[Content_Types].xml" in names and "word/document.xml" in names
-        assert sum(info.file_size for info in infos) <= MAX_TOTAL_UNCOMPRESSED
+        require(len(names) == len(infos), "duplicate archive member names are unsafe")
+        require(
+            "[Content_Types].xml" in names and "word/document.xml" in names,
+            "required DOCX package parts are missing",
+        )
+        require(
+            sum(info.file_size for info in infos) <= MAX_TOTAL_UNCOMPRESSED,
+            "declared archive size exceeds the review limit",
+        )
         actual_total = 0
         for info in infos:
-            assert info.file_size <= MAX_ENTRY
-            assert info.file_size / max(info.compress_size, 1) <= MAX_COMPRESSION_RATIO
+            require(info.file_size <= MAX_ENTRY, f"oversized part: {info.filename}")
+            require(
+                info.file_size / max(info.compress_size, 1) <= MAX_COMPRESSION_RATIO,
+                f"suspicious compression ratio: {info.filename}",
+            )
             is_xml = info.filename.endswith((".xml", ".rels"))
             if is_xml:
-                assert info.file_size <= MAX_XML_PART
+                require(info.file_size <= MAX_XML_PART, f"oversized XML part: {info.filename}")
             chunks = []
             actual_size = 0
             with archive.open(info) as stream:
                 while chunk := stream.read(64 * 1024):
                     actual_size += len(chunk)
                     actual_total += len(chunk)
-                    assert actual_size <= MAX_ENTRY
-                    assert actual_total <= MAX_TOTAL_UNCOMPRESSED
+                    require(actual_size <= MAX_ENTRY, f"part exceeded read limit: {info.filename}")
+                    require(
+                        actual_total <= MAX_TOTAL_UNCOMPRESSED,
+                        "archive exceeded total read limit",
+                    )
                     if is_xml:
                         chunks.append(chunk)
-            assert actual_size == info.file_size
+            require(actual_size == info.file_size, f"size mismatch: {info.filename}")
             if is_xml:
                 etree.fromstring(b"".join(chunks), parser=safe_xml_parser)
 
@@ -98,71 +116,94 @@ try:
 except (AssertionError, ValueError):
     archive_bomb_rejected = True
 check("suspicious compression ratio is rejected before XML expansion", archive_bomb_rejected)
+check(
+    "archive safety checks remain active under optimized Python",
+    __debug__ or archive_bomb_rejected,
+)
 
-# ---- read.md includes block paragraphs nested in content controls --------------
-def iter_body_paragraphs(parent, document):
-    for child in parent.iterchildren():
+# ---- read.md includes block/inline content controls and controlled tables -------
+def iter_part_blocks(root, parent):
+    for child in root.iterchildren():
         if child.tag == qn("w:p"):
-            yield Paragraph(child, document)
-        elif child.tag == qn("w:sdt"):
-            content = child.find(qn("w:sdtContent"))
-            if content is not None:
-                yield from iter_body_paragraphs(content, document)
-
-
-def iter_body_blocks(parent, document):
-    for child in parent.iterchildren():
-        if child.tag == qn("w:p"):
-            yield ("p", Paragraph(child, document))
+            yield "paragraph", Paragraph(child, parent)
         elif child.tag == qn("w:tbl"):
-            yield ("table", Table(child, document))
-        elif child.tag == qn("w:sdt"):
-            content = child.find(qn("w:sdtContent"))
-            if content is not None:
-                yield from iter_body_blocks(content, document)
+            yield "table", Table(child, parent)
+        else:
+            yield from iter_part_blocks(child, parent)
+
+
+def iter_paragraph_runs(paragraph):
+    def walk(element):
+        for child in element.iterchildren():
+            if child.tag == qn("w:r"):
+                yield Run(child, paragraph)
+            elif child.tag != qn("w:p"):
+                yield from walk(child)
+    yield from walk(paragraph._p)
+
+
+def paragraph_text(paragraph):
+    return "".join(run.text for run in iter_paragraph_runs(paragraph))
+
+
+def table_content(table):
+    rows = []
+    for row in table.rows:
+        rendered_cells = []
+        for cell in row.cells:
+            items = []
+            for kind, block in iter_part_blocks(cell._tc, cell):
+                items.append(paragraph_text(block) if kind == "paragraph" else table_content(block))
+            rendered_cells.append(items)
+        rows.append(rendered_cells)
+    return rows
+
+
+def wrap_in_sdt(element):
+    sdt = OxmlElement("w:sdt")
+    content = OxmlElement("w:sdtContent")
+    element.getparent().replace(element, sdt)
+    content.append(element)
+    sdt.append(content)
 
 
 sdt_doc = Document()
 sdt_doc.add_paragraph("direct paragraph")
 sdt_paragraph = sdt_doc.add_paragraph("inside content control")
-sdt = OxmlElement("w:sdt")
-sdt_content = OxmlElement("w:sdtContent")
-sdt_paragraph._p.getparent().replace(sdt_paragraph._p, sdt)
-sdt_content.append(sdt_paragraph._p)
-sdt.append(sdt_content)
-sdt_doc.add_paragraph("trailing paragraph")
+wrap_in_sdt(sdt_paragraph._p)
+controlled_table = sdt_doc.add_table(rows=1, cols=1)
+controlled_table.cell(0, 0).text = "table한"
+nested_table = controlled_table.cell(0, 0).add_table(rows=1, cols=1)
+nested_table.cell(0, 0).text = "nested한"
+wrap_in_sdt(controlled_table._tbl)
+inline_paragraph = sdt_doc.add_paragraph("before-")
+inline_run = inline_paragraph.add_run("inline한")
+inline_paragraph.add_run("-after")
+wrap_in_sdt(inline_run._r)
 sdt_doc.save("content-control.docx")
 sdt_reopened = Document("content-control.docx")
 check("doc.paragraphs omits block content-control text (negative control)",
       "inside content control" not in [paragraph.text for paragraph in sdt_reopened.paragraphs])
-walked_text = [paragraph.text for paragraph in iter_body_paragraphs(sdt_reopened.element.body, sdt_reopened)]
+walked_blocks = list(iter_part_blocks(sdt_reopened.element.body, sdt_reopened))
+check("doc.tables omits a table wrapped by a block content control (negative control)",
+      len(sdt_reopened.tables) == 0)
+check("block walker preserves document order across content controls",
+      [kind for kind, _ in walked_blocks]
+      == ["paragraph", "paragraph", "table", "paragraph"], walked_blocks)
+walked_paragraphs = [block for kind, block in walked_blocks if kind == "paragraph"]
+walked_text = [paragraph_text(paragraph) for paragraph in walked_paragraphs]
 check("content-control traversal emits the nested paragraph", "inside content control" in walked_text, walked_text)
-
-# A table placed inside w:sdtContent is invisible to doc.tables; the block walker reaches it.
-table_doc = Document()
-table_doc.add_paragraph("before the control")
-sdt_table = table_doc.add_table(rows=2, cols=2)
-sdt_table.cell(0, 0).text = "ctrl-a1"
-sdt_table.cell(1, 1).text = "ctrl-b2"
-table_sdt = OxmlElement("w:sdt")
-table_sdt_content = OxmlElement("w:sdtContent")
-sdt_table._tbl.getparent().replace(sdt_table._tbl, table_sdt)
-table_sdt_content.append(sdt_table._tbl)
-table_sdt.append(table_sdt_content)
-table_doc.add_paragraph("after the control")
-table_doc.save("content-control-table.docx")
-table_reopened = Document("content-control-table.docx")
-check("doc.tables omits content-control tables (negative control)", len(table_reopened.tables) == 0)
-blocks = list(iter_body_blocks(table_reopened.element.body, table_reopened))
-kinds = [kind for kind, _ in blocks]
-nested_tables = [block for kind, block in blocks if kind == "table"]
-check("block walker keeps document order across the control",
-      kinds == ["p", "table", "p"], kinds)
-check("block walker surfaces the content-control table", len(nested_tables) == 1)
-if nested_tables:
-    check("content-control table cells are readable",
-          nested_tables[0].cell(0, 0).text == "ctrl-a1" and nested_tables[0].cell(1, 1).text == "ctrl-b2",
-          [[cell.text for cell in row.cells] for row in nested_tables[0].rows])
+check("content-control traversal emits inline run text",
+      "before-inline한-after" in walked_text, walked_text)
+walked_tables = [block for kind, block in walked_blocks if kind == "table"]
+rendered_tables = [table_content(table) for table in walked_tables]
+check("content-control traversal emits a wrapped table",
+      len(walked_tables) == 1 and "table한" in str(rendered_tables), rendered_tables)
+all_emitted = walked_text + [str(table) for table in rendered_tables]
+check("table text is emitted exactly once, not again as prose",
+      sum(item.count("table한") for item in all_emitted) == 1, all_emitted)
+check("nested-table text is emitted exactly once",
+      sum(item.count("nested한") for item in all_emitted) == 1, all_emitted)
 
 # Per-run glyph validation must not let a different referenced font hide a missing glyph.
 fixture_cmaps = {"CJK Face": {ord("漢")}, "Latin Face": {ord("A")}}
@@ -175,57 +216,90 @@ check("pooled cmap is proven unsafe (negative control)", pooled_passes)
 check("per-run cmap check identifies the actual missing glyph",
       per_run_missing == [("Latin Face", "漢")], per_run_missing)
 
-# Header/footer runs do not expose run.part.document; resolve Normal from doc once.
-header_doc = Document()
-normal_style = header_doc.styles["Normal"]
-normal_rfonts = normal_style._element.get_or_add_rPr().get_or_add_rFonts()
-normal_rfonts.set(qn("w:eastAsia"), "Header CJK Face")
-header_run = header_doc.sections[0].header.paragraphs[0].add_run("漢")
+def font_slot(character):
+    codepoint = ord(character)
+    uses_east_asian_slot = (
+        0x1100 <= codepoint <= 0x11FF
+        or 0x2F00 <= codepoint <= 0x9FFF
+        or 0xA000 <= codepoint <= 0xA4CF
+        or 0xA960 <= codepoint <= 0xA97F
+        or 0xAC00 <= codepoint <= 0xD7FF
+        or 0xF900 <= codepoint <= 0xFAFF
+        or 0xFE30 <= codepoint <= 0xFE6F
+        or 0xFF00 <= codepoint <= 0xFFEF
+        or 0x20000 <= codepoint <= 0x3134F
+    )
+    return "eastAsia" if uses_east_asian_slot else ("ascii" if codepoint < 128 else "hAnsi")
 
 
-def fixture_face_from_rpr(rpr, slot):
+check("Han ideographs use the east-Asian font slot", font_slot("漢") == "eastAsia")
+check("Hangul syllables use the east-Asian font slot", font_slot("한") == "eastAsia")
+check("Hangul Jamo use the east-Asian font slot", font_slot("ᄒ") == "eastAsia")
+check("Yi syllables use the east-Asian font slot", font_slot("ꀀ") == "eastAsia")
+check("CJK compatibility forms use the east-Asian font slot", font_slot("︰") == "eastAsia")
+check("ASCII text keeps the ascii font slot", font_slot("A") == "ascii")
+
+# Header/footer parts have no `.document`; effective styles close over the document.
+font_doc = Document()
+normal_style = font_doc.styles["Normal"]
+normal_fonts = normal_style.element.get_or_add_rPr().get_or_add_rFonts()
+normal_fonts.set(qn("w:ascii"), "Latin Face")
+normal_fonts.set(qn("w:hAnsi"), "Latin Face")
+normal_fonts.set(qn("w:eastAsia"), "CJK Face")
+header_run = font_doc.sections[0].header.paragraphs[0].add_run("页眉")
+footer_run = font_doc.sections[0].footer.paragraphs[0].add_run("页脚")
+
+
+def face_from_rpr(rpr, slot):
     if rpr is None:
         return None
     rfonts = rpr.find(qn("w:rFonts"))
     return None if rfonts is None else rfonts.get(qn("w:" + slot))
 
 
-def fixture_style_faces(style, slot):
+def style_faces(style, slot):
     while style is not None:
-        face = fixture_face_from_rpr(style.element.find(qn("w:rPr")), slot)
+        face = face_from_rpr(style.element.find(qn("w:rPr")), slot)
         if face:
             yield face
         style = style.base_style
 
 
-def fixture_effective_face(run, slot):
-    direct = fixture_face_from_rpr(run._r.find(qn("w:rPr")), slot)
+def effective_face(run, slot):
+    direct = face_from_rpr(run._r.find(qn("w:rPr")), slot)
     if direct:
         return direct
     for style in (run.style, run._parent.style, normal_style):
-        if face := next(fixture_style_faces(style, slot), None):
+        if face := next(style_faces(style, slot), None):
             return face
     raise LookupError(slot)
 
 
 check("header part has no document back-reference (negative control)",
       not hasattr(header_run.part, "document"))
-check("header glyph validation resolves document Normal style",
-      fixture_effective_face(header_run, "eastAsia") == "Header CJK Face")
+check("header runs resolve Normal from the owning document",
+      effective_face(header_run, "eastAsia") == "CJK Face")
+check("footer runs resolve Normal from the owning document",
+      effective_face(footer_run, "eastAsia") == "CJK Face")
+inline_paragraph_reopened = next(
+    paragraph for paragraph in walked_paragraphs if "before-" in paragraph_text(paragraph)
+)
+check("inline content-control runs are included in glyph traversal",
+      any(run.text == "inline한" for run in iter_paragraph_runs(inline_paragraph_reopened)))
 
 # ---- edit.md guarded cross-run replacement ------------------------------------
 SAFE_RUN_CHILDREN = {
-    qn("w:rPr"), qn("w:t"), qn("w:tab"), qn("w:br"), qn("w:cr"),
+    qn("w:rPr"), qn("w:t"), qn("w:tab"), qn("w:cr"),
 }
 
 
 def unsafe_run_content(run):
     unsafe = []
     for child in run._r:
-        typed_break = child.tag == qn("w:br") and child.get(qn("w:type")) not in (
-            None, "textWrapping",
+        ordinary_break = child.tag == qn("w:br") and dict(child.attrib) in (
+            {}, {qn("w:type"): "textWrapping"},
         )
-        if child.tag not in SAFE_RUN_CHILDREN or typed_break:
+        if child.tag not in SAFE_RUN_CHILDREN and not ordinary_break:
             unsafe.append(child.tag.rsplit("}", 1)[-1])
     return unsafe
 
@@ -303,6 +377,23 @@ check(
     "rejected replacement leaves text and drawing untouched",
     guard_run.text == "TBD" and len(guard_run._r.findall(qn("w:drawing"))) == 1,
 )
+
+clear_doc = Document()
+clear_paragraph = clear_doc.add_paragraph()
+clear_run = clear_paragraph.add_run("TBD")
+clear_break = OxmlElement("w:br")
+clear_break.set(qn("w:type"), "textWrapping")
+clear_break.set(qn("w:clear"), "left")
+clear_run._r.append(clear_break)
+clear_before = etree.tostring(clear_run._r)
+try:
+    replace_across_runs(clear_paragraph, "TBD", "done")
+    clear_break_rejected = False
+except ValueError:
+    clear_break_rejected = True
+check("replacement rejects a wrapping break with clear semantics", clear_break_rejected)
+check("rejected clear-break replacement is atomic",
+      etree.tostring(clear_run._r) == clear_before)
 
 
 def list_number_num_id(doc):
@@ -503,6 +594,9 @@ def font_slot(character):
 check("Hangul syllables use the East Asian slot", font_slot("한") == "eastAsia")
 check("Hangul jamo use the East Asian slot", font_slot("ᄀ") == "eastAsia")
 check("compatibility jamo use the East Asian slot", font_slot("ㄱ") == "eastAsia")
+check("Hangul extended-A uses the East Asian slot", font_slot(chr(0xA960)) == "eastAsia")
+check("Hangul extended-B uses the East Asian slot", font_slot(chr(0xD7B0)) == "eastAsia")
+check("U+2E80 CJK radical uses the East Asian slot", font_slot(chr(0x2E80)) == "eastAsia")
 check("Latin stays in the ascii slot", font_slot("A") == "ascii")
 check("non-CJK fullwidth-range-adjacent Latin-1 stays hAnsi", font_slot("é") == "hAnsi")
 

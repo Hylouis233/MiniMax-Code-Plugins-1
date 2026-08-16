@@ -15,18 +15,36 @@ def iter_shapes(shapes):
         else:
             yield shape
 
-def cached_numeric_points(series, element_name):
-    """Read cached numeric points python-pptx does not expose for XY/bubble axes.
-
-    Returns (idx, value) pairs: a series with blank points omits those <c:pt>
-    entries while later points keep their original idx, so values extracted
-    without their indices cannot be paired across the x/y/bubble axes.
-    """
+def cached_numeric_points(source):
+    """Return indexed cached points, or None when the cache metadata is unavailable."""
+    if source is None:
+        return None
+    point_counts = source.xpath("./c:numRef/c:numCache/c:ptCount | ./c:numLit/c:ptCount")
+    if not point_counts:
+        return None
+    points = source.xpath("./c:numRef/c:numCache/c:pt | ./c:numLit/c:pt")
     return [
-        (int(pt.get("idx")), pt.find(qn("c:v")).text)
-        for pt in series._element.xpath(f"./c:{element_name}//c:pt")
-        if pt.get("idx") is not None and pt.find(qn("c:v")) is not None
+        (int(point.get("idx")), float(value.text))
+        for point in points
+        if point.get("idx") is not None and (value := point.find(qn("c:v"))) is not None
     ]
+
+def series_content(series):
+    x_source = getattr(series._element, "xVal", None)
+    if x_source is None:                    # category/value chart
+        return {"name": series.name, "values": list(series.values)}
+    x_points = cached_numeric_points(x_source)
+    y_points = cached_numeric_points(getattr(series._element, "yVal", None))
+    if x_points is None or y_points is None:
+        return {"name": series.name, "points": None, "cache_status": "unavailable"}
+    content = {"name": series.name, "x_points": x_points, "y_points": y_points}
+    size_source = getattr(series._element, "bubbleSize", None)
+    if size_source is not None:
+        bubble_points = cached_numeric_points(size_source)
+        if bubble_points is None:
+            return {"name": series.name, "points": None, "cache_status": "unavailable"}
+        content["bubble_points"] = bubble_points
+    return content
 
 prs = Presentation("input.pptx")
 print("slide size:", prs.slide_width, prs.slide_height)
@@ -57,31 +75,13 @@ for i, slide in enumerate(prs.slides):
         )
         plots = []
         for plot in chart.plots:
-            plot_kind = type(plot).__name__
-            if plot_kind in {"XyPlot", "BubblePlot"}:
-                series = []
-                for item in plot.series:
-                    values = {
-                        "name": item.name,
-                        # Pair x/y/bubble entries by idx; a missing idx marks a
-                        # blank point and must not shift the pairing.
-                        "x_points": cached_numeric_points(item, "xVal"),
-                        "y_points": cached_numeric_points(item, "yVal"),
-                    }
-                    if plot_kind == "BubblePlot":
-                        values["bubble_points"] = cached_numeric_points(item, "bubbleSize")
-                    series.append(values)
-                plots.append({"kind": plot_kind, "series": series})
-            else:
-                categories = [
-                    [str(level) for level in label]
-                    for label in plot.categories.flattened_labels
-                ]
-                series = [
-                    {"name": item.name, "values": list(item.values)}
-                    for item in plot.series
-                ]
-                plots.append({"kind": plot_kind, "categories": categories, "series": series})
+            items = list(plot.series)
+            has_xy_values = any(getattr(item._element, "xVal", None) is not None for item in items)
+            categories = [] if has_xy_values else [
+                [str(level) for level in label] for label in plot.categories.flattened_labels
+            ]
+            series = [series_content(item) for item in items]
+            plots.append({"kind": type(plot).__name__, "categories": categories, "series": series})
         charts.append({"title": chart_title, "plots": plots})
     pictures = [sh.name for sh in shapes if sh.shape_type == MSO_SHAPE_TYPE.PICTURE]
 
@@ -106,7 +106,7 @@ layouts where the title placeholder is missing.)
 | Text is clipped or overflows its box | render every slide and inspect right/left and bottom/vertical fit; shape bounds do not measure laid-out text | reflow, resize the box, or reduce text/font size, then render again |
 | Everything shifted | slide size changed between sources | normalize slide size or re-layout on the target size |
 | Fonts look wrong elsewhere | non-embedded fonts (pptx rarely embeds) | report every effective font via the resolution chain below, not just explicit `run.font.name` values |
-| File will not open | broken ZIP / part mismatch | run the bounded package health check below before parsing every XML part |
+| File will not open | broken ZIP / part mismatch | run the bounded package check below before parsing parts |
 | Pictures blank | media parts missing or rels broken | verify `ppt/media/*` present and slide rels reference them |
 
 ## Bounded package health check
@@ -118,7 +118,6 @@ must not be the first check because it expands every member, including an archiv
 import zipfile
 from lxml import etree
 
-path = "input.pptx"
 MAX_XML_PART = 20 * 1024 * 1024
 MAX_ENTRY = 100 * 1024 * 1024
 MAX_TOTAL_UNCOMPRESSED = 500 * 1024 * 1024
@@ -138,7 +137,7 @@ safe_xml_parser = etree.XMLParser(
     recover=False,
 )
 
-with zipfile.ZipFile(path) as archive:
+with zipfile.ZipFile("input.pptx") as archive:
     infos = archive.infolist()
     names = {info.filename for info in infos}
     require(len(names) == len(infos), "duplicate archive member names are unsafe")
@@ -231,86 +230,106 @@ def theme_faces_for_slide(slide):
         }
     return cache_key, theme_cache[cache_key]
 
+EAST_ASIAN_SCRIPTS = {"Hans", "Hant", "Jpan", "Hang"}
+COMPLEX_SCRIPTS = {"Arab", "Hebr", "Deva", "Beng", "Taml", "Thai"}
+
+def character_tags(character):
+    codepoint = ord(character)
+    if 0x3040 <= codepoint <= 0x30FF:
+        return ["Jpan"]
+    if 0x1100 <= codepoint <= 0x11FF or 0xAC00 <= codepoint <= 0xD7AF:
+        return ["Hang"]
+    if 0x2F00 <= codepoint <= 0x9FFF:
+        return ["Hans", "Hant", "Jpan", "Hang"]  # locale disambiguates Han
+    for tag, start, end in (
+        ("Cyrl", 0x0400, 0x052F), ("Hebr", 0x0590, 0x05FF),
+        ("Arab", 0x0600, 0x06FF), ("Deva", 0x0900, 0x097F),
+        ("Beng", 0x0980, 0x09FF), ("Taml", 0x0B80, 0x0BFF),
+        ("Thai", 0x0E00, 0x0E7F),
+    ):
+        if start <= codepoint <= end:
+            return [tag]
+    return []
+
 def script_tags(text):
     tags = []
     for character in text:
-        codepoint = ord(character)
-        if 0x3040 <= codepoint <= 0x30FF:
-            tags.append("Jpan")
-        elif 0xAC00 <= codepoint <= 0xD7AF:
-            tags.append("Hang")
-        elif 0x2E80 <= codepoint <= 0x9FFF:
-            tags.extend(("Hans", "Hant", "Jpan", "Hang"))  # locale disambiguates Han
-        elif 0x0400 <= codepoint <= 0x052F:
-            tags.append("Cyrl")
-        elif 0x0590 <= codepoint <= 0x05FF:
-            tags.append("Hebr")
-        elif 0x0600 <= codepoint <= 0x06FF:
-            tags.append("Arab")
-        elif 0x0900 <= codepoint <= 0x097F:
-            tags.append("Deva")
+        tags.extend(character_tags(character))
     return list(dict.fromkeys(tags))
 
-def required_font_slots(text):
-    tags = script_tags(text)
+def required_slots(text):
     slots = []
-    if any(ch.isascii() and ch.isalnum() for ch in text):
-        slots.append("latin")
-    if any(tag in ("Hans", "Hant", "Jpan", "Hang") for tag in tags):
-        slots.append("eastAsia")
-    if any(tag in ("Arab", "Hebr", "Deva") for tag in tags):
-        slots.append("complexScript")
+    for character in text:
+        tags = set(character_tags(character))
+        slot = "eastAsia" if tags & EAST_ASIAN_SCRIPTS else (
+            "complexScript" if tags & COMPLEX_SCRIPTS else "latin"
+        )
+        if slot not in slots:
+            slots.append(slot)
     return slots or ["latin"]
 
-def theme_candidates_by_slot(role_fonts, text):
-    tags = script_tags(text)
-    east_tags = {"Hans", "Hant", "Jpan", "Hang"}
-    complex_tags = {"Arab", "Hebr", "Deva"}
-    candidates = {}
-    for slot in required_font_slots(text):
+def raw_font_slots(rpr):
+    slots = {}
+    if rpr is None:
+        return slots
+    for slot, tag in (("latin", "a:latin"), ("eastAsia", "a:ea"),
+                      ("complexScript", "a:cs")):
+        child = rpr.find(qn(tag))
+        if child is not None and child.get("typeface"):
+            slots[slot] = child.get("typeface")
+    return slots
+
+THEME_TOKENS = {
+    "+mj-lt": ("major", "latin"), "+mj-ea": ("major", "eastAsia"),
+    "+mj-cs": ("major", "complexScript"), "+mn-lt": ("minor", "latin"),
+    "+mn-ea": ("minor", "eastAsia"), "+mn-cs": ("minor", "complexScript"),
+}
+
+def expand_theme_token(face, theme_fonts):
+    role_slot = THEME_TOKENS.get(face)
+    return theme_fonts[role_slot[0]][role_slot[1]] if role_slot else face
+
+def font_candidates(run, paragraph, theme_fonts, role):
+    run_slots = raw_font_slots(run._r.rPr)
+    ppr = paragraph._p.pPr
+    paragraph_slots = raw_font_slots(None if ppr is None else ppr.defRPr)
+    tags = script_tags(run.text)
+    candidates = []
+    for slot in required_slots(run.text):
+        fallback_role = role
+        explicit_source = None
+        face = run_slots.get(slot)
+        if face:
+            explicit_source = "run"
+        else:
+            face = paragraph_slots.get(slot)
+            if face:
+                explicit_source = "paragraph defaults"
+        if face:
+            resolved = expand_theme_token(face, theme_fonts)
+            if resolved:
+                candidates.append((slot, resolved, explicit_source))
+                continue
+            # A generic +mj/+mn slot can be empty while the same role has a matching
+            # script-specific theme face. Preserve the token's role for that fallback.
+            if face in THEME_TOKENS:
+                fallback_role = THEME_TOKENS[face][0]
+            else:
+                continue
+        role_fonts = theme_fonts[fallback_role]
         slot_tags = [
             tag for tag in tags
-            if (slot == "eastAsia" and tag in east_tags)
-            or (slot == "complexScript" and tag in complex_tags)
-            or (slot == "latin" and tag not in east_tags | complex_tags)
+            if (slot == "eastAsia" and tag in EAST_ASIAN_SCRIPTS)
+            or (slot == "complexScript" and tag in COMPLEX_SCRIPTS)
+            or (slot == "latin" and tag not in EAST_ASIAN_SCRIPTS | COMPLEX_SCRIPTS)
         ]
-        faces = [role_fonts[slot]]
-        faces.extend(role_fonts["scripts"].get(tag, "") for tag in slot_tags)
-        candidates[slot] = [face for face in dict.fromkeys(faces) if face]
-    return candidates
-
-# 2. Per run: explicit value, else paragraph defaults, else report as inherited.
-# run.font.name exposes only the LATIN typeface; a run that also declares a:ea
-# or a:cs must be resolved per the scripts present in its own text first.
-def explicit_run_faces(run):
-    """Direct a:latin/a:ea/a:cs faces keyed by slot; missing slots stay missing."""
-    rPr = run._r.find(qn("a:rPr"))
-    if rPr is None:
-        return {}
-    declared = {}
-    for slot, tag in (("latin", "a:latin"), ("eastAsia", "a:ea"), ("complexScript", "a:cs")):
-        node = rPr.find(qn(tag))
-        if node is not None and node.get("typeface"):
-            declared[slot] = node.get("typeface")
-    return declared
-
-def resolve_run_faces(run, paragraph, role_fonts):
-    """Resolve every required script slot without letting one direct slot hide another."""
-    direct = explicit_run_faces(run)
-    inherited = theme_candidates_by_slot(role_fonts, run.text)
-    resolved = []
-    for slot in required_font_slots(run.text):
-        if slot in direct:
-            faces, source = [direct[slot]], "run direct"
-        elif slot == "latin" and run.font.name:
-            faces, source = [run.font.name], "run latin"
-        elif slot == "latin" and paragraph.font.name:
-            faces, source = [paragraph.font.name], "paragraph defaults (latin)"
-        else:
-            faces = inherited.get(slot, []) or ["(unresolved inherited face)"]
-            source = "theme candidates (verify placeholder chain/locale)"
-        resolved.append({"slot": slot, "faces": faces, "source": source})
-    return resolved
+        candidates.extend(
+            (slot, role_fonts["scripts"][tag], f"{fallback_role} theme script {tag}")
+            for tag in slot_tags if role_fonts["scripts"].get(tag)
+        )
+        if role_fonts.get(slot):
+            candidates.append((slot, role_fonts[slot], f"{fallback_role} theme {slot}"))
+    return list(dict.fromkeys(candidates))
 
 def iter_text_frames(shapes):
     """Shape text frames plus every table cell's text frame (a graphic frame
@@ -335,15 +354,16 @@ for i, slide in enumerate(prs.slides):
                     title_shape is not None and
                     getattr(holder, "_element", None) is title_shape._element
                 ) else "minor"
-                resolved = resolve_run_faces(run, paragraph, theme_fonts[role])
-                print(i, repr(run.text[:20]), f"{role} font slots:", ascii(resolved))
+                faces = font_candidates(run, paragraph, theme_fonts, role)
+                print(i, repr(run.text[:20]), "font candidates:", ascii(faces))
 ```
 
-python-pptx does not evaluate the full placeholder -> layout -> master inheritance chain; when
-a run reports inherited, list the script-aware theme candidates above and, if the exact face
-matters, check the layout and master placeholder of the same index for explicit `<a:latin>`,
-`<a:ea>`, `<a:cs>`, and script-specific `<a:font>` mappings. Han text also needs the deck locale
-to distinguish Hans, Hant, Japanese, and Korean theme mappings.
+`run.font.name` exposes only the Latin slot, so it must not short-circuit inspection of explicit
+`<a:ea>`/`<a:cs>` faces. python-pptx also does not evaluate the full placeholder -> layout ->
+master inheritance chain; the output above remains a candidate list. Check matching layout/master
+placeholders when the exact face matters. Han text needs the deck locale to distinguish Hans,
+Hant, Japanese, and Korean mappings; add other script ranges when the task uses them rather than
+claiming the Latin fallback is definitive.
 
 ## Text-fit verification
 

@@ -11,6 +11,7 @@ prs = Presentation("input.pptx")
 old, new = "old wording", "new wording"
 slide_index = None                 # Set this and shape_name when repeated text is expected.
 shape_name = None
+target_location = None             # e.g. "Table 1/table[0,1]" for duplicate table text
 
 def iter_shapes(shapes, path=""):
     """Yield (path, shape) for every shape, recursing into groups so text inside
@@ -38,6 +39,8 @@ for i, slide in enumerate(prs.slides):
         if shape_name is not None and shape.name != shape_name:
             continue
         for location, text_frame in iter_text_targets(path, shape):
+            if target_location is not None and location != target_location:
+                continue
             if old in text_frame.text:
                 candidates.append((i, location, text_frame))
 
@@ -67,7 +70,8 @@ prs.save("input-edited.pptx")
    template, masters, notes, and animations. Edit in place, save to a new path.
 2. Address shapes by slide index + shape name or matched text, and **assert exactly one match**.
    The locator must search both shape text frames and every table cell, retaining a stable
-   `/table[row,column]` suffix. If copy repeats, set both selectors rather than choosing one.
+   `/table[row,column]` suffix. If copy repeats inside one table, set `target_location` as well as
+   the slide/shape selectors rather than choosing one.
 3. For formatted text, change `run.text` only when the target is wholly inside one run. Assigning
    `paragraph.text` or `text_frame.text` rebuilds runs and can discard run formatting and links.
    If the target spans runs, stop and make an explicitly reviewed run/XML edit.

@@ -18,29 +18,43 @@ from docx import Document
 from docx.oxml.ns import qn
 from docx.table import Table
 from docx.text.paragraph import Paragraph
+from docx.text.run import Run
 
-def iter_body_blocks(parent, document):
-    """Yield ("p", paragraph) / ("table", table) blocks, recursing into block content controls."""
-    for child in parent.iterchildren():
+def iter_part_blocks(root, parent):
+    """Yield each paragraph/table once, descending through block content controls."""
+    for child in root.iterchildren():
         if child.tag == qn("w:p"):
-            yield ("p", Paragraph(child, document))
+            yield "paragraph", Paragraph(child, parent)
         elif child.tag == qn("w:tbl"):
-            yield ("table", Table(child, document))
-        elif child.tag == qn("w:sdt"):
-            content = child.find(qn("w:sdtContent"))
-            if content is not None:
-                yield from iter_body_blocks(content, document)
+            yield "table", Table(child, parent)
+        else:
+            yield from iter_part_blocks(child, parent)
 
-def tc_text(tc):
+def iter_paragraph_runs(paragraph):
+    """Include runs wrapped by hyperlinks, fields, revisions, or inline content controls."""
+    def walk(element):
+        for child in element.iterchildren():
+            if child.tag == qn("w:r"):
+                yield Run(child, paragraph)
+            elif child.tag != qn("w:p"):  # nested text-box paragraphs are yielded separately
+                yield from walk(child)
+    yield from walk(paragraph._p)
+
+def paragraph_text(paragraph):
+    return "".join(run.text for run in iter_paragraph_runs(paragraph))
+
+def tc_text(tc, parent):
     """Cell text rebuilt per paragraph, keeping tabs and breaks visible.
 
     Joining only the w:t descendants concatenates separate paragraphs
     ("First" + "Second" -> "FirstSecond") and loses separators entirely.
     """
     paragraphs = []
-    for p in tc.iter(qn("w:p")):
+    for kind, block in iter_part_blocks(tc, parent):
+        if kind != "paragraph":  # nested tables are represented recursively, not duplicated here
+            continue
         pieces = []
-        for node in p.iter():
+        for node in block._p.iter():
             if node.tag == qn("w:t"):
                 pieces.append(node.text or "")
             elif node.tag == qn("w:tab"):
@@ -50,47 +64,53 @@ def tc_text(tc):
         paragraphs.append("".join(pieces))
     return " / ".join(paragraphs)
 
-def table_matrix(table):
-    """Rows of cell text with merge structure preserved.
-
-    python-docx's row.cells repeats a merge-origin cell across every grid
-    position it spans, which hides the real structure. Walk the actual w:tc
-    elements and annotate gridSpan/vMerge instead.
-    """
+def table_content(table):
     rows = []
     for row in table.rows:
-        cells = []
-        for tc in row._tr.tc_lst:
-            tc_pr = tc.find(qn("w:tcPr"))
-            grid_span = tc_pr.find(qn("w:gridSpan")) if tc_pr is not None else None
-            v_merge = tc_pr.find(qn("w:vMerge")) if tc_pr is not None else None
-            note = ""
-            if grid_span is not None:
-                note += "(span {})".format(grid_span.get(qn("w:val")))
-            if v_merge is not None:
-                note += "(vmerge start)" if v_merge.get(qn("w:val")) == "restart" else "(vmerge cont.)"
-            text = tc_text(tc)
-            cells.append(text + note if note else text)
-        rows.append(cells)
+        rendered_cells = []
+        column = 0
+        # row.cells repeats a merge-origin proxy for every grid position it spans.
+        # Walk physical w:tc elements and expose the merge structure instead.
+        for cell_element in row._tr.tc_lst:
+            cell_properties = cell_element.find(qn("w:tcPr"))
+            grid_span = None if cell_properties is None else cell_properties.find(qn("w:gridSpan"))
+            colspan = 1 if grid_span is None else int(grid_span.get(qn("w:val"), "1"))
+            vertical = None if cell_properties is None else cell_properties.find(qn("w:vMerge"))
+            vertical_merge = None if vertical is None else vertical.get(qn("w:val"), "continue")
+            nested_tables = []
+            for kind, block in iter_part_blocks(cell_element, table):
+                if kind == "table":
+                    nested_tables.append(table_content(block))
+            rendered_cells.append({
+                "column": column, "colspan": colspan,
+                "vMerge": vertical_merge,
+                "text": tc_text(cell_element, table),
+                "tables": nested_tables,
+            })
+            column += colspan
+        rows.append(rendered_cells)
     return rows
 
 doc = Document("input.docx")
 content_controls = list(doc.element.body.iter(qn("w:sdt")))
-print("block content controls:", len(content_controls))
-for kind, block in iter_body_blocks(doc.element.body, doc):
-    if kind == "p":
-        print("p", block.style.name, "|", block.text)
+blocks = list(iter_part_blocks(doc.element.body, doc))
+print("content controls:", len(content_controls), "top-level blocks:", len(blocks))
+for kind, block in blocks:
+    if kind == "paragraph":
+        print(block.style.name, "|", paragraph_text(block))
     else:
-        print("table", len(block.rows), "x", len(block.columns), table_matrix(block))
+        print("table |", table_content(block))
 ```
 
 Notes:
 
-- `doc.paragraphs` includes only direct body paragraphs and `doc.tables` only top-level
-  tables; both omit content nested in block content controls (`w:sdt`). The walker above
-  yields paragraphs and tables inside `w:sdtContent` too, and reports the content-control
-  count. Tables nested inside table cells still require walking `cell.tables`; text boxes,
-  headers, footers, and footnotes still require their own collections
+- `doc.paragraphs` includes only direct body paragraphs, `doc.tables` includes only direct body
+  tables, and `Paragraph.runs` omits runs wrapped by inline content controls and other containers.
+  Use the XML-backed traversal above and report the content-control count. It stops descending
+  when a table is yielded, so table text is not also emitted as prose; `table_content()` handles
+  nested tables recursively and emits `column`, `colspan`, and `vMerge` metadata for physical
+  cells instead of duplicating merge-origin text through `row.cells`.
+  Text boxes, headers, footers, and footnotes still require their own collections
   (`section.header/.footer`) or raw XML.
 - For revision/comment metadata, inspect the XML parts directly: `word/comments.xml`,
   `w:ins`/`w:del` elements in `word/document.xml`.

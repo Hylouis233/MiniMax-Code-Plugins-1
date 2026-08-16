@@ -41,25 +41,29 @@ Watermark / stamp by merging a stamp page onto each page:
 from pypdf import Transformation
 
 stamp = open_pdf("watermark.pdf").pages[0]
+stamp.transfer_rotation_to_content()
 stamp_text = (stamp.extract_text() or "").strip()
 reader = open_pdf("input.pdf")
-expected_sizes = [tuple(float(value) for value in page.mediabox) for page in reader.pages]
 expected_fields = reader.get_fields() or {}
 writer = PdfWriter()
 writer.append(reader)                 # clone pages plus catalog entries such as /AcroForm
 
 # A plain merge_page() overlays the stamp in its own coordinates, so on a page
 # with different dimensions, origin, or rotation the stamp can be clipped or
-# land entirely off-page. Scale each copy to fit its destination and center it.
-sw, sh = float(stamp.mediabox.width), float(stamp.mediabox.height)
+# land entirely off-page. Normalize /Rotate into content, then scale each copy
+# to the visible destination box and include both boxes' non-zero origins.
+stamp_box = stamp.cropbox
+sw, sh = float(stamp_box.width), float(stamp_box.height)
 for page in writer.pages:
-    dw, dh = float(page.mediabox.width), float(page.mediabox.height)
+    page.transfer_rotation_to_content()
+    destination = page.cropbox
+    dw, dh = float(destination.width), float(destination.height)
     scale = min(dw / sw, dh / sh)
-    tx = (dw - sw * scale) / 2 - float(stamp.mediabox.left) * scale
-    ty = (dh - sh * scale) / 2 - float(stamp.mediabox.bottom) * scale
+    tx = float(destination.left) + (dw - sw * scale) / 2 - float(stamp_box.left) * scale
+    ty = float(destination.bottom) + (dh - sh * scale) / 2 - float(stamp_box.bottom) * scale
     page.merge_transformed_page(stamp, Transformation().scale(scale).translate(tx, ty))
-# Rotated destination pages (/Rotate != 0) apply the transformation in
-# unrotated page space: verify rotated pages visually after stamping.
+
+expected_sizes = [tuple(float(value) for value in page.mediabox) for page in writer.pages]
 
 with open("watermarked.pdf", "wb") as f:
     writer.write(f)
@@ -119,6 +123,10 @@ Encryption and forms:
 ## Rules
 
 - Always write a new file; transformation in place risks losing the original on a bad write.
+- Open every source through `open_pdf` above before touching `.pages`; this authenticates
+  encrypted inputs and fails with a clear password error instead of failing mid-transform.
+- Merge complete inputs with `writer.append(..., import_outline=True)` so their outlines and
+  named destinations are imported and remapped; page-by-page `add_page` is for intentional splits.
 - After writing, re-open with `PdfReader("output.pdf")` and verify page count and page sizes.
 - `rotate` is cumulative on already-rotated pages - read `/Rotate` first if the source was
   scanned sideways.

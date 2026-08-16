@@ -7,10 +7,17 @@ formula_wb = openpyxl.load_workbook("input.xlsx", read_only=True, data_only=Fals
 value_wb = openpyxl.load_workbook("input.xlsx", read_only=True, data_only=True)
 print("sheets:", value_wb.sheetnames)
 
-def formula_text(cell):
-    value = cell.value
-    # ArrayFormula/DataTableFormula are objects in current openpyxl, not strings.
-    return getattr(value, "text", None) or str(value)
+def formula_text(value):
+    if isinstance(value, str):
+        return value
+    if text := getattr(value, "text", None):       # ArrayFormula
+        return text
+    # DataTableFormula has no .text; render stable, useful attributes, not an address repr.
+    fields = ("ref", "r1", "r2", "dt2D", "dtr", "ca", "del1", "del2")
+    details = ", ".join(
+        f"{name}={getattr(value, name)!r}" for name in fields if hasattr(value, name)
+    )
+    return f"{type(value).__name__}({details})"
 
 # Profile EVERY sheet by default; only narrow when the task names a specific sheet.
 for sheet_name in value_wb.sheetnames:
@@ -43,7 +50,7 @@ for sheet_name in value_wb.sheetnames:
                 missing_cache_count += 1
                 if missing_cache_count <= 10:
                     print("formula without cached value:", formula_cell.coordinate,
-                          formula_text(formula_cell))
+                          formula_text(formula_cell.value))
     print("formulas without cached values:", missing_cache_count)
 formula_wb.close()
 value_wb.close()

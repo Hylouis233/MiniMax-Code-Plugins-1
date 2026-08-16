@@ -13,17 +13,17 @@ from docx import Document
 from docx.oxml.ns import qn
 
 SAFE_RUN_CHILDREN = {
-    qn("w:rPr"), qn("w:t"), qn("w:tab"), qn("w:br"), qn("w:cr"),
+    qn("w:rPr"), qn("w:t"), qn("w:tab"), qn("w:cr"),
 }
 
 def unsafe_run_content(run):
     unsafe = []
     for child in run._r:
         # Assigning run.text can reconstruct text, tabs, and ordinary line breaks only.
-        typed_break = child.tag == qn("w:br") and child.get(qn("w:type")) not in (
-            None, "textWrapping",
+        ordinary_break = child.tag == qn("w:br") and dict(child.attrib) in (
+            {}, {qn("w:type"): "textWrapping"},
         )
-        if child.tag not in SAFE_RUN_CHILDREN or typed_break:
+        if child.tag not in SAFE_RUN_CHILDREN and not ordinary_break:
             unsafe.append(child.tag.rsplit("}", 1)[-1])
     return unsafe
 
@@ -103,8 +103,8 @@ doc.save("input.edited.docx")
 
 The replacement text inherits the first matched run's formatting. Unmatched text before and
 after it stays in its original runs, so its formatting is preserved. The routine fails before
-making changes if any matched run contains a drawing, field, reference, or typed page/column
-break that `run.text` would destroy. Use raw OOXML for those cases and for tracked changes or
+making changes if any matched run contains a drawing, field, reference, typed page/column break,
+or a text-wrapping break with `w:clear` that `run.text` would destroy. Use raw OOXML for those cases and for tracked changes or
 other content that `paragraph.runs` does not expose.
 
 ## Tier 2 - raw OOXML surgery (only when Tier 1 cannot express it)

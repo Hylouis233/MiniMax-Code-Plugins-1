@@ -10,20 +10,34 @@ from openpyxl.utils.cell import range_boundaries
 wb = openpyxl.load_workbook("input.xlsx")   # NOT data_only: that would drop all formulas
 ws = wb["Data"]
 
-def non_cell_references(workbook):
-    """Inventory ranges/formulas that insert_rows/delete_rows will not rewrite."""
-    refs = []
-    defined_names = workbook.defined_names
-    # openpyxl 3.1 exposes a dict-like mapping; 3.0 uses DefinedNameList.
-    defined_name_items = (
-        defined_names.values()
-        if hasattr(defined_names, "values")
-        else defined_names.definedName
+def formula_text(value):
+    if isinstance(value, str):
+        return value
+    if text := getattr(value, "text", None):
+        return text
+    fields = ("ref", "r1", "r2", "dt2D", "dtr", "ca", "del1", "del2")
+    details = ", ".join(
+        f"{name}={getattr(value, name)!r}" for name in fields if hasattr(value, name)
     )
-    for item in defined_name_items:
+    return f"{type(value).__name__}({details})"
+
+def defined_name_values(workbook):
+    names = workbook.defined_names
+    # openpyxl 3.1 uses DefinedNameDict; 3.0 uses DefinedNameList. Support both.
+    return names.values() if hasattr(names, "values") else names.definedName
+
+def structural_references(workbook):
+    """Inventory formulas/ranges that insert_rows/delete_rows will not rewrite."""
+    refs = []
+    for item in defined_name_values(workbook):
         refs.append(("defined name", item.name, item.attr_text))
     for sheet in workbook.worksheets:
         owner = sheet.title
+        for row in sheet.iter_rows():
+            for cell in row:
+                if cell.data_type == "f":
+                    refs.append(("cell formula", f"{owner}!{cell.coordinate}",
+                                 formula_text(cell.value)))
         for table in sheet.tables.values():
             refs.append(("table", owner + "!" + table.name, table.ref))
         for merged_range in sheet.merged_cells.ranges:
@@ -53,6 +67,10 @@ def non_cell_references(workbook):
                     refs.append(("chart series", f"{owner} chart {index}", element.text))
     return refs
 
+def non_cell_references(workbook):
+    return [reference for reference in structural_references(workbook)
+            if reference[0] != "cell formula"]
+
 def cell_formula_references(workbook):
     """Inventory ordinary, array, and data-table formulas before row/column moves."""
     refs = []
@@ -65,7 +83,7 @@ def cell_formula_references(workbook):
                         "cell formula",
                         sheet.title,
                         cell.coordinate,
-                        getattr(value, "text", None) or str(value),
+                        formula_text(value),
                     ))
     return refs
 
@@ -129,7 +147,7 @@ for row in summary["A1:B1"]:
     for cell in row:
         cell.font = header_font
 
-# After applying the planned rewrites, rerun both inventories and compare them with the
+# After applying the planned rewrites, rerun the same inventory and compare it with the
 # pre-edit snapshot before saving. A post-edit listing alone cannot reveal a stale formula.
 print("cell formulas before:", cell_formulas_before)
 print("cell formulas after planned rewrites:", cell_formula_references(wb))

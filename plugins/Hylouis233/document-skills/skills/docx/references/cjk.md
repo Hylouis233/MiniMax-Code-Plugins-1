@@ -24,7 +24,9 @@ style.element.get_or_add_rPr().get_or_add_rFonts().set(qn("w:eastAsia"), EAST_AS
 ```
 
 Convention for mixed-script body text: CJK glyphs from the east-asian face, digits and Latin
-from a Latin face (Times New Roman or Arial). Both slots set = deterministic rendering.## Chinese font-size table (字号)
+from a Latin face (Times New Roman or Arial). Both slots set = deterministic rendering.
+
+## Chinese font-size table (字号)
 
 Word's Chinese UI names map to point sizes; scripts must use the points:
 
@@ -101,14 +103,23 @@ section.left_margin, section.right_margin = Cm(2.8), Cm(2.6)
    from fontTools.ttLib import TTFont
    from docx.oxml.ns import qn
    from docx.text.paragraph import Paragraph
+   from docx.text.run import Run
 
    doc = Document("output.docx")
    normal_style = doc.styles["Normal"]
+   def paragraph_runs(paragraph):
+       def walk(element):
+           for child in element.iterchildren():
+               if child.tag == qn("w:r"):
+                   yield Run(child, paragraph)
+               elif child.tag != qn("w:p"):
+                   yield from walk(child)
+       yield from walk(paragraph._p)
 
    def xml_runs(element, parent):
-       # Covers direct paragraphs, tables, nested tables, and block content controls.
+       # Covers paragraphs in tables/block controls and runs in inline controls/hyperlinks.
        for paragraph_element in element.iter(qn("w:p")):
-           yield from Paragraph(paragraph_element, parent).runs
+           yield from paragraph_runs(Paragraph(paragraph_element, parent))
 
    emitted_runs = list(xml_runs(doc.element.body, doc))
    for section in doc.sections:
@@ -140,15 +151,24 @@ section.left_margin, section.right_margin = Cm(2.8), Cm(2.6)
        raise LookupError(f"no resolved {slot} face for run {run.text!r}; resolve theme defaults")
 
    def font_slot(character):
+       # This is the ordinary non-cs/rtl mapping. Resolve effective w:cs/w:rtl and special
+       # w:rFonts@w:hint overrides separately before relying on a slot for those runs.
        codepoint = ord(character)
-       # Word renders Korean through the East Asian slot as well: Hangul Jamo,
-       # compatibility Jamo, extended-A, and the syllable blocks.
-       return "eastAsia" if (
-           0x1100 <= codepoint <= 0x11FF or 0x2E80 <= codepoint <= 0x9FFF
-           or 0x3130 <= codepoint <= 0x318F or 0xA960 <= codepoint <= 0xA97F
-           or 0xAC00 <= codepoint <= 0xD7FF or 0xF900 <= codepoint <= 0xFAFF
-           or 0x20000 <= codepoint <= 0x3134F
-       ) else ("ascii" if codepoint < 128 else "hAnsi")
+       uses_east_asian_slot = (
+           0x1100 <= codepoint <= 0x11FF       # Hangul Jamo
+           or 0x2E80 <= codepoint <= 0x9FFF   # CJK radicals, kana, bopomofo, ideographs
+           or 0x3130 <= codepoint <= 0x318F   # Hangul compatibility Jamo
+           or 0xA000 <= codepoint <= 0xA4CF   # Yi syllables and radicals
+           or 0xA960 <= codepoint <= 0xA97F   # Hangul Jamo Extended-A
+           or 0xAC00 <= codepoint <= 0xD7FF   # Hangul syllables and Extended-B
+           or 0xF900 <= codepoint <= 0xFAFF   # CJK compatibility ideographs
+           or 0xFE30 <= codepoint <= 0xFE6F   # CJK compatibility and small forms
+           or 0xFF00 <= codepoint <= 0xFFEF   # fullwidth and halfwidth forms
+           or 0x20000 <= codepoint <= 0x3134F  # CJK unified ideograph extensions
+       )
+       return "eastAsia" if uses_east_asian_slot else (
+           "ascii" if codepoint < 128 else "hAnsi"
+       )
 
    # Resolve installed files by exact face name first; do not pool their cmaps.
    # TTC collections need the face's fontNumber; ordinary TTF files use -1.
