@@ -104,11 +104,40 @@ size_mismatches = [
            for value, expected in zip(actual, expected_page_size))
 ]
 assert not size_mismatches, f"unexpected page sizes: {size_mismatches}"
+
+# Overflow is a defect (shared rule 4): text that runs past the page box is
+# clipped or off-page even though every check above still passes. Plain block
+# extraction silently drops fully off-page text, so extract through an
+# explicitly enlarged clip rectangle and compare the block boxes to the page.
+import fitz
+
+overflow_doc = fitz.open(output_path)
+if overflow_doc.needs_pass:
+    if not password:
+        raise RuntimeError("set PDF_PASSWORD so the encrypted output can be overflow-checked")
+    overflow_doc.authenticate(password)
+overflow_pages = []
+for page in overflow_doc:
+    clip = fitz.Rect(-2000, -2000, page.rect.width + 2000, page.rect.height + 2000)
+    text_blocks = [b for b in page.get_text("blocks", clip=clip) if b[6] == 0]
+    beyond_box = any(
+        b[0] < -0.5 or b[1] < -0.5 or b[2] > page.rect.width + 0.5 or b[3] > page.rect.height + 0.5
+        for b in text_blocks
+    )
+    if beyond_box:
+        overflow_pages.append(page.number + 1)
+overflow_doc.close()
+assert not overflow_pages, f"text blocks extend past the page box on pages: {overflow_pages}"
+# The page box is the hard bound. When the task declares specific margins,
+# additionally check key blocks against them (or render and inspect visually) -
+# content inside the box but past a declared margin is a softer, task-specific
+# defect to report.
 ```
 
 Confirm: page count matches the request; every page except those explicitly listed in
 `intentionally_raster_only_pages` has extractable text or at least one form widget (a pure
 interactive page); each requested key string is listed in `expected_strings_by_page` and
 extracts on the correct page; every value in `page_sizes` is the declared size within
-`page_size_tolerance`. Report all four. For pixel-sensitive work, render every applicable page
+`page_size_tolerance`; and no page's text blocks extend past the page box (the overflow
+check). Report all five. For pixel-sensitive work, render every applicable page
 with PyMuPDF at 100 dpi and check that each render is non-blank (mean pixel value).

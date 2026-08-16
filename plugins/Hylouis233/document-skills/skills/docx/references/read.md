@@ -31,6 +31,25 @@ def iter_body_blocks(parent, document):
             if content is not None:
                 yield from iter_body_blocks(content, document)
 
+def tc_text(tc):
+    """Cell text rebuilt per paragraph, keeping tabs and breaks visible.
+
+    Joining only the w:t descendants concatenates separate paragraphs
+    ("First" + "Second" -> "FirstSecond") and loses separators entirely.
+    """
+    paragraphs = []
+    for p in tc.iter(qn("w:p")):
+        pieces = []
+        for node in p.iter():
+            if node.tag == qn("w:t"):
+                pieces.append(node.text or "")
+            elif node.tag == qn("w:tab"):
+                pieces.append("<tab>")
+            elif node.tag in (qn("w:br"), qn("w:cr")):
+                pieces.append("<br>")
+        paragraphs.append("".join(pieces))
+    return " / ".join(paragraphs)
+
 def table_matrix(table):
     """Rows of cell text with merge structure preserved.
 
@@ -50,7 +69,7 @@ def table_matrix(table):
                 note += "(span {})".format(grid_span.get(qn("w:val")))
             if v_merge is not None:
                 note += "(vmerge start)" if v_merge.get(qn("w:val")) == "restart" else "(vmerge cont.)"
-            text = "".join(node.text or "" for node in tc.iter(qn("w:t")))
+            text = tc_text(tc)
             cells.append(text + note if note else text)
         rows.append(cells)
     return rows

@@ -95,7 +95,7 @@ with zipfile.ZipFile("compressed-bomb.docx", "w", zipfile.ZIP_DEFLATED) as archi
 try:
     validate_docx_package("compressed-bomb.docx")
     archive_bomb_rejected = False
-except AssertionError:
+except (AssertionError, ValueError):
     archive_bomb_rejected = True
 check("suspicious compression ratio is rejected before XML expansion", archive_bomb_rejected)
 
@@ -505,6 +505,42 @@ check("Hangul jamo use the East Asian slot", font_slot("ᄀ") == "eastAsia")
 check("compatibility jamo use the East Asian slot", font_slot("ㄱ") == "eastAsia")
 check("Latin stays in the ascii slot", font_slot("A") == "ascii")
 check("non-CJK fullwidth-range-adjacent Latin-1 stays hAnsi", font_slot("é") == "hAnsi")
+
+
+
+# ---- read.md tc_text: paragraph boundaries survive cell extraction ---------------
+def tc_text(tc):
+    paragraphs = []
+    for p in tc.iter(qn("w:p")):
+        pieces = []
+        for node in p.iter():
+            if node.tag == qn("w:t"):
+                pieces.append(node.text or "")
+            elif node.tag == qn("w:tab"):
+                pieces.append("<tab>")
+            elif node.tag in (qn("w:br"), qn("w:cr")):
+                pieces.append("<br>")
+        paragraphs.append("".join(pieces))
+    return " / ".join(paragraphs)
+
+cells_doc = Document()
+cells_table = cells_doc.add_table(rows=1, cols=1)
+cell = cells_table.cell(0, 0)
+cell.paragraphs[0].text = "First"
+cell.add_paragraph("Second")
+run_with_tab = cell.paragraphs[0].add_run("")
+tab_element = OxmlElement("w:tab")
+run_with_tab._r.append(tab_element)
+run_with_tab.add_text("after tab")
+cells_doc.save("cell-paragraphs.docx")
+cells_reopened = Document("cell-paragraphs.docx")
+cells_tc = cells_reopened.tables[0].rows[0]._tr.tc_lst[0]
+joined_raw = "".join(node.text or "" for node in cells_tc.iter(qn("w:t")))
+extracted = tc_text(cells_tc)
+check("raw w:t joining concatenates paragraphs (negative control)",
+      "Firstafter tab" in joined_raw, joined_raw)
+check("tc_text preserves the paragraph boundary", " / Second" in extracted, extracted)
+check("tc_text keeps tabs visible", "<tab>after tab" in extracted, extracted)
 
 
 print("\n" + ("ALL DOCX FIXTURES PASSED" if not failures else f"{len(failures)} FAILURES: {failures}"))

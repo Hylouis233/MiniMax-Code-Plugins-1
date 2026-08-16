@@ -548,7 +548,7 @@ with zipfile.ZipFile("compressed-bomb.pptx", "w", zipfile.ZIP_DEFLATED) as archi
 try:
     validate_pptx_package("compressed-bomb.pptx")
     archive_bomb_rejected = False
-except AssertionError:
+except (AssertionError, ValueError):
     archive_bomb_rejected = True
 check("PPTX compression bomb is rejected before XML expansion", archive_bomb_rejected)
 
@@ -581,6 +581,63 @@ compact = [value for _, value in points]
 check("compact extraction is provably lossy (negative control)",
       compact == ["1", "5", "9"] and len({idx for idx, _ in points}) == len(points))
 
+
+
+# ---- analyze.md: script-aware run faces and table-cell triage --------------------
+from pptx.oxml import parse_xml as pptx_parse_xml2
+from pptx.oxml.ns import qn
+
+def explicit_run_face(run, text, script_tags_fn):
+    rPr = run._r.find(qn("a:rPr"))
+    if rPr is None:
+        return None
+    declared = {}
+    for slot, tag in (("latin", "a:latin"), ("eastAsia", "a:ea"), ("complexScript", "a:cs")):
+        node = rPr.find(qn(tag))
+        if node is not None and node.get("typeface"):
+            declared[slot] = node.get("typeface")
+    if not declared:
+        return None
+    tags = script_tags_fn(text)
+    if any(tag in ("Hans", "Hant", "Jpan", "Hang") for tag in tags) and "eastAsia" in declared:
+        return declared["eastAsia"]
+    if any(tag in ("Arab", "Hebr", "Deva") for tag in tags) and "complexScript" in declared:
+        return declared["complexScript"]
+    return declared.get("latin")
+
+run_xml = (
+    '<a:r xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+    '<a:rPr lang="zh-CN"><a:latin typeface="Arial"/><a:ea typeface="SimSun"/></a:rPr>'
+    '<a:t>\u6d4b\u8bd5</a:t></a:r>'
+)
+dual_run = pptx_parse_xml2(run_xml)
+class FakeRun:
+    _r = dual_run
+check("a CJK run with latin+ea declared resolves to the eastAsia face",
+      explicit_run_face(FakeRun(), "\u6d4b\u8bd5", script_tags) == "SimSun")
+check("run.font.name alone would report only the Latin face (negative control)",
+      dual_run.find(qn("a:rPr")).find(qn("a:latin")).get("typeface") == "Arial")
+
+triage_deck = Presentation()
+triage_slide = triage_deck.slides.add_slide(triage_deck.slide_layouts[6])
+triage_shape = triage_slide.shapes.add_table(2, 2, 0, 0, 4000000, 2000000)
+triage_shape.table.cell(0, 0).text_frame.text = "\u8868\u683c\u6587\u672c"
+triage_deck.save("triage-table.pptx")
+triage_reopened = Presentation("triage-table.pptx")
+triage_table_shape = next(s for s in triage_reopened.slides[0].shapes if s.has_table)
+def iter_text_frames(shapes):
+    for shape in shapes:
+        if shape.has_text_frame:
+            yield shape.text_frame
+        if getattr(shape, "has_table", False):
+            for row in shape.table.rows:
+                for cell in row.cells:
+                    yield cell.text_frame
+frames = list(iter_text_frames(triage_reopened.slides[0].shapes))
+check("table-cell text frames are reached by the triage walker",
+      any("\u8868\u683c\u6587\u672c" in f.text for f in frames), [f.text for f in frames])
+check("the table graphic frame itself has no text frame (negative control)",
+      not triage_table_shape.has_text_frame)
 
 print("\n" + ("ALL PPTX FIXTURES PASSED" if not failures else f"{len(failures)} FAILURES: {failures}"))
 sys.exit(0 if not failures else 1)

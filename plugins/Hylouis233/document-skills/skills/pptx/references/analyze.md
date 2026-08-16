@@ -117,6 +117,13 @@ MAX_XML_PART = 20 * 1024 * 1024
 MAX_ENTRY = 100 * 1024 * 1024
 MAX_TOTAL_UNCOMPRESSED = 500 * 1024 * 1024
 MAX_COMPRESSION_RATIO = 200
+
+# Security limits must survive `python -O` (which strips assert statements),
+# so every check raises explicitly instead of asserting.
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
 safe_xml_parser = etree.XMLParser(
     load_dtd=False,
     resolve_entities=False,
@@ -128,18 +135,20 @@ safe_xml_parser = etree.XMLParser(
 with zipfile.ZipFile(path) as archive:
     infos = archive.infolist()
     names = {info.filename for info in infos}
-    assert len(names) == len(infos), "duplicate archive member names are unsafe"
-    assert "[Content_Types].xml" in names and "ppt/presentation.xml" in names
-    assert sum(info.file_size for info in infos) <= MAX_TOTAL_UNCOMPRESSED
+    require(len(names) == len(infos), "duplicate archive member names are unsafe")
+    require("[Content_Types].xml" in names and "ppt/presentation.xml" in names,
+            "missing required OPC members")
+    require(sum(info.file_size for info in infos) <= MAX_TOTAL_UNCOMPRESSED,
+            "declared total uncompressed size above limit")
 
     actual_total = 0
     for info in infos:
-        assert info.file_size <= MAX_ENTRY, f"oversized part: {info.filename}"
+        require(info.file_size <= MAX_ENTRY, f"oversized part: {info.filename}")
         ratio = info.file_size / max(info.compress_size, 1)
-        assert ratio <= MAX_COMPRESSION_RATIO, f"suspicious compression ratio: {info.filename}"
+        require(ratio <= MAX_COMPRESSION_RATIO, f"suspicious compression ratio: {info.filename}")
         is_xml = info.filename.endswith((".xml", ".rels"))
         if is_xml:
-            assert info.file_size <= MAX_XML_PART, f"oversized XML part: {info.filename}"
+            require(info.file_size <= MAX_XML_PART, f"oversized XML part: {info.filename}")
 
         chunks = []
         actual_size = 0
@@ -148,11 +157,11 @@ with zipfile.ZipFile(path) as archive:
             while chunk := stream.read(64 * 1024):
                 actual_size += len(chunk)
                 actual_total += len(chunk)
-                assert actual_size <= MAX_ENTRY, f"part exceeded read limit: {info.filename}"
-                assert actual_total <= MAX_TOTAL_UNCOMPRESSED, "archive exceeded total read limit"
+                require(actual_size <= MAX_ENTRY, f"part exceeded read limit: {info.filename}")
+                require(actual_total <= MAX_TOTAL_UNCOMPRESSED, "archive exceeded total read limit")
                 if is_xml:
                     chunks.append(chunk)
-        assert actual_size == info.file_size, f"size mismatch: {info.filename}"
+        require(actual_size == info.file_size, f"size mismatch: {info.filename}")
         if is_xml:
             etree.fromstring(b"".join(chunks), parser=safe_xml_parser)
 ```
@@ -237,26 +246,64 @@ def theme_candidates(role_fonts, text):
     return [face for face in dict.fromkeys(faces) if face]
 
 # 2. Per run: explicit value, else paragraph defaults, else report as inherited.
+# run.font.name exposes only the LATIN typeface; a run that also declares a:ea
+# or a:cs must be resolved per the scripts present in its own text first.
+def explicit_run_face(run, text):
+    """The run's direct a:latin/a:ea/a:cs typeface chosen by its scripts (or None)."""
+    rPr = run._r.find(qn("a:rPr"))
+    if rPr is None:
+        return None
+    declared = {}
+    for slot, tag in (("latin", "a:latin"), ("eastAsia", "a:ea"), ("complexScript", "a:cs")):
+        node = rPr.find(qn(tag))
+        if node is not None and node.get("typeface"):
+            declared[slot] = node.get("typeface")
+    if not declared:
+        return None
+    tags = script_tags(text)
+    if any(tag in ("Hans", "Hant", "Jpan", "Hang") for tag in tags) and "eastAsia" in declared:
+        return declared["eastAsia"]
+    if any(tag in ("Arab", "Hebr", "Deva") for tag in tags) and "complexScript" in declared:
+        return declared["complexScript"]
+    return declared.get("latin")
+
+def iter_text_frames(shapes):
+    """Shape text frames plus every table cell's text frame (a graphic frame
+    has has_text_frame=False, so tables must be walked explicitly)."""
+    for shape in shapes:
+        if shape.has_text_frame:
+            yield shape.text_frame
+        if getattr(shape, "has_table", False):
+            for row in shape.table.rows:
+                for cell in row.cells:
+                    yield cell.text_frame
+
 for i, slide in enumerate(prs.slides):
     master_name, theme_fonts = theme_faces_for_slide(slide)
     print(i, "master:", master_name, "theme:", ascii(theme_fonts))
     title_shape = slide.shapes.title
-    for shape in iter_shapes(slide.shapes):
-        if not shape.has_text_frame:
-            continue
-        for paragraph in shape.text_frame.paragraphs:
+    for frame in iter_text_frames(iter_shapes(slide.shapes)):
+        holder = getattr(frame, "_parent", None)  # the shape for ordinary frames
+        for paragraph in frame.paragraphs:
             for run in paragraph.runs:
-                if run.font.name:
-                    face, source = run.font.name, "run"
+                explicit = explicit_run_face(run, run.text)
+                if explicit:
+                    face, source = explicit, "run script face (a:latin/a:ea/a:cs)"
+                elif run.font.name:
+                    face, source = run.font.name, "run latin"
                 elif paragraph.font.name:
-                    face, source = paragraph.font.name, "paragraph defaults"
+                    # paragraph.font is the LATIN slot of a:pPr/a:defRPr only;
+                    # script-specific paragraph defaults are not modeled by
+                    # python-pptx and need raw XML for full coverage.
+                    face, source = paragraph.font.name, "paragraph defaults (latin)"
                 else:
                     role = "major" if (
-                        title_shape is not None and shape._element is title_shape._element
+                        title_shape is not None and
+                        getattr(holder, "_element", None) is title_shape._element
                     ) else "minor"
                     face = theme_candidates(theme_fonts[role], run.text)
                     source = f"inherited {role} theme candidates (verify placeholder chain/locale)"
-                print(i, shape.name, repr(run.text[:20]), "font:", ascii(face), "source:", source)
+                print(i, repr(run.text[:20]), "font:", ascii(face), "source:", source)
 ```
 
 python-pptx does not evaluate the full placeholder -> layout -> master inheritance chain; when

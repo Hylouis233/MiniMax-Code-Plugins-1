@@ -429,5 +429,37 @@ guard_last = header_ws.max_row
 if guard_last < 2:
     pass  # guarded route: skip building rules
 
+
+# ---- read.md: implausible <dimension> is reset before streaming ------------------
+dim_wb = openpyxl.Workbook()
+dim_ws = dim_wb.active
+dim_ws.append(["h1", "h2"])
+dim_ws.append([1, 2])
+dim_ws.append([3, 4])
+dim_wb.save("dimension.xlsx")
+# Corrupt the sheet's dimension metadata the way non-Excel producers do.
+import zipfile as dim_zip
+with dim_zip.ZipFile("dimension.xlsx") as archive:
+    members = {name: archive.read(name) for name in archive.namelist()}
+members["xl/worksheets/sheet1.xml"] = members["xl/worksheets/sheet1.xml"].replace(
+    b"<dimension ref=\"A1:B3\"/>", b"<dimension ref=\"A1:A1\"/>"
+)
+with dim_zip.ZipFile("dimension.xlsx", "w") as archive:
+    for name, data in members.items():
+        archive.writestr(name, data)
+
+dim_value = openpyxl.load_workbook("dimension.xlsx", read_only=True, data_only=True)
+dim_ws_ro = dim_value.active
+check("corrupted dimension truncates streaming (negative control)",
+      dim_ws_ro.max_row == 1, dim_ws_ro.max_row)
+streamed_before_reset = [row for row in dim_ws_ro.iter_rows(values_only=True)]
+dim_ws_ro.reset_dimensions()
+streamed_after_reset = [row for row in dim_ws_ro.iter_rows(values_only=True)]
+dim_value.close()
+check("reset_dimensions restores the real extent",
+      len(streamed_after_reset) == 3 and streamed_after_reset[2] == (3, 4),
+      (len(streamed_before_reset), streamed_after_reset[-1]))
+
+
 print("\n" + ("ALL XLSX FIXTURES PASSED" if not failures else f"{len(failures)} FAILURES: {failures}"))
 sys.exit(0 if not failures else 1)

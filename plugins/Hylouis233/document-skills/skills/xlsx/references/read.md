@@ -16,6 +16,15 @@ def formula_text(cell):
 for sheet_name in value_wb.sheetnames:
     formula_ws = formula_wb[sheet_name]
     value_ws = value_wb[sheet_name]
+    # Read-only iteration is bounded by the sheet's <dimension> metadata.
+    # Non-Excel producers write wrong dimensions, which silently truncates the
+    # stream; when the declared extent looks implausible, reset it and let
+    # openpyxl discover the real used range.
+    declared = value_ws.calculate_dimension()
+    if value_ws.max_row in (None, 0) or declared in ("A1:A1", "A1"):
+        value_ws.reset_dimensions()
+        formula_ws.reset_dimensions()
+        print(f"--- {sheet_name} --- implausible dimension {declared!r}; reset, real extent:")
     print(f"--- {sheet_name} --- dims:", value_ws.calculate_dimension())
 
     rows = value_ws.iter_rows(values_only=True)

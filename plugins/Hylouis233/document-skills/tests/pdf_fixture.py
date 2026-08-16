@@ -347,5 +347,38 @@ check("scaled stamp lands inside the mixed-size small page",
 check("mixed-size pages keep their original dimensions",
       [round(float(p.mediabox.width)) for p in scaled_check.pages] == [595, 595, 200])
 
+
+# ---- SKILL.md overflow check: off-page text is a defect -------------------------
+overflow_ok = canvas.Canvas("overflow.pdf", pagesize=A4)
+overflow_ok.setFont("Helvetica", 16)
+overflow_ok.drawString(72, 780, "fits on page")
+overflow_ok.showPage()
+overflow_ok.save()
+overflow_bad = canvas.Canvas("overflow-bad.pdf", pagesize=A4)
+overflow_bad.setFont("Helvetica", 16)
+overflow_bad.drawString(72, -200, "drawn far below the page box")
+overflow_bad.showPage()
+overflow_bad.save()
+
+def overflow_pages(path):
+    doc = fitz.open(path)
+    pages = []
+    for page in doc:
+        # Plain block extraction drops fully off-page text; enlarge the clip.
+        clip = fitz.Rect(-2000, -2000, page.rect.width + 2000, page.rect.height + 2000)
+        blocks = [b for b in page.get_text("blocks", clip=clip) if b[6] == 0]
+        if any(b[0] < -0.5 or b[1] < -0.5 or b[2] > page.rect.width + 0.5 or b[3] > page.rect.height + 0.5
+               for b in blocks):
+            pages.append(page.number + 1)
+    doc.close()
+    return pages
+
+check("in-bounds PDF reports no overflow pages", overflow_pages("overflow.pdf") == [])
+check("off-page text is detected by the overflow check (negative control)",
+      overflow_pages("overflow-bad.pdf") == [1])
+check("off-page text still extracts, so extraction alone cannot catch it",
+      "drawn far below" in (pypdf.PdfReader("overflow-bad.pdf").pages[0].extract_text() or ""))
+
+
 print("\n" + ("ALL PDF FIXTURES PASSED" if not failures else f"{len(failures)} FAILURES: {failures}"))
 sys.exit(0 if not failures else 1)

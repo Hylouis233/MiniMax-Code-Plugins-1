@@ -18,7 +18,12 @@ python -c "import docx; print(docx.__version__ if hasattr(docx,'__version__') el
 ```
 
 - `python-docx` present -> full create/read/edit support.
-- Missing -> report it (`pip install python-docx`) and stop; do not hand-write OOXML.
+- `python-docx` missing but `pandoc` present -> read/extract requests can still
+  be served by the pandoc route in [references/read.md](references/read.md);
+  report that structural reads, edits, and creation are unavailable
+  (`pip install python-docx`) and stop only for those routes. Never hand-write
+  OOXML as a substitute.
+- Both missing -> report the missing tools and stop.
 - `pandoc` present -> prefer it for text/markdown extraction (fast, faithful).
 - `soffice` present -> enables the PDF smoke test in postcheck.
 

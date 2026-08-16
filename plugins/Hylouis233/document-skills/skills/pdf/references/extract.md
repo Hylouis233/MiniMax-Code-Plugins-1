@@ -37,14 +37,20 @@ for page in doc:
 
     # With coordinates (decide columns/reading order yourself); also the fallback
     # when a table is visually present but find_tables detected nothing.
-    for block in page.get_text("dict")["blocks"]:
-        for line in block.get("lines", []):
-            for span in line["spans"]:
-                print(page_number, round(span["bbox"][0]),
-                      round(span["bbox"][1]), span["text"])
+    # Collect and sort first: spans arrive in content-stream order, which can
+    # differ from the visual order even when plain text extraction is sorted.
+    spans = [
+        (page_number, round(span["bbox"][0]), round(span["bbox"][1]), span["text"])
+        for block in page.get_text("dict")["blocks"]
+        for line in block.get("lines", [])
+        for span in line["spans"]
+    ]
+    for record in sorted(spans, key=lambda item: (item[2], item[1])):
+        print(*record)
 
     # Images. Apply a soft mask (xref at info[1]) before saving or transparency is lost.
     # Pixmap keeps the image's own colorspace: convert CMYK/ICC bases to RGB first.
+    # This loop sees image XObjects only.
     for i, info in enumerate(page.get_images(full=True), start=1):
         base = fitz.Pixmap(doc, info[0])
         if base.colorspace and base.colorspace not in (fitz.csGRAY, fitz.csRGB):
@@ -55,6 +61,17 @@ for page in doc:
         else:
             pix = base
         pix.save(f"img-p{page_number}-{i}.png")
+
+    # Inline images live in the page content stream, not the XObject table, so
+    # get_images() never lists them. Enumerate image blocks from the dict pass
+    # and report both lists: the xref loop is authoritative for XObjects, the
+    # block pass catches inline placements.
+    for b in page.get_text("dict")["blocks"]:
+        if b["type"] != 1:
+            continue
+        ext = b.get("ext") or "png"
+        with open(f"img-p{page_number}-inline-{b['number']}.{ext}", "wb") as fh:
+            fh.write(b["image"])
 
     # Rasterize (for visual checks or OCR preprocessing)
     pix = page.get_pixmap(dpi=150)
