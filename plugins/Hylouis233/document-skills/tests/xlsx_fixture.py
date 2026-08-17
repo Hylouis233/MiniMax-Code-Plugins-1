@@ -368,6 +368,34 @@ from openpyxl.worksheet.datavalidation import DataValidation
 from openpyxl.worksheet.table import Table
 
 
+# ---- create.md chart: duplicate products are described as row-level sales ----
+row_chart_wb = openpyxl.Workbook()
+row_chart_ws = row_chart_wb.active
+row_chart_ws.title = "Sales"
+row_chart_ws.append(["Region", "Product", "Revenue"])
+for row in (("EU", "Widget", 1140), ("EU", "Gadget", 1680), ("US", "Widget", 1900)):
+    row_chart_ws.append(row)
+row_chart = BarChart()
+row_chart.type = "col"
+row_chart.title = "Revenue by transaction row"
+row_chart.add_data(Reference(row_chart_ws, min_col=3, min_row=1, max_row=4),
+                   titles_from_data=True)
+row_chart.set_categories(Reference(row_chart_ws, min_col=2, min_row=2, max_row=4))
+row_chart_ws.add_chart(row_chart, "E2")
+row_chart_wb.save("row-level-sales-chart.xlsx")
+row_chart_reopened = openpyxl.load_workbook("row-level-sales-chart.xlsx", data_only=False)
+reopened_row_chart = row_chart_reopened["Sales"]._charts[0]
+row_chart_title = reopened_row_chart.title.tx.rich.p[0].r[0].t
+check("duplicate product labels are explicitly charted per transaction row",
+      [row_chart_reopened["Sales"][f"B{row}"].value for row in range(2, 5)].count("Widget") == 2
+      and row_chart_title == "Revenue by transaction row"
+      and reopened_row_chart.ser[0].cat.numRef.f == "'Sales'!$B$2:$B$4"
+      and reopened_row_chart.ser[0].val.numRef.f == "'Sales'!$C$2:$C$4"
+      and reopened_row_chart.ser[0].tx.strRef.f == "'Sales'!C1",
+      row_chart_title)
+row_chart_reopened.close()
+
+
 def formula_text(value):
     if isinstance(value, str):
         return value
@@ -397,17 +425,26 @@ def drawing_anchor_rows(drawing):
     return tuple(rows)
 
 
+def sparse_formula_cells(sheet):
+    if not hasattr(sheet, "_cells"):
+        raise RuntimeError("structural edits require a normal writable Worksheet")
+    return (
+        cell for cell in sorted(
+            sheet._cells.values(), key=lambda cell: (cell.row, cell.column)
+        )
+        if cell.data_type == "f"
+    )
+
+
 def structural_references(workbook):
     refs = []
     for item in defined_name_values(workbook):
         refs.append(("defined name", item.name, item.attr_text))
     for sheet in workbook.worksheets:
         owner = sheet.title
-        for row in sheet.iter_rows():
-            for cell in row:
-                if cell.data_type == "f":
-                    refs.append(("cell formula", f"{owner}!{cell.coordinate}",
-                                 formula_text(cell.value)))
+        for cell in sparse_formula_cells(sheet):
+            refs.append(("cell formula", f"{owner}!{cell.coordinate}",
+                         formula_text(cell.value)))
         for table in sheet.tables.values():
             refs.append(("table", owner + "!" + table.name, table.ref))
         for merged_range in sheet.merged_cells.ranges:
@@ -444,16 +481,14 @@ def structural_references(workbook):
 def cell_formula_references(workbook):
     refs = []
     for sheet in workbook.worksheets:
-        for row in sheet.iter_rows():
-            for cell in row:
-                if cell.data_type == "f":
-                    value = cell.value
-                    refs.append((
-                        "cell formula",
-                        sheet.title,
-                        cell.coordinate,
-                        formula_text(value),
-                    ))
+        for cell in sparse_formula_cells(sheet):
+            value = cell.value
+            refs.append((
+                "cell formula",
+                sheet.title,
+                cell.coordinate,
+                formula_text(value),
+            ))
     return refs
 
 
@@ -551,6 +586,30 @@ check(
     formula_references == [("cell formula", "Audit", "C1", "=SUM(A2:A3)")],
     formula_references,
 )
+
+sparse_scan_wb = openpyxl.Workbook()
+sparse_scan_ws = sparse_scan_wb.active
+sparse_scan_ws.title = "Sparse"
+sparse_scan_ws["D2"] = "=1+1"
+sparse_scan_ws["XFD1048576"].number_format = "0.00"
+sparse_scan_wb.save("sparse-structural-scan.xlsx")
+sparse_scan_wb.close()
+sparse_scan_wb = openpyxl.load_workbook("sparse-structural-scan.xlsx", data_only=False)
+sparse_scan_ws = sparse_scan_wb["Sparse"]
+original_sparse_iter_rows = sparse_scan_ws.iter_rows
+sparse_scan_ws.iter_rows = lambda *args, **kwargs: (_ for _ in ()).throw(
+    RuntimeError("rectangular formula scan must not run")
+)
+try:
+    sparse_structural = structural_references(sparse_scan_wb)
+    sparse_formulas = cell_formula_references(sparse_scan_wb)
+finally:
+    sparse_scan_ws.iter_rows = original_sparse_iter_rows
+check("structural formula inventory walks sparse cells at worksheet limits",
+      ("cell formula", "Sparse!D2", "=1+1") in sparse_structural
+      and sparse_formulas == [("cell formula", "Sparse", "D2", "=1+1")],
+      (sparse_structural, sparse_formulas))
+sparse_scan_wb.close()
 check("intersecting formula ranges are blocked before row insertion",
       formula_may_intersect_rows("Audit", "=SUM(A2:A3)", "Audit", 3))
 check("audited formula ranges above the insertion can proceed",

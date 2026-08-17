@@ -38,6 +38,17 @@ def drawing_anchor_rows(drawing):
         rows.append(marker.row + 1)
     return tuple(rows)
 
+def sparse_formula_cells(sheet):
+    """Walk instantiated formula cells only; worksheet bounds can span the full grid."""
+    if not hasattr(sheet, "_cells"):
+        raise RuntimeError("structural edits require a normal writable Worksheet")
+    return (
+        cell for cell in sorted(
+            sheet._cells.values(), key=lambda cell: (cell.row, cell.column)
+        )
+        if cell.data_type == "f"
+    )
+
 def structural_references(workbook):
     """Inventory formulas/ranges that insert_rows/delete_rows will not rewrite."""
     refs = []
@@ -45,11 +56,9 @@ def structural_references(workbook):
         refs.append(("defined name", item.name, item.attr_text))
     for sheet in workbook.worksheets:
         owner = sheet.title
-        for row in sheet.iter_rows():
-            for cell in row:
-                if cell.data_type == "f":
-                    refs.append(("cell formula", f"{owner}!{cell.coordinate}",
-                                 formula_text(cell.value)))
+        for cell in sparse_formula_cells(sheet):
+            refs.append(("cell formula", f"{owner}!{cell.coordinate}",
+                         formula_text(cell.value)))
         for table in sheet.tables.values():
             refs.append(("table", owner + "!" + table.name, table.ref))
         for merged_range in sheet.merged_cells.ranges:
@@ -90,16 +99,14 @@ def cell_formula_references(workbook):
     """Inventory ordinary, array, and data-table formulas before row/column moves."""
     refs = []
     for sheet in workbook.worksheets:
-        for row in sheet.iter_rows():
-            for cell in row:
-                if cell.data_type == "f":
-                    value = cell.value
-                    refs.append((
-                        "cell formula",
-                        sheet.title,
-                        cell.coordinate,
-                        formula_text(value),
-                    ))
+        for cell in sparse_formula_cells(sheet):
+            value = cell.value
+            refs.append((
+                "cell formula",
+                sheet.title,
+                cell.coordinate,
+                formula_text(value),
+            ))
     return refs
 
 def formula_may_intersect_rows(owner_sheet, formula, shifted_sheet, start_row):

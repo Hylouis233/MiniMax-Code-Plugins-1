@@ -7,9 +7,133 @@ from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 from pptx.oxml.ns import qn
 from lxml import etree
+from pathlib import Path
+import zipfile
 
 DIAGRAM_NS = "http://schemas.openxmlformats.org/drawingml/2006/diagram"
-SAFE_XML = etree.XMLParser(load_dtd=False, resolve_entities=False, no_network=True)
+CONTENT_TYPES_NS = "http://schemas.openxmlformats.org/package/2006/content-types"
+SAFE_XML = etree.XMLParser(
+    load_dtd=False, resolve_entities=False, no_network=True,
+    huge_tree=False, recover=False,
+)
+MAX_ARCHIVE_BYTES = 200 * 1024 * 1024
+MAX_MEMBERS = 10_000
+MAX_XML_PART = 20 * 1024 * 1024
+MAX_ENTRY = 100 * 1024 * 1024
+MAX_TOTAL_UNCOMPRESSED = 500 * 1024 * 1024
+MAX_COMPRESSION_RATIO = 200
+
+def require(condition, message):
+    """Security gates must remain active under python -O."""
+    if not condition:
+        raise ValueError(message)
+
+def validate_pptx_package(source):
+    """Validate the same seekable handle that python-pptx will parse."""
+    source.seek(0, 2)
+    compressed_size = source.tell()
+    source.seek(0)
+    require(compressed_size <= MAX_ARCHIVE_BYTES, "compressed PPTX file size above limit")
+    with zipfile.ZipFile(source) as archive:
+        infos = archive.infolist()
+        require(len(infos) <= MAX_MEMBERS, "archive member count above limit")
+        names = {info.filename for info in infos}
+        require(len(names) == len(infos), "duplicate archive member names are unsafe")
+        require("[Content_Types].xml" in names and "ppt/presentation.xml" in names,
+                "missing required OPC members")
+        require(sum(info.file_size for info in infos) <= MAX_TOTAL_UNCOMPRESSED,
+                "declared total uncompressed size above limit")
+
+        content_types_info = next(
+            info for info in infos if info.filename == "[Content_Types].xml"
+        )
+        require(content_types_info.file_size <= MAX_XML_PART,
+                "oversized XML part: [Content_Types].xml")
+        require(
+            content_types_info.file_size / max(content_types_info.compress_size, 1)
+            <= MAX_COMPRESSION_RATIO,
+            "suspicious compression ratio: [Content_Types].xml",
+        )
+        content_type_chunks = []
+        content_type_size = 0
+        with archive.open(content_types_info) as stream:
+            while chunk := stream.read(64 * 1024):
+                content_type_size += len(chunk)
+                require(content_type_size <= MAX_XML_PART,
+                        "part exceeded read limit: [Content_Types].xml")
+                content_type_chunks.append(chunk)
+        require(content_type_size == content_types_info.file_size,
+                "size mismatch: [Content_Types].xml")
+        content_types_blob = b"".join(content_type_chunks)
+        content_types_root = etree.fromstring(content_types_blob, parser=SAFE_XML)
+        require(content_types_root.tag == f"{{{CONTENT_TYPES_NS}}}Types",
+                "invalid content-types root")
+        default_types = {}
+        override_types = {}
+        for declaration in content_types_root:
+            if declaration.tag == f"{{{CONTENT_TYPES_NS}}}Default":
+                key = (declaration.get("Extension") or "").casefold()
+                target = default_types
+            elif declaration.tag == f"{{{CONTENT_TYPES_NS}}}Override":
+                part_name = declaration.get("PartName") or ""
+                require(part_name.startswith("/"), "invalid content-type part name")
+                key = part_name[1:].casefold()
+                target = override_types
+            else:
+                continue
+            content_type = declaration.get("ContentType") or ""
+            require(key and content_type and key not in target,
+                    "invalid or duplicate content-type declaration")
+            target[key] = content_type.partition(";")[0].strip().casefold()
+
+        actual_total = 0
+        for info in infos:
+            require(info.file_size <= MAX_ENTRY, f"oversized part: {info.filename}")
+            ratio = info.file_size / max(info.compress_size, 1)
+            require(ratio <= MAX_COMPRESSION_RATIO,
+                    f"suspicious compression ratio: {info.filename}")
+            extension = info.filename.rpartition(".")[2].casefold()
+            content_type = override_types.get(
+                info.filename.casefold(), default_types.get(extension, "")
+            )
+            is_xml = (
+                info.filename.casefold().endswith((".xml", ".rels"))
+                or content_type in {"application/xml", "text/xml"}
+                or content_type.endswith("+xml")
+            )
+            if is_xml:
+                require(info.file_size <= MAX_XML_PART, f"oversized XML part: {info.filename}")
+
+            chunks = []
+            actual_size = 0
+            if info.filename == "[Content_Types].xml":
+                chunks = [content_types_blob]
+                actual_size = len(content_types_blob)
+                actual_total += actual_size
+            else:
+                with archive.open(info) as stream:
+                    while chunk := stream.read(64 * 1024):
+                        actual_size += len(chunk)
+                        actual_total += len(chunk)
+                        require(actual_size <= MAX_ENTRY,
+                                f"part exceeded read limit: {info.filename}")
+                        require(actual_total <= MAX_TOTAL_UNCOMPRESSED,
+                                "archive exceeded total read limit")
+                        if is_xml:
+                            chunks.append(chunk)
+            require(actual_total <= MAX_TOTAL_UNCOMPRESSED,
+                    "archive exceeded total read limit")
+            require(actual_size == info.file_size, f"size mismatch: {info.filename}")
+            if is_xml:
+                etree.fromstring(b"".join(chunks), parser=SAFE_XML)
+    source.seek(0)
+
+def open_validated_presentation(path):
+    """Preflight and parse one immutable open-file identity, then release the handle."""
+    with Path(path).open("rb") as source:
+        validate_pptx_package(source)
+        source.seek(0)
+        return Presentation(source)
 
 def iter_shapes(shapes):
     """Walk shapes recursively so content nested inside group shapes is counted too."""
@@ -18,6 +142,56 @@ def iter_shapes(shapes):
             yield from iter_shapes(shape.shapes)
         else:
             yield shape
+
+OOXML_TRUE = {"1", "true"}
+OOXML_FALSE = {"0", "false"}
+
+def ooxml_bool(element, attribute, default):
+    value = element.get(attribute)
+    if value is None:
+        return default
+    value = value.strip(" \t\r\n")
+    if value in OOXML_TRUE:
+        return True
+    if value in OOXML_FALSE:
+        return False
+    raise ValueError(f"invalid OOXML boolean {attribute}={value!r}")
+
+def shape_is_hidden(shape):
+    properties = shape._element.find(".//" + qn("p:cNvPr"))
+    return properties is not None and ooxml_bool(properties, "hidden", False)
+
+def layer_text_content(shapes, source, *, inherited):
+    """Collect visible text from one layer; inherited placeholders are template prompts."""
+    records = []
+    for shape in shapes:
+        if shape_is_hidden(shape):
+            continue
+        if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
+            records.extend(layer_text_content(shape.shapes, source, inherited=inherited))
+            continue
+        if inherited and shape.is_placeholder:
+            continue
+        if shape.has_text_frame and shape.text_frame.text:
+            records.append({
+                "source": source,
+                "shape": shape.name,
+                "text": shape.text_frame.text,
+            })
+    return records
+
+def slide_text_content(slide):
+    """Inventory rendered text layers in master -> layout -> slide order."""
+    records = []
+    if ooxml_bool(slide._element, "showMasterSp", True):
+        layout = slide.slide_layout
+        if ooxml_bool(layout._element, "showMasterSp", True):
+            records.extend(layer_text_content(
+                layout.slide_master.shapes, "master", inherited=True,
+            ))
+        records.extend(layer_text_content(layout.shapes, "layout", inherited=True))
+    records.extend(layer_text_content(slide.shapes, "slide", inherited=False))
+    return records
 
 def table_cells(table):
     """Inventory the grid without repeating a merged cell's text in covered slots."""
@@ -109,10 +283,11 @@ def cached_text_point_map(container, point_count):
             index = int(point.get("idx"))
         except (TypeError, ValueError):
             return None
-        value = point.find(qn("c:v"))
-        if value is None or not 0 <= index < point_count or index in values:
+        value_nodes = point.findall(qn("c:v"))
+        if (len(value_nodes) != 1 or not 0 <= index < point_count
+                or index in values):
             return None
-        values[index] = value.text or ""
+        values[index] = value_nodes[0].text or ""
     return values
 
 def category_source(series):
@@ -258,22 +433,39 @@ def series_content(series, *, include_categories=False, point_budget=None):
         })
     return content
 
-def chart_axis_text(axis):
-    title = axis.find(qn("c:title"))
+def title_text(title):
+    """Read a chart/axis title without invoking python-pptx's mutating text accessor."""
     if title is None:
         return ""
-    rich = title.xpath("./c:tx/c:rich")
-    references = title.xpath("./c:tx/c:strRef")
-    if len(rich) + len(references) != 1:
+    text_nodes = title.findall(qn("c:tx"))
+    if len(text_nodes) != 1:
         return None
-    if rich:
-        return "\n".join(paragraph.text for paragraph in rich[0].findall(qn("a:p")))
-    caches = references[0].findall(qn("c:strCache"))
+    sources = [child for child in text_nodes[0] if isinstance(child.tag, str)]
+    if len(sources) != 1:
+        return None
+    if sources[0].tag == qn("c:rich"):
+        paragraphs = sources[0].findall(qn("a:p"))
+        return None if not paragraphs else "\n".join(
+            paragraph.text for paragraph in paragraphs
+        )
+    if sources[0].tag != qn("c:strRef"):
+        return None
+    formulas = sources[0].findall(qn("c:f"))
+    if len(formulas) != 1 or not formulas[0].text:
+        return None
+    caches = sources[0].findall(qn("c:strCache"))
     if (len(caches) != 1 or (count := cache_point_count(caches[0])) is None
             or count != 1):
         return None
     values = cached_text_point_map(caches[0], count)
-    return None if values is None else "\n".join(values.get(index, "") for index in range(count))
+    return None if values is None or set(values) != {0} else values[0]
+
+def chart_axis_text(axis):
+    return title_text(axis.find(qn("c:title")))
+
+def chart_title_text(chart):
+    titles = chart._element.xpath("./c:chart/c:title")
+    return title_text(titles[0]) if len(titles) == 1 else ("" if not titles else None)
 
 def chart_axes(chart):
     """Return every category, date, value, and series axis in document order."""
@@ -318,7 +510,7 @@ def smartart_content(shape):
     labels = [node.text for node in root.iter(qn("a:t")) if node.text]
     return {"name": shape.name, "status": "ok", "text": labels}
 
-prs = Presentation("input.pptx")
+prs = open_validated_presentation("input.pptx")
 print("slide size:", prs.slide_width, prs.slide_height)
 point_budget = {"remaining": MAX_CHART_POINTS}
 for i, slide in enumerate(prs.slides):
@@ -326,7 +518,7 @@ for i, slide in enumerate(prs.slides):
     title = slide.shapes.title.text_frame.text if slide.shapes.title is not None else ""
     notes = slide.notes_slide.notes_text_frame.text if slide.has_notes_slide else ""
     shapes = list(iter_shapes(slide.shapes))   # flattened; groups are common in template decks
-    text = [sh.text_frame.text for sh in shapes if sh.has_text_frame and sh.text_frame.text]
+    text = slide_text_content(slide)
     tables = [
         table_cells(sh.table)
         for sh in shapes if sh.has_table
@@ -336,10 +528,7 @@ for i, slide in enumerate(prs.slides):
         if not sh.has_chart:
             continue
         chart = sh.chart
-        chart_title = (
-            chart.chart_title.text_frame.text
-            if chart.has_title else ""
-        )
+        chart_title = chart_title_text(chart)
         plots = []
         for plot in chart.plots:
             items = list(plot.series)
@@ -379,8 +568,10 @@ for i, slide in enumerate(prs.slides):
     print("  notes:", notes)
 ```
 
-(Simplify the title lookup to `slide.shapes.title` when present; the defensive loop is for
-layouts where the title placeholder is missing.)
+Inherited layout/master placeholders are deliberately excluded: their stored text is a template
+prompt, not rendered slide copy, and slide placeholders already contribute their instantiated
+text. Footer/date/slide-number fields and occlusion still require a rendered-slide check when
+pixel-level visibility matters.
 
 ## Triage: deck renders wrong
 
@@ -395,74 +586,10 @@ layouts where the title placeholder is missing.)
 
 ## Bounded package health check
 
-Inspect declared sizes and compression ratios before decompressing anything. `ZipFile.testzip()`
-must not be the first check because it expands every member, including an archive bomb.
-
-```python
-import zipfile
-from pathlib import Path
-from lxml import etree
-
-path = Path("input.pptx")
-MAX_ARCHIVE_BYTES = 200 * 1024 * 1024
-MAX_MEMBERS = 10_000
-MAX_XML_PART = 20 * 1024 * 1024
-MAX_ENTRY = 100 * 1024 * 1024
-MAX_TOTAL_UNCOMPRESSED = 500 * 1024 * 1024
-MAX_COMPRESSION_RATIO = 200
-
-# Security limits must survive `python -O` (which strips assert statements),
-# so every check raises explicitly instead of asserting.
-def require(condition, message):
-    if not condition:
-        raise ValueError(message)
-
-safe_xml_parser = etree.XMLParser(
-    load_dtd=False,
-    resolve_entities=False,
-    no_network=True,
-    huge_tree=False,
-    recover=False,
-)
-
-# Bound the package itself before ZipFile materializes its central directory.
-require(path.stat().st_size <= MAX_ARCHIVE_BYTES,
-        "compressed PPTX file size above limit")
-with zipfile.ZipFile(path) as archive:
-    infos = archive.infolist()
-    # Check the count before building sets, summing sizes, or opening any member.
-    require(len(infos) <= MAX_MEMBERS, "archive member count above limit")
-    names = {info.filename for info in infos}
-    require(len(names) == len(infos), "duplicate archive member names are unsafe")
-    require("[Content_Types].xml" in names and "ppt/presentation.xml" in names,
-            "missing required OPC members")
-    require(sum(info.file_size for info in infos) <= MAX_TOTAL_UNCOMPRESSED,
-            "declared total uncompressed size above limit")
-
-    actual_total = 0
-    for info in infos:
-        require(info.file_size <= MAX_ENTRY, f"oversized part: {info.filename}")
-        ratio = info.file_size / max(info.compress_size, 1)
-        require(ratio <= MAX_COMPRESSION_RATIO, f"suspicious compression ratio: {info.filename}")
-        is_xml = info.filename.endswith((".xml", ".rels"))
-        if is_xml:
-            require(info.file_size <= MAX_XML_PART, f"oversized XML part: {info.filename}")
-
-        chunks = []
-        actual_size = 0
-        # Streaming to EOF verifies decompression and CRC only after metadata limits pass.
-        with archive.open(info) as stream:
-            while chunk := stream.read(64 * 1024):
-                actual_size += len(chunk)
-                actual_total += len(chunk)
-                require(actual_size <= MAX_ENTRY, f"part exceeded read limit: {info.filename}")
-                require(actual_total <= MAX_TOTAL_UNCOMPRESSED, "archive exceeded total read limit")
-                if is_xml:
-                    chunks.append(chunk)
-        require(actual_size == info.file_size, f"size mismatch: {info.filename}")
-        if is_xml:
-            etree.fromstring(b"".join(chunks), parser=safe_xml_parser)
-```
+The content-inventory block performs this check before its first `Presentation()` call and parses
+the same open handle it validated. Do not replace that order with `Presentation(path)` followed by
+a later check: package parsing already expands ZIP members. Likewise, `ZipFile.testzip()` must not
+be the first check because it expands every member, including an archive bomb.
 
 These are conservative triage defaults, not PPTX format limits. Raise a limit only for an
 explicitly trusted large deck, and retain the per-member and streaming checks.
@@ -470,24 +597,23 @@ explicitly trusted large deck, and retain the per-member and streaming checks.
 ## Font triage with inheritance
 
 Most template decks set no explicit `run.font.name`; the effective face is inherited from the
-placeholder, layout, master, or theme. Resolve what you can and name the fallback explicitly:
+placeholder, layout, master, or theme. This block is a continuation of the content-inventory
+session above: reuse its already validated `prs` object rather than reopening the path. Resolve
+what you can and name the fallback explicitly:
 
 ```python
 import xml.etree.ElementTree as ET
-from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 from pptx.opc.constants import RELATIONSHIP_TYPE as RT
 from pptx.oxml.ns import qn
 
 def iter_shapes(shapes):
-    """Self-contained recursive walker for this independently runnable block."""
+    """Local recursive walker for the font-triage continuation."""
     for shape in shapes:
         if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
             yield from iter_shapes(shape.shapes)
         else:
             yield shape
-
-prs = Presentation("deck.pptx")
 
 # 1. Resolve the theme related to each slide's own layout/master. A package can contain
 # multiple masters with different themes, so the first /ppt/theme/* part is not a safe default.

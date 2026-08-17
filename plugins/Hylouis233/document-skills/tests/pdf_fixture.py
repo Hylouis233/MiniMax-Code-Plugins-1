@@ -5,6 +5,7 @@
 #   python pptx_fixture.py  (deps: python-pptx)
 #   python xlsx_fixture.py  (deps: openpyxl)
 #   python docx_fixture.py  (deps: python-docx, pymupdf, soffice on PATH)
+import math
 import os
 import sys
 
@@ -218,14 +219,130 @@ widget_canvas.showPage()
 widget_canvas.save()
 widget_doc = fitz.open("widget-only.pdf")
 widget_page = widget_doc[0]
-widgets = list(widget_page.widgets() or ())
-annotations = list(widget_page.annots() or ())
-links = widget_page.get_links()
+
+NON_VIEWABLE_ANNOTATION_FLAGS = (
+    fitz.PDF_ANNOT_IS_INVISIBLE | fitz.PDF_ANNOT_IS_HIDDEN | fitz.PDF_ANNOT_IS_NO_VIEW
+)
+
+
+def annotation_flags(page, item):
+    flags = getattr(item, "flags", None)
+    if flags is not None:
+        return int(flags)
+    xref = getattr(item, "xref", 0)
+    if not xref:
+        return 0
+    value_type, value = page.parent.xref_get_key(xref, "F")
+    try:
+        return int(value) if value_type == "int" else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def visible_clip(page, rectangle, *, already_rotated=False):
+    try:
+        rectangle = fitz.Rect(rectangle)
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(value) for value in rectangle):
+        return None
+    rectangle.normalize()
+    if rectangle.is_empty or rectangle.is_infinite:
+        return None
+    rotated = rectangle if already_rotated else rectangle * page.rotation_matrix
+    clip = rotated & page.rect
+    return None if clip.is_empty else clip
+
+
+def rendered_interactives(page, items):
+    rendered = []
+    visibility_unknown = False
+    for item in items:
+        if annotation_flags(page, item) & NON_VIEWABLE_ANNOTATION_FLAGS:
+            continue
+        clip = visible_clip(page, item.rect)
+        if clip is None:
+            continue
+        try:
+            with_annotations = page.get_pixmap(
+                matrix=fitz.Matrix(2, 2), clip=clip, alpha=False, annots=True,
+            )
+            without_annotations = page.get_pixmap(
+                matrix=fitz.Matrix(2, 2), clip=clip, alpha=False, annots=False,
+            )
+        except (RuntimeError, ValueError):
+            visibility_unknown = True
+            continue
+        if with_annotations.samples != without_annotations.samples:
+            rendered.append(item)
+    return rendered, visibility_unknown
+
+
+def page_links(page):
+    links = []
+    link = page.first_link
+    while link is not None:
+        links.append(link)
+        link = link.next
+    return links
+
+
+def link_has_target(link):
+    destination = getattr(link, "dest", None)
+    return bool(getattr(link, "uri", None)) or (
+        destination is not None and getattr(destination, "page", -1) >= 0
+    )
+
+
+def viewable_interactives(page):
+    widgets, widget_visibility_unknown = rendered_interactives(
+        page, list(page.widgets() or ())
+    )
+    annotations, annotation_visibility_unknown = rendered_interactives(
+        page, list(page.annots() or ())
+    )
+    links = [
+        link for link in page_links(page)
+        if link_has_target(link)
+        and not annotation_flags(page, link) & NON_VIEWABLE_ANNOTATION_FLAGS
+        and visible_clip(page, link.rect, already_rotated=True) is not None
+    ]
+    return (
+        widgets, annotations, links,
+        widget_visibility_unknown or annotation_visibility_unknown,
+    )
+
+
+class RenderFailurePage:
+    rect = fitz.Rect(0, 0, 200, 300)
+    rotation_matrix = fitz.Identity
+
+    def get_pixmap(self, **kwargs):
+        raise RuntimeError("fixture render failure")
+
+
+class VisibleInteractiveProbe:
+    flags = 0
+    rect = fitz.Rect(20, 20, 80, 40)
+
+
+failed_render_items, failed_render_unknown = rendered_interactives(
+    RenderFailurePage(), [VisibleInteractiveProbe()]
+)
+failed_render_blank = not (failed_render_items or failed_render_unknown)
+check("interactive render failures keep blank-page classification fail closed",
+      not failed_render_items and failed_render_unknown and not failed_render_blank,
+      (failed_render_items, failed_render_unknown, failed_render_blank))
+
+
+widgets, annotations, links, interaction_visibility_unknown = viewable_interactives(
+    widget_page
+)
 blank = (
     not widget_page.get_text().strip()
     and not widget_page.get_images()
     and not widget_page.get_drawings()
-    and not widgets and not annotations and not links
+    and not widgets and not annotations and not links and not interaction_visibility_unknown
 )
 check("widget-only form page exposes a widget", len(widgets) == 1, len(widgets))
 check("widget-aware blank-page predicate keeps form page", not blank)
@@ -312,7 +429,8 @@ for label, flag in (("invisible", 1), ("hidden", 2), ("no-view", 32)):
     hidden_render = fitz.open(hidden_path)
     check(f"{label} widget does not exempt an otherwise blank page",
           widget_count(hidden_page, hidden_render[0]) == 0
-          and not bool((hidden_page.extract_text() or "").strip()))
+          and not bool((hidden_page.extract_text() or "").strip())
+          and not any(viewable_interactives(hidden_render[0])[:3]))
 
 appearance_writer = pypdf.PdfWriter()
 appearance_writer.append(widget_postcheck)
@@ -358,7 +476,49 @@ for label, rectangle in (
     geometry_page = pypdf.PdfReader(geometry_path).pages[0]
     geometry_render = fitz.open(geometry_path)
     check(f"{label} widget does not exempt an otherwise blank page",
-          widget_count(geometry_page, geometry_render[0]) == 0)
+          widget_count(geometry_page, geometry_render[0]) == 0
+          and not any(viewable_interactives(geometry_render[0])[:3]))
+
+interaction_doc = fitz.open()
+interaction_page = interaction_doc.new_page(width=200, height=300)
+hidden_annotation = interaction_page.add_text_annot((40, 40), "hidden note")
+hidden_annotation.set_flags(fitz.PDF_ANNOT_IS_HIDDEN)
+hidden_annotation.update()
+interaction_page.insert_link({
+    "kind": fitz.LINK_URI,
+    "from": fitz.Rect(500, 500, 600, 520),
+    "uri": "https://example.invalid",
+})
+interaction_doc.save("non-viewable-interactives.pdf")
+interaction_doc.close()
+interaction_reopened = fitz.open("non-viewable-interactives.pdf")
+filtered_widgets, filtered_annotations, filtered_links, filtered_unknown = (
+    viewable_interactives(interaction_reopened[0])
+)
+check("hidden annotations and off-page links do not exempt a blank page",
+      not filtered_widgets and not filtered_annotations and not filtered_links
+      and not filtered_unknown,
+      (filtered_widgets, filtered_annotations, filtered_links, filtered_unknown))
+
+visible_interaction_doc = fitz.open()
+visible_interaction_page = visible_interaction_doc.new_page(width=200, height=300)
+visible_annotation = visible_interaction_page.add_text_annot((40, 40), "visible note")
+visible_annotation.update()
+visible_interaction_page.insert_link({
+    "kind": fitz.LINK_URI,
+    "from": fitz.Rect(40, 80, 140, 100),
+    "uri": "https://example.invalid",
+})
+visible_interaction_doc.save("visible-interactives.pdf")
+visible_interaction_doc.close()
+visible_interaction_reopened = fitz.open("visible-interactives.pdf")
+visible_widgets, visible_annotations, visible_links, visible_unknown = (
+    viewable_interactives(visible_interaction_reopened[0])
+)
+check("visible annotations and usable links keep an interactive page nonblank",
+      not visible_widgets and len(visible_annotations) == 1 and len(visible_links) == 1
+      and not visible_unknown,
+      (visible_widgets, visible_annotations, visible_links, visible_unknown))
 
 reversed_writer = pypdf.PdfWriter()
 reversed_writer.append(widget_postcheck)
@@ -1078,6 +1238,11 @@ overflow_bad.setFont("Helvetica", 16)
 overflow_bad.drawString(72, -200, "drawn far below the page box")
 overflow_bad.showPage()
 overflow_bad.save()
+overflow_very_far = canvas.Canvas("overflow-very-far.pdf", pagesize=A4)
+overflow_very_far.setFont("Helvetica", 16)
+overflow_very_far.drawString(72, -5000, "drawn beyond the old finite search window")
+overflow_very_far.showPage()
+overflow_very_far.save()
 
 rotated_source = canvas.Canvas("overflow-rotated-source.pdf", pagesize=A4)
 rotated_source.setFont("Helvetica", 16)
@@ -1144,16 +1309,12 @@ def overflow_pages(path, password=None):
             raise RuntimeError(f"password could not decrypt {path} for overflow checking")
     pages = []
     for page in doc:
-        # Plain block extraction drops fully off-page text; enlarge the clip.
+        # Plain block extraction drops fully off-page text; disable clipping.
         crop_left, crop_bottom, crop_right, crop_top = normalized_box(page.cropbox)
         page_box = fitz.Rect(0, 0, crop_right - crop_left, crop_top - crop_bottom)
-        clip = fitz.Rect(
-            page_box.x0 - 2000, page_box.y0 - 2000,
-            page_box.x1 + 2000, page_box.y1 + 2000,
-        )
         text_rects = [
             fitz.Rect(block[:4])
-            for block in page.get_text("blocks", clip=clip)
+            for block in page.get_text("blocks", clip=fitz.INFINITE_RECT())
             if block[6] == 0
         ]
         image_rects = [
@@ -1175,6 +1336,16 @@ check("reversed page boxes remain valid through the overflow postcheck",
       overflow_pages("widget-reversed-page-boxes.pdf") == [])
 check("off-page text is detected by the overflow check (negative control)",
       overflow_pages("overflow-bad.pdf") == [1])
+very_far_probe = fitz.open("overflow-very-far.pdf")[0]
+old_finite_clip = fitz.Rect(
+    very_far_probe.rect.x0 - 2000, very_far_probe.rect.y0 - 2000,
+    very_far_probe.rect.x1 + 2000, very_far_probe.rect.y1 + 2000,
+)
+check("the old finite clip misses text positioned more than 2,000 points away (negative control)",
+      not [block for block in very_far_probe.get_text("blocks", clip=old_finite_clip)
+           if block[6] == 0])
+check("the unbounded overflow check detects very distant positioned text",
+      overflow_pages("overflow-very-far.pdf") == [1])
 check("in-bounds image and vector drawing pass the overflow check",
       overflow_pages("overflow-graphics-ok.pdf") == [])
 check("out-of-bounds image placement is detected",

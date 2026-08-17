@@ -181,7 +181,8 @@ MAX_XML_PART = 20 * 1024 * 1024
 MAX_ENTRY = 100 * 1024 * 1024
 MAX_TOTAL_UNCOMPRESSED = 500 * 1024 * 1024
 MAX_COMPRESSION_RATIO = 200
-safe_xml_parser = etree.XMLParser(
+CONTENT_TYPES_NS = "http://schemas.openxmlformats.org/package/2006/content-types"
+SAFE_XML = etree.XMLParser(
     load_dtd=False,
     resolve_entities=False,
     no_network=True,
@@ -195,47 +196,116 @@ def require(condition, message):
         raise ValueError(message)
 
 
-def validate_pptx_package(path):
-    require(
-        Path(path).stat().st_size <= MAX_ARCHIVE_BYTES,
-        "compressed PPTX file size above limit",
-    )
-    with zipfile.ZipFile(path) as archive:
+def validate_pptx_package(source):
+    source.seek(0, 2)
+    compressed_size = source.tell()
+    source.seek(0)
+    require(compressed_size <= MAX_ARCHIVE_BYTES,
+            "compressed PPTX file size above limit")
+    with zipfile.ZipFile(source) as archive:
         infos = archive.infolist()
         require(len(infos) <= MAX_MEMBERS, "archive member count above limit")
         names = {info.filename for info in infos}
         require(len(names) == len(infos), "duplicate archive member names are unsafe")
         require("[Content_Types].xml" in names and "ppt/presentation.xml" in names,
-                "required PPTX package parts are missing")
+                "missing required OPC members")
         require(sum(info.file_size for info in infos) <= MAX_TOTAL_UNCOMPRESSED,
-                "declared archive size exceeds the review limit")
+                "declared total uncompressed size above limit")
+
+        content_types_info = next(
+            info for info in infos if info.filename == "[Content_Types].xml"
+        )
+        require(content_types_info.file_size <= MAX_XML_PART,
+                "oversized XML part: [Content_Types].xml")
+        require(
+            content_types_info.file_size / max(content_types_info.compress_size, 1)
+            <= MAX_COMPRESSION_RATIO,
+            "suspicious compression ratio: [Content_Types].xml",
+        )
+        content_type_chunks = []
+        content_type_size = 0
+        with archive.open(content_types_info) as stream:
+            while chunk := stream.read(64 * 1024):
+                content_type_size += len(chunk)
+                require(content_type_size <= MAX_XML_PART,
+                        "part exceeded read limit: [Content_Types].xml")
+                content_type_chunks.append(chunk)
+        require(content_type_size == content_types_info.file_size,
+                "size mismatch: [Content_Types].xml")
+        content_types_blob = b"".join(content_type_chunks)
+        content_types_root = etree.fromstring(content_types_blob, parser=SAFE_XML)
+        require(content_types_root.tag == f"{{{CONTENT_TYPES_NS}}}Types",
+                "invalid content-types root")
+        default_types = {}
+        override_types = {}
+        for declaration in content_types_root:
+            if declaration.tag == f"{{{CONTENT_TYPES_NS}}}Default":
+                key = (declaration.get("Extension") or "").casefold()
+                target = default_types
+            elif declaration.tag == f"{{{CONTENT_TYPES_NS}}}Override":
+                part_name = declaration.get("PartName") or ""
+                require(part_name.startswith("/"), "invalid content-type part name")
+                key = part_name[1:].casefold()
+                target = override_types
+            else:
+                continue
+            content_type = declaration.get("ContentType") or ""
+            require(key and content_type and key not in target,
+                    "invalid or duplicate content-type declaration")
+            target[key] = content_type.partition(";")[0].strip().casefold()
+
         actual_total = 0
         for info in infos:
             require(info.file_size <= MAX_ENTRY, f"oversized part: {info.filename}")
-            require(info.file_size / max(info.compress_size, 1) <= MAX_COMPRESSION_RATIO,
+            ratio = info.file_size / max(info.compress_size, 1)
+            require(ratio <= MAX_COMPRESSION_RATIO,
                     f"suspicious compression ratio: {info.filename}")
-            is_xml = info.filename.endswith((".xml", ".rels"))
+            extension = info.filename.rpartition(".")[2].casefold()
+            content_type = override_types.get(
+                info.filename.casefold(), default_types.get(extension, "")
+            )
+            is_xml = (
+                info.filename.casefold().endswith((".xml", ".rels"))
+                or content_type in {"application/xml", "text/xml"}
+                or content_type.endswith("+xml")
+            )
             if is_xml:
                 require(info.file_size <= MAX_XML_PART, f"oversized XML part: {info.filename}")
             chunks = []
             actual_size = 0
-            with archive.open(info) as stream:
-                while chunk := stream.read(64 * 1024):
-                    actual_size += len(chunk)
-                    actual_total += len(chunk)
-                    require(actual_size <= MAX_ENTRY,
-                            f"part exceeded read limit: {info.filename}")
-                    require(actual_total <= MAX_TOTAL_UNCOMPRESSED,
-                            "archive exceeded total read limit")
-                    if is_xml:
-                        chunks.append(chunk)
+            if info.filename == "[Content_Types].xml":
+                chunks = [content_types_blob]
+                actual_size = len(content_types_blob)
+                actual_total += actual_size
+            else:
+                with archive.open(info) as stream:
+                    while chunk := stream.read(64 * 1024):
+                        actual_size += len(chunk)
+                        actual_total += len(chunk)
+                        require(actual_size <= MAX_ENTRY,
+                                f"part exceeded read limit: {info.filename}")
+                        require(actual_total <= MAX_TOTAL_UNCOMPRESSED,
+                                "archive exceeded total read limit")
+                        if is_xml:
+                            chunks.append(chunk)
+            require(actual_total <= MAX_TOTAL_UNCOMPRESSED,
+                    "archive exceeded total read limit")
             require(actual_size == info.file_size, f"size mismatch: {info.filename}")
             if is_xml:
-                etree.fromstring(b"".join(chunks), parser=safe_xml_parser)
+                etree.fromstring(b"".join(chunks), parser=SAFE_XML)
+    source.seek(0)
+
+
+def open_validated_presentation(path):
+    with Path(path).open("rb") as source:
+        validate_pptx_package(source)
+        source.seek(0)
+        return Presentation(source)
 
 
 try:
-    validate_pptx_package("input.pptx")
+    with Path("input.pptx").open("rb") as source:
+        validate_pptx_package(source)
     healthy_pptx_passed = True
 except Exception:
     healthy_pptx_passed = False
@@ -245,7 +315,8 @@ Path("oversized-before-open.pptx").write_bytes(b"not a ZIP package")
 original_archive_limit = MAX_ARCHIVE_BYTES
 MAX_ARCHIVE_BYTES = 0
 try:
-    validate_pptx_package("oversized-before-open.pptx")
+    with Path("oversized-before-open.pptx").open("rb") as source:
+        validate_pptx_package(source)
     compressed_size_rejected_before_open = False
 except ValueError as exc:
     compressed_size_rejected_before_open = (
@@ -262,7 +333,8 @@ with zipfile.ZipFile("too-many-members.pptx", "w", zipfile.ZIP_STORED) as archiv
     for member_index in range(MAX_MEMBERS + 1):
         archive.writestr(f"zero-{member_index:05d}.bin", b"")
 try:
-    validate_pptx_package("too-many-members.pptx")
+    with Path("too-many-members.pptx").open("rb") as source:
+        validate_pptx_package(source)
     many_members_rejected = False
 except ValueError as exc:
     many_members_rejected = str(exc) == "archive member count above limit"
@@ -271,18 +343,232 @@ check(
     many_members_rejected,
 )
 
+with zipfile.ZipFile("input.pptx") as source_archive:
+    compressed_bomb_payload = {
+        info.filename: source_archive.read(info) for info in source_archive.infolist()
+    }
+compressed_bomb_member = next(
+    name for name in compressed_bomb_payload
+    if not name.casefold().endswith((".xml", ".rels"))
+)
+compressed_bomb_payload[compressed_bomb_member] = b"x" * 2_000_000
 with zipfile.ZipFile("compressed-bomb.pptx", "w", zipfile.ZIP_DEFLATED) as archive:
-    archive.writestr("[Content_Types].xml", "<Types/>")
-    archive.writestr(
-        "ppt/presentation.xml",
-        '<p:presentation xmlns:p="urn:test">' + (" " * 2_000_000) + "</p:presentation>",
-    )
+    for member_name, member_data in compressed_bomb_payload.items():
+        archive.writestr(member_name, member_data)
 try:
-    validate_pptx_package("compressed-bomb.pptx")
+    with Path("compressed-bomb.pptx").open("rb") as source:
+        validate_pptx_package(source)
     pptx_bomb_rejected = False
+except ValueError as error:
+    pptx_bomb_rejected = (
+        str(error) == f"suspicious compression ratio: {compressed_bomb_member}"
+    )
+check("valid-manifest PPTX compression bomb reaches the ratio gate",
+      pptx_bomb_rejected, compressed_bomb_member)
+
+with zipfile.ZipFile("input.pptx") as source_archive:
+    uppercase_xml_payload = {
+        info.filename: source_archive.read(info) for info in source_archive.infolist()
+    }
+uppercase_slide = uppercase_xml_payload.pop("ppt/slides/slide1.xml")
+uppercase_xml_limit = 64 * 1024
+uppercase_xml_payload["ppt/slides/slide1.XML"] = uppercase_slide.replace(
+    b"</p:sld>", b" " * uppercase_xml_limit + b"</p:sld>", 1,
+)
+uppercase_xml_payload["[Content_Types].xml"] = uppercase_xml_payload[
+    "[Content_Types].xml"
+].replace(b"/ppt/slides/slide1.xml", b"/ppt/slides/slide1.XML")
+uppercase_xml_payload["ppt/_rels/presentation.xml.rels"] = uppercase_xml_payload[
+    "ppt/_rels/presentation.xml.rels"
+].replace(b"slides/slide1.xml", b"slides/slide1.XML")
+with zipfile.ZipFile("uppercase-xml-part.pptx", "w", zipfile.ZIP_STORED) as archive:
+    for member_name, member_data in uppercase_xml_payload.items():
+        archive.writestr(member_name, member_data)
+uppercase_route_parses = len(Presentation("uppercase-xml-part.pptx").slides) == 1
+original_xml_limit = MAX_XML_PART
+MAX_XML_PART = uppercase_xml_limit
+try:
+    with Path("uppercase-xml-part.pptx").open("rb") as source:
+        validate_pptx_package(source)
+    uppercase_oversized_xml_rejected = False
+except ValueError as error:
+    uppercase_oversized_xml_rejected = (
+        str(error) == "oversized XML part: ppt/slides/slide1.XML"
+    )
+finally:
+    MAX_XML_PART = original_xml_limit
+check("uppercase XML part names cannot bypass the XML size and parser gate",
+      uppercase_route_parses and uppercase_oversized_xml_rejected)
+
+with zipfile.ZipFile("input.pptx") as source_archive:
+    typed_xml_payload = {
+        info.filename: source_archive.read(info) for info in source_archive.infolist()
+    }
+typed_slide = typed_xml_payload.pop("ppt/slides/slide1.xml")
+typed_xml_payload["ppt/slides/Slide1.DaT"] = typed_slide.replace(
+    b"</p:sld>", b" " * uppercase_xml_limit + b"</p:sld>", 1,
+)
+typed_xml_payload["[Content_Types].xml"] = typed_xml_payload[
+    "[Content_Types].xml"
+].replace(b"/ppt/slides/slide1.xml", b"/PPT/SLIDES/SLIDE1.DAT")
+typed_xml_payload["ppt/_rels/presentation.xml.rels"] = typed_xml_payload[
+    "ppt/_rels/presentation.xml.rels"
+].replace(b"slides/slide1.xml", b"slides/Slide1.DaT")
+with zipfile.ZipFile("content-typed-xml-part.pptx", "w", zipfile.ZIP_STORED) as archive:
+    for member_name, member_data in typed_xml_payload.items():
+        archive.writestr(member_name, member_data)
+typed_xml_route_parses = len(Presentation("content-typed-xml-part.pptx").slides) == 1
+original_xml_limit = MAX_XML_PART
+MAX_XML_PART = uppercase_xml_limit
+try:
+    with Path("content-typed-xml-part.pptx").open("rb") as source:
+        validate_pptx_package(source)
+    typed_oversized_xml_rejected = False
+except ValueError as error:
+    typed_oversized_xml_rejected = (
+        str(error) == "oversized XML part: ppt/slides/Slide1.DaT"
+    )
+finally:
+    MAX_XML_PART = original_xml_limit
+check("case-insensitive XML content types cannot bypass bounds with an arbitrary extension",
+      typed_xml_route_parses and typed_oversized_xml_rejected)
+
+mixed_case_xml_rejections = []
+for mixed_case_name in ("custom.XmL", "custom.ReLs"):
+    with zipfile.ZipFile("input.pptx") as source_archive:
+        mixed_case_payload = {
+            info.filename: source_archive.read(info) for info in source_archive.infolist()
+        }
+    mixed_case_payload[mixed_case_name] = (
+        b"<root>" + b" " * uppercase_xml_limit + b"</root>"
+    )
+    mixed_case_declaration = (
+        f'<Override PartName="/{mixed_case_name}" '
+        'ContentType="application/octet-stream"/>'
+    ).encode()
+    mixed_case_payload["[Content_Types].xml"] = mixed_case_payload[
+        "[Content_Types].xml"
+    ].replace(b"</Types>", mixed_case_declaration + b"</Types>", 1)
+    mixed_case_path = "mixed-case-" + mixed_case_name.replace(".", "-") + ".pptx"
+    with zipfile.ZipFile(mixed_case_path, "w", zipfile.ZIP_STORED) as archive:
+        for member_name, member_data in mixed_case_payload.items():
+            archive.writestr(member_name, member_data)
+    original_xml_limit = MAX_XML_PART
+    MAX_XML_PART = uppercase_xml_limit
+    try:
+        with Path(mixed_case_path).open("rb") as source:
+            validate_pptx_package(source)
+    except ValueError as error:
+        if str(error) == f"oversized XML part: {mixed_case_name}":
+            mixed_case_xml_rejections.append(mixed_case_name)
+    finally:
+        MAX_XML_PART = original_xml_limit
+check("mixed-case XML and relationship suffixes keep XML bounds",
+      mixed_case_xml_rejections == ["custom.XmL", "custom.ReLs"],
+      mixed_case_xml_rejections)
+
+with zipfile.ZipFile("input.pptx") as source_archive:
+    default_xml_payload = {
+        info.filename: source_archive.read(info) for info in source_archive.infolist()
+    }
+default_xml_payload["custom.payload"] = (
+    b"<root>" + b" " * uppercase_xml_limit + b"</root>"
+)
+default_xml_declaration = (
+    b'<Default Extension="payload" ContentType="application/custom+xml"/>'
+)
+default_xml_payload["[Content_Types].xml"] = default_xml_payload[
+    "[Content_Types].xml"
+].replace(b"</Types>", default_xml_declaration + b"</Types>", 1)
+with zipfile.ZipFile("default-content-type-xml.pptx", "w", zipfile.ZIP_STORED) as archive:
+    for member_name, member_data in default_xml_payload.items():
+        archive.writestr(member_name, member_data)
+original_xml_limit = MAX_XML_PART
+MAX_XML_PART = uppercase_xml_limit
+try:
+    with Path("default-content-type-xml.pptx").open("rb") as source:
+        validate_pptx_package(source)
+    default_typed_xml_rejected = False
+except ValueError as error:
+    default_typed_xml_rejected = str(error) == "oversized XML part: custom.payload"
+finally:
+    MAX_XML_PART = original_xml_limit
+check("default +xml content types apply XML bounds to arbitrary extensions",
+      default_typed_xml_rejected)
+
+duplicate_override_payload = dict(typed_xml_payload)
+duplicate_override = (
+    b'<Override PartName="/ppt/slides/slide1.dat" '
+    b'ContentType="application/octet-stream"/>'
+)
+duplicate_override_payload["[Content_Types].xml"] = duplicate_override_payload[
+    "[Content_Types].xml"
+].replace(b"</Types>", duplicate_override + b"</Types>", 1)
+with zipfile.ZipFile("duplicate-case-override.pptx", "w", zipfile.ZIP_STORED) as archive:
+    for member_name, member_data in duplicate_override_payload.items():
+        archive.writestr(member_name, member_data)
+try:
+    with Path("duplicate-case-override.pptx").open("rb") as source:
+        validate_pptx_package(source)
+    duplicate_case_override_rejected = False
+except ValueError as error:
+    duplicate_case_override_rejected = (
+        str(error) == "invalid or duplicate content-type declaration"
+    )
+check("case-insensitive duplicate content-type overrides fail closed",
+      duplicate_case_override_rejected)
+
+presentation_loader_calls = []
+real_presentation_loader = Presentation
+
+
+def unexpected_presentation_loader(source):
+    presentation_loader_calls.append(source)
+    return real_presentation_loader(source)
+
+
+Presentation = unexpected_presentation_loader
+try:
+    open_validated_presentation("compressed-bomb.pptx")
+    bomb_rejected_before_presentation = False
 except ValueError:
-    pptx_bomb_rejected = True
-check("PPTX compression bomb is rejected before XML expansion", pptx_bomb_rejected)
+    bomb_rejected_before_presentation = not presentation_loader_calls
+finally:
+    Presentation = real_presentation_loader
+check("content inventory rejects a package bomb before Presentation parses it",
+      bomb_rejected_before_presentation, len(presentation_loader_calls))
+
+validated_sources = []
+parsed_sources = []
+parsed_source_open_states = []
+real_package_validator = validate_pptx_package
+real_presentation_loader = Presentation
+
+
+def tracking_package_validator(source):
+    validated_sources.append(source)
+    return real_package_validator(source)
+
+
+def tracking_presentation_loader(source):
+    parsed_sources.append(source)
+    parsed_source_open_states.append(not source.closed)
+    return real_presentation_loader(source)
+
+
+validate_pptx_package = tracking_package_validator
+Presentation = tracking_presentation_loader
+try:
+    same_handle_prs = open_validated_presentation("input.pptx")
+finally:
+    validate_pptx_package = real_package_validator
+    Presentation = real_presentation_loader
+check("validated presentation parses the exact same open handle before closing it",
+      len(same_handle_prs.slides) == 1
+      and len(validated_sources) == len(parsed_sources) == 1
+      and validated_sources[0] is parsed_sources[0]
+      and parsed_source_open_states == [True]
+      and validated_sources[0].closed)
 
 # ---- edit.md snippet: single-shape run replace keeps styling and hyperlink -----
 prs = Presentation("input.pptx")
@@ -360,6 +646,56 @@ def iter_shapes(shapes):
             yield from iter_shapes(shape.shapes)
         else:
             yield shape
+
+
+OOXML_TRUE = {"1", "true"}
+OOXML_FALSE = {"0", "false"}
+
+
+def ooxml_bool(element, attribute, default):
+    value = element.get(attribute)
+    if value is None:
+        return default
+    value = value.strip(" \t\r\n")
+    if value in OOXML_TRUE:
+        return True
+    if value in OOXML_FALSE:
+        return False
+    raise ValueError(f"invalid OOXML boolean {attribute}={value!r}")
+
+
+def shape_is_hidden(shape):
+    properties = shape._element.find(".//" + qn("p:cNvPr"))
+    return properties is not None and ooxml_bool(properties, "hidden", False)
+
+
+def layer_text_content(shapes, source, *, inherited):
+    records = []
+    for shape in shapes:
+        if shape_is_hidden(shape):
+            continue
+        if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
+            records.extend(layer_text_content(shape.shapes, source, inherited=inherited))
+            continue
+        if inherited and shape.is_placeholder:
+            continue
+        if shape.has_text_frame and shape.text_frame.text:
+            records.append({"source": source, "shape": shape.name,
+                            "text": shape.text_frame.text})
+    return records
+
+
+def slide_text_content(slide):
+    records = []
+    if ooxml_bool(slide._element, "showMasterSp", True):
+        layout = slide.slide_layout
+        if ooxml_bool(layout._element, "showMasterSp", True):
+            records.extend(layer_text_content(
+                layout.slide_master.shapes, "master", inherited=True,
+            ))
+        records.extend(layer_text_content(layout.shapes, "layout", inherited=True))
+    records.extend(layer_text_content(slide.shapes, "slide", inherited=False))
+    return records
 
 
 def table_cells(table):
@@ -455,10 +791,11 @@ def cached_text_point_map(container, point_count):
             index = int(point.get("idx"))
         except (TypeError, ValueError):
             return None
-        value = point.find(qn("c:v"))
-        if value is None or not 0 <= index < point_count or index in values:
+        value_nodes = point.findall(qn("c:v"))
+        if (len(value_nodes) != 1 or not 0 <= index < point_count
+                or index in values):
             return None
-        values[index] = value.text or ""
+        values[index] = value_nodes[0].text or ""
     return values
 
 
@@ -608,22 +945,40 @@ def series_content(series, *, include_categories=False, point_budget=None):
     return content
 
 
-def chart_axis_text(axis):
-    title = axis.find(qn("c:title"))
+def title_text(title):
     if title is None:
         return ""
-    rich = title.xpath("./c:tx/c:rich")
-    references = title.xpath("./c:tx/c:strRef")
-    if len(rich) + len(references) != 1:
+    text_nodes = title.findall(qn("c:tx"))
+    if len(text_nodes) != 1:
         return None
-    if rich:
-        return "\n".join(paragraph.text for paragraph in rich[0].findall(qn("a:p")))
-    caches = references[0].findall(qn("c:strCache"))
+    sources = [child for child in text_nodes[0] if isinstance(child.tag, str)]
+    if len(sources) != 1:
+        return None
+    if sources[0].tag == qn("c:rich"):
+        paragraphs = sources[0].findall(qn("a:p"))
+        return None if not paragraphs else "\n".join(
+            paragraph.text for paragraph in paragraphs
+        )
+    if sources[0].tag != qn("c:strRef"):
+        return None
+    formulas = sources[0].findall(qn("c:f"))
+    if len(formulas) != 1 or not formulas[0].text:
+        return None
+    caches = sources[0].findall(qn("c:strCache"))
     if (len(caches) != 1 or (count := cache_point_count(caches[0])) is None
             or count != 1):
         return None
     values = cached_text_point_map(caches[0], count)
-    return None if values is None else "\n".join(values.get(index, "") for index in range(count))
+    return None if values is None or set(values) != {0} else values[0]
+
+
+def chart_axis_text(axis):
+    return title_text(axis.find(qn("c:title")))
+
+
+def chart_title_text(chart):
+    titles = chart._element.xpath("./c:chart/c:title")
+    return title_text(titles[0]) if len(titles) == 1 else ("" if not titles else None)
 
 
 def chart_axes(chart):
@@ -677,7 +1032,7 @@ def extract_slide_content(slide, point_budget=None):
     shapes = list(iter_shapes(slide.shapes))
     if point_budget is None:
         point_budget = {"remaining": MAX_CHART_POINTS}
-    text = [sh.text_frame.text for sh in shapes if sh.has_text_frame and sh.text_frame.text]
+    text = slide_text_content(slide)
     tables = [
         table_cells(sh.table)
         for sh in shapes if sh.has_table
@@ -687,10 +1042,7 @@ def extract_slide_content(slide, point_budget=None):
         if not sh.has_chart:
             continue
         chart = sh.chart
-        chart_title = (
-            chart.chart_title.text_frame.text
-            if chart.has_title else ""
-        )
+        chart_title = chart_title_text(chart)
         plots = []
         for plot in chart.plots:
             items = list(plot.series)
@@ -723,8 +1075,9 @@ def extract_slide_content(slide, point_budget=None):
             "pictures": pictures, "smartart": smartart, "notes": notes}
 
 
-content = extract_slide_content(Presentation("input.pptx").slides[0])
-check("content inventory emits body text", any("old wording" in value for value in content["text"]), content)
+content = extract_slide_content(open_validated_presentation("input.pptx").slides[0])
+check("content inventory emits body text",
+      any("old wording" in value["text"] for value in content["text"]), content)
 check("content inventory emits table cell text",
       content["tables"][0][0][1]["text"] == "old cell text", content["tables"])
 check(
@@ -742,6 +1095,296 @@ check("content inventory emits raw category and value axis metadata",
       == {"Region", "Units sold"}
       and all(axis["id"] and axis["position"] and axis["cross_axis_id"]
               for axis in content["charts"][0]["axes"]), content["charts"][0])
+
+chart_title_prs = Presentation("input.pptx")
+chart_title_chart = next(
+    shape.chart for shape in chart_title_prs.slides[0].shapes if shape.has_chart
+)
+chart_title_element = chart_title_chart._element.xpath("./c:chart/c:title")[0]
+chart_title_tx = chart_title_element.find(qn("c:tx"))
+for child in list(chart_title_tx):
+    chart_title_tx.remove(child)
+chart_title_ref = OxmlElement("c:strRef")
+chart_title_formula = OxmlElement("c:f")
+chart_title_formula.text = "Sheet1!$G$1"
+chart_title_cache = OxmlElement("c:strCache")
+chart_title_count = OxmlElement("c:ptCount")
+chart_title_count.set("val", "1")
+chart_title_point = OxmlElement("c:pt")
+chart_title_point.set("idx", "0")
+chart_title_value = OxmlElement("c:v")
+chart_title_value.text = "Cached chart title"
+chart_title_point.append(chart_title_value)
+chart_title_cache.extend([chart_title_count, chart_title_point])
+chart_title_ref.extend([chart_title_formula, chart_title_cache])
+chart_title_tx.append(chart_title_ref)
+chart_title_prs.save("chart-title-strref.pptx")
+
+chart_title_reopened = Presentation("chart-title-strref.pptx")
+raw_title_chart = next(
+    shape.chart for shape in chart_title_reopened.slides[0].shapes if shape.has_chart
+)
+raw_title_element = raw_title_chart._element.xpath("./c:chart/c:title")[0]
+title_xml_before = etree.tostring(raw_title_element)
+cached_chart_title = chart_title_text(raw_title_chart)
+title_xml_after = etree.tostring(raw_title_element)
+check("raw chart title reads a worksheet cache without mutating strRef",
+      cached_chart_title == "Cached chart title"
+      and title_xml_before == title_xml_after
+      and raw_title_element.xpath("./c:tx/c:strRef/c:f")[0].text == "Sheet1!$G$1"
+      and not raw_title_element.xpath("./c:tx/c:rich"),
+      cached_chart_title)
+inventory_title_xml_before = etree.tostring(raw_title_element)
+cached_title_inventory = extract_slide_content(chart_title_reopened.slides[0])
+inventory_title_xml_after = etree.tostring(raw_title_element)
+check("full content inventory keeps a worksheet-backed chart title and its XML intact",
+      cached_title_inventory["charts"][0]["title"] == "Cached chart title"
+      and inventory_title_xml_before == inventory_title_xml_after
+      and raw_title_element.xpath("./c:tx/c:strRef/c:f")[0].text == "Sheet1!$G$1"
+      and not raw_title_element.xpath("./c:tx/c:rich"),
+      cached_title_inventory["charts"][0])
+
+cacheless_chart_title = copy.deepcopy(raw_title_element)
+cacheless_chart_title.xpath("./c:tx/c:strRef")[0].remove(
+    cacheless_chart_title.xpath("./c:tx/c:strRef/c:strCache")[0]
+)
+empty_chart_title = copy.deepcopy(raw_title_element)
+empty_chart_title.xpath("./c:tx/c:strRef/c:strCache/c:pt/c:v")[0].text = None
+ambiguous_chart_title = copy.deepcopy(raw_title_element)
+ambiguous_chart_title.find(qn("c:tx")).append(OxmlElement("c:v"))
+literal_only_chart_title = copy.deepcopy(raw_title_element)
+literal_only_tx = literal_only_chart_title.find(qn("c:tx"))
+literal_only_tx.remove(literal_only_tx.find(qn("c:strRef")))
+literal_only_value = OxmlElement("c:v")
+literal_only_value.text = "invalid literal title"
+literal_only_tx.append(literal_only_value)
+foreign_namespace_title = copy.deepcopy(raw_title_element)
+foreign_namespace_tx = foreign_namespace_title.find(qn("c:tx"))
+foreign_namespace_ref = foreign_namespace_tx.find(qn("c:strRef"))
+foreign_namespace_ref.tag = "{urn:foreign-chart-title}strRef"
+empty_rich_title = copy.deepcopy(raw_title_element)
+empty_rich_tx = empty_rich_title.find(qn("c:tx"))
+empty_rich_tx.remove(empty_rich_tx.find(qn("c:strRef")))
+empty_rich_tx.append(OxmlElement("c:rich"))
+duplicate_choice_title = copy.deepcopy(raw_title_element)
+duplicate_choice_tx = duplicate_choice_title.find(qn("c:tx"))
+duplicate_choice_tx.append(copy.deepcopy(duplicate_choice_tx.find(qn("c:strRef"))))
+duplicate_cache_title = copy.deepcopy(raw_title_element)
+duplicate_cache_ref = duplicate_cache_title.xpath("./c:tx/c:strRef")[0]
+duplicate_cache_ref.append(copy.deepcopy(duplicate_cache_ref.find(qn("c:strCache"))))
+missing_formula_title = copy.deepcopy(raw_title_element)
+missing_formula_ref = missing_formula_title.xpath("./c:tx/c:strRef")[0]
+missing_formula_ref.remove(missing_formula_ref.find(qn("c:f")))
+duplicate_formula_title = copy.deepcopy(raw_title_element)
+duplicate_formula_ref = duplicate_formula_title.xpath("./c:tx/c:strRef")[0]
+duplicate_formula_ref.append(copy.deepcopy(duplicate_formula_ref.find(qn("c:f"))))
+missing_count_title = copy.deepcopy(raw_title_element)
+missing_count_cache = missing_count_title.xpath("./c:tx/c:strRef/c:strCache")[0]
+missing_count_cache.remove(missing_count_cache.find(qn("c:ptCount")))
+missing_point_title = copy.deepcopy(raw_title_element)
+missing_point_cache = missing_point_title.xpath("./c:tx/c:strRef/c:strCache")[0]
+missing_point_cache.remove(missing_point_cache.find(qn("c:pt")))
+missing_value_title = copy.deepcopy(raw_title_element)
+missing_value_point = missing_value_title.xpath("./c:tx/c:strRef/c:strCache/c:pt")[0]
+missing_value_point.remove(missing_value_point.find(qn("c:v")))
+duplicate_value_title = copy.deepcopy(raw_title_element)
+duplicate_value_point = duplicate_value_title.xpath("./c:tx/c:strRef/c:strCache/c:pt")[0]
+duplicate_value = OxmlElement("c:v")
+duplicate_value.text = "second value"
+duplicate_value_point.append(duplicate_value)
+
+rich_paragraph_title = copy.deepcopy(raw_title_element)
+rich_paragraph_tx = rich_paragraph_title.find(qn("c:tx"))
+rich_paragraph_tx.remove(rich_paragraph_tx.find(qn("c:strRef")))
+rich_title = OxmlElement("c:rich")
+for text_value in ("First paragraph", "Second paragraph"):
+    paragraph = OxmlElement("a:p")
+    run = OxmlElement("a:r")
+    text_node = OxmlElement("a:t")
+    text_node.text = text_value
+    run.append(text_node)
+    paragraph.append(run)
+    rich_title.append(paragraph)
+rich_paragraph_tx.append(rich_title)
+check("chart title cache parser distinguishes unavailable, empty, and ambiguous choices",
+      title_text(cacheless_chart_title) is None
+      and title_text(empty_chart_title) == ""
+      and title_text(ambiguous_chart_title) is None
+      and title_text(literal_only_chart_title) is None
+      and title_text(foreign_namespace_title) is None
+      and title_text(empty_rich_title) is None
+      and title_text(duplicate_choice_title) is None
+      and title_text(duplicate_cache_title) is None
+      and title_text(missing_formula_title) is None
+      and title_text(duplicate_formula_title) is None
+      and title_text(missing_count_title) is None
+      and title_text(missing_point_title) is None
+      and title_text(missing_value_title) is None
+      and title_text(duplicate_value_title) is None
+      and title_text(rich_paragraph_title) == "First paragraph\nSecond paragraph")
+
+
+def install_inherited_text(target_shapes, scratch_slide, text, *, grouped=False, hidden=False):
+    if grouped:
+        source_shape = scratch_slide.shapes.add_group_shape()
+        group_texts = (text,) if isinstance(text, str) else tuple(text)
+        for index, text_value in enumerate(group_texts):
+            child = source_shape.shapes.add_textbox(
+                Inches(1), Inches(1 + index), Inches(5), Inches(0.5)
+            )
+            child.text = text_value
+    else:
+        source_shape = scratch_slide.shapes.add_textbox(
+            Inches(1), Inches(1), Inches(5), Inches(0.5)
+        )
+        source_shape.text = text
+    copied = copy.deepcopy(source_shape._element)
+    next_shape_id = target_shapes._next_shape_id
+    for non_visual_properties in copied.iter(qn("p:cNvPr")):
+        non_visual_properties.set("id", str(next_shape_id))
+        next_shape_id += 1
+    if hidden:
+        copied.find(".//" + qn("p:cNvPr")).set("hidden", "1")
+    target_shapes._spTree.insert_element_before(copied, "p:extLst")
+    scratch_slide.shapes._spTree.remove(source_shape._element)
+
+
+inheritance_prs = Presentation()
+inheritance_layout = inheritance_prs.slide_layouts[5]
+inheritance_slide = inheritance_prs.slides.add_slide(inheritance_layout)
+inheritance_slide.shapes.title.text = "Actual slide title"
+inheritance_layout_title = next(
+    shape for shape in inheritance_layout.placeholders
+    if shape.placeholder_format.type in (PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.CENTER_TITLE)
+)
+inheritance_layout_title.text = "TEMPLATE PLACEHOLDER PROMPT"
+inheritance_master_placeholder = next(iter(inheritance_layout.slide_master.placeholders))
+inheritance_master_placeholder.text = "MASTER TEMPLATE PLACEHOLDER PROMPT"
+install_inherited_text(
+    inheritance_layout.slide_master.shapes, inheritance_slide, "Master disclaimer"
+)
+install_inherited_text(inheritance_layout.shapes, inheritance_slide, "Layout disclaimer")
+install_inherited_text(
+    inheritance_layout.shapes, inheritance_slide,
+    ("Grouped layout first", "Grouped layout second"), grouped=True,
+)
+install_inherited_text(
+    inheritance_layout.slide_master.shapes, inheritance_slide,
+    "Hidden master copy", hidden=True,
+)
+install_inherited_text(
+    inheritance_layout.shapes, inheritance_slide,
+    "Hidden grouped layout copy", grouped=True, hidden=True,
+)
+install_inherited_text(
+    inheritance_layout.shapes, inheritance_slide, "Whitespace-hidden layout copy"
+)
+whitespace_hidden_shape = next(
+    shape for shape in inheritance_layout.shapes
+    if shape.has_text_frame and shape.text_frame.text == "Whitespace-hidden layout copy"
+)
+whitespace_hidden_shape._element.find(".//" + qn("p:cNvPr")).set(
+    "hidden", " \ttrue\r\n"
+)
+hidden_slide_shape = inheritance_slide.shapes.add_textbox(
+    Inches(1), Inches(6), Inches(5), Inches(0.5)
+)
+hidden_slide_shape.text = "Hidden slide copy"
+hidden_slide_shape._element.find(".//" + qn("p:cNvPr")).set("hidden", "1")
+inheritance_prs.save("inherited-text.pptx")
+
+inherited_slide = open_validated_presentation("inherited-text.pptx").slides[0]
+inherited_text = extract_slide_content(inherited_slide)["text"]
+inherited_pairs = [(item["source"], item["text"]) for item in inherited_text]
+inherited_master_ids = [
+    node.get("id") for node in inherited_slide.slide_layout.slide_master._element.xpath(
+        ".//p:cNvPr"
+    )
+]
+inherited_layout_ids = [
+    node.get("id") for node in inherited_slide.slide_layout._element.xpath(".//p:cNvPr")
+]
+check("inherited-text fixture keeps unique non-visual shape ids per part",
+      len(inherited_master_ids) == len(set(inherited_master_ids))
+      and len(inherited_layout_ids) == len(set(inherited_layout_ids)),
+      (inherited_master_ids, inherited_layout_ids))
+check("content inventory includes visible master and layout text with provenance",
+      inherited_pairs == [
+          ("master", "Master disclaimer"),
+          ("layout", "Layout disclaimer"),
+          ("layout", "Grouped layout first"),
+          ("layout", "Grouped layout second"),
+          ("slide", "Actual slide title"),
+      ],
+      inherited_pairs)
+
+slide_hidden_prs = Presentation("inherited-text.pptx")
+slide_hidden_prs.slides[0]._element.set("showMasterSp", "0")
+slide_hidden_prs.save("slide-hides-inherited-text.pptx")
+slide_hidden_pairs = [
+    (item["source"], item["text"])
+    for item in extract_slide_content(
+        open_validated_presentation("slide-hides-inherited-text.pptx").slides[0]
+    )["text"]
+]
+check("slide showMasterSp=false hides both layout and master copy",
+      ("slide", "Actual slide title") in slide_hidden_pairs
+      and not any(source in {"layout", "master"} for source, _ in slide_hidden_pairs),
+      slide_hidden_pairs)
+
+layout_hidden_prs = Presentation("inherited-text.pptx")
+layout_hidden_prs.slides[0].slide_layout._element.set("showMasterSp", "false")
+layout_hidden_prs.save("layout-hides-master-text.pptx")
+layout_hidden_pairs = [
+    (item["source"], item["text"])
+    for item in extract_slide_content(
+        open_validated_presentation("layout-hides-master-text.pptx").slides[0]
+    )["text"]
+]
+check("layout showMasterSp=false hides only master copy",
+      ("layout", "Layout disclaimer") in layout_hidden_pairs
+      and ("slide", "Actual slide title") in layout_hidden_pairs
+      and not any(source == "master" for source, _ in layout_hidden_pairs),
+      layout_hidden_pairs)
+
+whitespace_false_prs = Presentation("inherited-text.pptx")
+whitespace_false_prs.slides[0]._element.set("showMasterSp", " \t0\r\n")
+whitespace_false_prs.save("whitespace-false-inherited-text.pptx")
+whitespace_false_text = extract_slide_content(
+    open_validated_presentation("whitespace-false-inherited-text.pptx").slides[0]
+)["text"]
+check("xsd whitespace around false hides inherited layers",
+      all(item["source"] == "slide" for item in whitespace_false_text),
+      whitespace_false_text)
+
+whitespace_true_prs = Presentation("inherited-text.pptx")
+whitespace_true_prs.slides[0]._element.set("showMasterSp", "\ttrue\n")
+whitespace_true_prs.save("whitespace-true-inherited-text.pptx")
+whitespace_true_pairs = [
+    (item["source"], item["text"])
+    for item in extract_slide_content(
+        open_validated_presentation("whitespace-true-inherited-text.pptx").slides[0]
+    )["text"]
+]
+check("xsd whitespace around true preserves inherited layers",
+      ("master", "Master disclaimer") in whitespace_true_pairs
+      and ("layout", "Layout disclaimer") in whitespace_true_pairs,
+      whitespace_true_pairs)
+
+invalid_visibility_values = (
+    "maybe", "on", "off", "yes", "no", "TRUE", "False", "true false",
+)
+invalid_visibility_rejections = []
+for invalid_value in invalid_visibility_values:
+    invalid_visibility_slide = Presentation("inherited-text.pptx").slides[0]
+    invalid_visibility_slide._element.set("showMasterSp", invalid_value)
+    try:
+        extract_slide_content(invalid_visibility_slide)
+    except ValueError:
+        invalid_visibility_rejections.append(invalid_value)
+check("non-xsd showMasterSp values fail closed under optimized Python",
+      invalid_visibility_rejections == list(invalid_visibility_values),
+      invalid_visibility_rejections)
 
 secondary_axis_prs = Presentation("input.pptx")
 secondary_axis_chart = next(

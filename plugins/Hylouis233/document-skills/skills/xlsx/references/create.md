@@ -47,7 +47,9 @@ ws.freeze_panes = "A2"
 # Native chart bound to the sheet data
 chart = BarChart()
 chart.type = "col"
-chart.title = "Revenue by product"
+# The source has one bar per sales row (including two separate Widget rows), not
+# a product aggregate, so keep the title explicit about that granularity.
+chart.title = "Revenue by transaction row"
 chart.y_axis.title = "Revenue"
 data = Reference(ws, min_col=5, min_row=1, max_row=last)          # includes header for series name
 cats = Reference(ws, min_col=2, min_row=2, max_row=last)

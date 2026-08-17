@@ -935,6 +935,8 @@ def tc_text(tc):
                 pieces.append("<tab>")
             elif node.tag in (qn("w:br"), qn("w:cr")):
                 pieces.append("<br>")
+            elif node.tag == qn("w:noBreakHyphen"):
+                pieces.append("-")
         paragraphs.append("".join(pieces))
     return " / ".join(paragraphs)
 
@@ -947,6 +949,9 @@ run_with_tab = cell.paragraphs[0].add_run("")
 tab_element = OxmlElement("w:tab")
 run_with_tab._r.append(tab_element)
 run_with_tab.add_text("after tab")
+hyphen_run = cell.paragraphs[0].add_run("non")
+hyphen_run._r.append(OxmlElement("w:noBreakHyphen"))
+hyphen_run.add_text("breaking")
 cells_doc.save("cell-paragraphs.docx")
 cells_reopened = Document("cell-paragraphs.docx")
 cells_tc = cells_reopened.tables[0].rows[0]._tr.tc_lst[0]
@@ -956,6 +961,8 @@ check("raw w:t joining concatenates paragraphs (negative control)",
       "Firstafter tab" in joined_raw, joined_raw)
 check("tc_text preserves the paragraph boundary", " / Second" in extracted, extracted)
 check("tc_text keeps tabs visible", "<tab>after tab" in extracted, extracted)
+check("tc_text preserves a table-cell nonbreaking hyphen",
+      "non-breaking" in extracted, extracted)
 
 
 # ---- edit.md raw OOXML repack: every input gets a fresh extraction tree ---------

@@ -86,6 +86,8 @@ def tc_text(tc, parent):
                 pieces.append("<tab>")
             elif node.tag in (qn("w:br"), qn("w:cr")):
                 pieces.append("<br>")
+            elif node.tag == qn("w:noBreakHyphen"):
+                pieces.append("-")
             elif node.tag == qn("w:sym"):
                 pieces.append(legacy_symbol_record(node))
         paragraphs.append("".join(pieces))

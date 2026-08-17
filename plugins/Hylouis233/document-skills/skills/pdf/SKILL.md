@@ -194,13 +194,9 @@ for page in overflow_doc:
     # extent so valid high-y portrait content is not flagged on a rotated page.
     crop_left, crop_bottom, crop_right, crop_top = normalized_box(page.cropbox)
     page_box = fitz.Rect(0, 0, crop_right - crop_left, crop_top - crop_bottom)
-    clip = fitz.Rect(
-        page_box.x0 - 2000, page_box.y0 - 2000,
-        page_box.x1 + 2000, page_box.y1 + 2000,
-    )
     text_rects = [
         fitz.Rect(block[:4])
-        for block in page.get_text("blocks", clip=clip)
+        for block in page.get_text("blocks", clip=fitz.INFINITE_RECT())
         if block[6] == 0
     ]
     image_rects = [
