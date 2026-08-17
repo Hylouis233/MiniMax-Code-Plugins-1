@@ -7,6 +7,7 @@
 #   python docx_fixture.py  (deps: python-docx, pymupdf, soffice on PATH)
 import math
 import os
+import re
 import sys
 
 import fitz
@@ -14,7 +15,7 @@ import pypdf
 import reportlab
 from pypdf.generic import (
     ArrayObject, DecodedStreamObject, DictionaryObject, FloatObject,
-    NameObject, NumberObject,
+    NameObject, NullObject, NumberObject,
 )
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfbase import pdfmetrics
@@ -129,86 +130,202 @@ font_canvas.setFont("FixtureVera", 12)
 font_canvas.drawString(72, 750, "Embedded Vera")
 font_canvas.save()
 
+DIRECT_CHARPROC_NAME = re.compile(
+    r"/(?:#[0-9A-Fa-f]{2}|[^#\s()<>\[\]{}/%])+"
+)
+DIRECT_CHARPROC_REFERENCE = re.compile(r"\s+([1-9]\d*)\s+\d+\s+R")
+
+
+def indirect_xref(value):
+    match = re.fullmatch(r"\s*([1-9]\d*)\s+\d+\s+R\s*", value or "")
+    return int(match.group(1)) if match else None
+
+
+def direct_charproc_xrefs(value):
+    value = (value or "").strip()
+    if not value.startswith("<<") or not value.endswith(">>"):
+        return "uninspectable", []
+    body = value[2:-2]
+    position = 0
+    references = []
+    while position < len(body):
+        while position < len(body) and body[position].isspace():
+            position += 1
+        if position == len(body):
+            break
+        name_match = DIRECT_CHARPROC_NAME.match(body, position)
+        if name_match is None:
+            return "uninspectable", []
+        reference_match = DIRECT_CHARPROC_REFERENCE.match(body, name_match.end())
+        if reference_match is None:
+            return "malformed", []
+        references.append(int(reference_match.group(1)))
+        position = reference_match.end()
+    return ("parsed", references) if references else ("malformed", [])
+
+
+def type3_charprocs_status(document, xref, font_type):
+    if font_type.replace(" ", "").casefold() != "type3":
+        return None
+    if xref <= 0:
+        return "uninspectable"
+    try:
+        charprocs_type, charprocs_value = document.xref_get_key(xref, "CharProcs")
+    except (RuntimeError, ValueError):
+        return "uninspectable"
+    if charprocs_type == "dict":
+        parse_status, glyph_xrefs = direct_charproc_xrefs(charprocs_value)
+        if parse_status != "parsed":
+            return parse_status
+    elif charprocs_type == "xref":
+        dictionary_xref = indirect_xref(charprocs_value)
+        if dictionary_xref is None:
+            return "malformed"
+        try:
+            dictionary_source = document.xref_object(dictionary_xref, compressed=True)
+            glyph_names = document.xref_get_keys(dictionary_xref)
+        except (RuntimeError, ValueError):
+            return "uninspectable"
+        if not dictionary_source.lstrip().startswith("<<") or not glyph_names:
+            return "malformed"
+        glyph_xrefs = []
+        for glyph_name in glyph_names:
+            try:
+                glyph_type, glyph_value = document.xref_get_key(dictionary_xref, glyph_name)
+            except (RuntimeError, ValueError):
+                return "uninspectable"
+            glyph_xref = indirect_xref(glyph_value) if glyph_type == "xref" else None
+            if glyph_xref is None:
+                return "malformed"
+            glyph_xrefs.append(glyph_xref)
+    else:
+        return "malformed"
+    for glyph_xref in glyph_xrefs:
+        try:
+            if not document.xref_is_stream(glyph_xref):
+                return "malformed"
+        except (RuntimeError, ValueError):
+            return "uninspectable"
+    return "verified"
+
+
 def font_inventory(document, page):
     fonts = []
     for entry in page.get_fonts(full=True):
         xref, extension, font_type, base_name, resource_name, encoding = entry[:6]
         is_type3 = font_type.replace(" ", "").casefold() == "type3"
-        type3_self_contained = False
-        if is_type3 and xref > 0:
-            try:
-                charprocs_type, _ = document.xref_get_key(xref, "CharProcs")
-                type3_self_contained = charprocs_type in {"dict", "xref"}
-            except (RuntimeError, ValueError):
-                type3_self_contained = False
+        charprocs_status = type3_charprocs_status(document, xref, font_type)
         embedded_bytes = 0
         if xref > 0:
             try:
                 embedded_bytes = len((document.extract_font(xref)[3] or b""))
             except (RuntimeError, ValueError):
                 embedded_bytes = 0
+        if is_type3:
+            embedded = (
+                True if charprocs_status == "verified" else
+                (False if charprocs_status == "malformed" else None)
+            )
+            self_contained = embedded
+            program_source = "type3-charprocs"
+        else:
+            embedded = embedded_bytes > 0
+            self_contained = None
+            program_source = "font-file" if embedded_bytes else None
         fonts.append({
             "base_name": base_name, "type": font_type,
-            "embedded": type3_self_contained or embedded_bytes > 0,
+            "embedded": embedded,
             "embedded_bytes": embedded_bytes,
-            "self_contained": type3_self_contained,
-            "program_source": (
-                "type3-charprocs" if type3_self_contained else
-                ("font-file" if embedded_bytes else None)
-            ),
+            "self_contained": self_contained,
+            "charprocs_status": charprocs_status,
+            "program_source": program_source,
         })
     return fonts
 
 font_doc = fitz.open("font-inventory.pdf")
 fonts = font_inventory(font_doc, font_doc[0])
 check("font inventory labels the embedded TrueType face",
-      any("Vera" in item["base_name"] and item["embedded"] for item in fonts), fonts)
+      any("Vera" in item["base_name"] and item["embedded"] is True for item in fonts), fonts)
 check("font inventory labels referenced-only Helvetica as non-embedded",
-      any("Helvetica" in item["base_name"] and not item["embedded"] for item in fonts), fonts)
+      any("Helvetica" in item["base_name"] and item["embedded"] is False for item in fonts), fonts)
 
 # A Type3 font stores each glyph as PDF content in /CharProcs rather than as an
 # extractable conventional font file.
-type3_writer = pypdf.PdfWriter()
-type3_page = type3_writer.add_blank_page(width=612, height=792)
-type3_glyph = DecodedStreamObject()
-type3_glyph.set_data(b"500 0 0 0 500 700 d1 0 0 500 700 re f")
-type3_glyph_ref = type3_writer._add_object(type3_glyph)
-type3_charprocs_ref = type3_writer._add_object(DictionaryObject({
-    NameObject("/A"): type3_glyph_ref,
-}))
-type3_encoding = DictionaryObject({
-    NameObject("/Type"): NameObject("/Encoding"),
-    NameObject("/Differences"): ArrayObject([
-        NumberObject(65), NameObject("/A"),
-    ]),
-})
-type3_font = DictionaryObject({
-    NameObject("/Type"): NameObject("/Font"),
-    NameObject("/Subtype"): NameObject("/Type3"),
-    NameObject("/Name"): NameObject("/FType3"),
-    NameObject("/FontBBox"): ArrayObject([
-        NumberObject(0), NumberObject(0), NumberObject(500), NumberObject(700),
-    ]),
-    NameObject("/FontMatrix"): ArrayObject([
-        FloatObject(0.001), NumberObject(0), NumberObject(0),
-        FloatObject(0.001), NumberObject(0), NumberObject(0),
-    ]),
-    NameObject("/CharProcs"): type3_charprocs_ref,
-    NameObject("/Encoding"): type3_encoding,
-    NameObject("/FirstChar"): NumberObject(65),
-    NameObject("/LastChar"): NumberObject(65),
-    NameObject("/Widths"): ArrayObject([NumberObject(500)]),
-    NameObject("/Resources"): DictionaryObject(),
-})
-type3_font_ref = type3_writer._add_object(type3_font)
-type3_page[NameObject("/Resources")] = DictionaryObject({
-    NameObject("/Font"): DictionaryObject({NameObject("/FType3"): type3_font_ref}),
-})
-type3_content = DecodedStreamObject()
-type3_content.set_data(b"BT /FType3 72 Tf 72 700 Td (A) Tj ET")
-type3_page[NameObject("/Contents")] = type3_writer._add_object(type3_content)
-with open("type3-font.pdf", "wb") as output:
-    type3_writer.write(output)
+
+
+def write_type3_pdf(path, *, charprocs_kind="indirect-dict", direct_font=False):
+    writer = pypdf.PdfWriter()
+    page = writer.add_blank_page(width=612, height=792)
+    glyph = DecodedStreamObject()
+    glyph.set_data(b"500 0 0 0 500 700 d1 0 0 500 700 re f")
+    glyph_ref = writer._add_object(glyph)
+    valid_charprocs = DictionaryObject({NameObject("/A"): glyph_ref})
+    if charprocs_kind == "indirect-dict":
+        charprocs = writer._add_object(valid_charprocs)
+    elif charprocs_kind == "direct-dict":
+        charprocs = valid_charprocs
+    elif charprocs_kind == "direct-escaped-name":
+        charprocs = DictionaryObject({NameObject("/A#20B"): glyph_ref})
+    elif charprocs_kind == "empty-direct":
+        charprocs = DictionaryObject()
+    elif charprocs_kind == "direct-number-entry":
+        charprocs = DictionaryObject({NameObject("/A"): NumberObject(42)})
+    elif charprocs_kind == "indirect-array":
+        charprocs = writer._add_object(ArrayObject([glyph_ref]))
+    elif charprocs_kind == "indirect-number":
+        charprocs = writer._add_object(NumberObject(42))
+    elif charprocs_kind == "indirect-null":
+        charprocs = writer._add_object(NullObject())
+    elif charprocs_kind == "indirect-bad-glyph":
+        bad_glyph_ref = writer._add_object(NumberObject(42))
+        charprocs = writer._add_object(DictionaryObject({
+            NameObject("/A"): bad_glyph_ref,
+        }))
+    else:
+        raise ValueError(f"unsupported CharProcs fixture kind {charprocs_kind}")
+    encoding = DictionaryObject({
+        NameObject("/Type"): NameObject("/Encoding"),
+        NameObject("/Differences"): ArrayObject([
+            NumberObject(65), NameObject("/A"),
+        ]),
+    })
+    font = DictionaryObject({
+        NameObject("/Type"): NameObject("/Font"),
+        NameObject("/Subtype"): NameObject("/Type3"),
+        NameObject("/Name"): NameObject("/FType3"),
+        NameObject("/FontBBox"): ArrayObject([
+            NumberObject(0), NumberObject(0), NumberObject(500), NumberObject(700),
+        ]),
+        NameObject("/FontMatrix"): ArrayObject([
+            FloatObject(0.001), NumberObject(0), NumberObject(0),
+            FloatObject(0.001), NumberObject(0), NumberObject(0),
+        ]),
+        NameObject("/CharProcs"): charprocs,
+        NameObject("/Encoding"): encoding,
+        NameObject("/FirstChar"): NumberObject(65),
+        NameObject("/LastChar"): NumberObject(65),
+        NameObject("/Widths"): ArrayObject([NumberObject(500)]),
+        NameObject("/Resources"): DictionaryObject(),
+    })
+    font_object = font if direct_font else writer._add_object(font)
+    page[NameObject("/Resources")] = DictionaryObject({
+        NameObject("/Font"): DictionaryObject({NameObject("/FType3"): font_object}),
+    })
+    content = DecodedStreamObject()
+    content.set_data(b"BT /FType3 72 Tf 72 700 Td (A) Tj ET")
+    page[NameObject("/Contents")] = writer._add_object(content)
+    with open(path, "wb") as output:
+        writer.write(output)
+
+
+def type3_fixture_record(path):
+    document = fitz.open(path)
+    record = next(item for item in font_inventory(document, document[0])
+                  if item["type"].replace(" ", "").casefold() == "type3")
+    return document, record
+
+
+write_type3_pdf("type3-font.pdf")
 type3_doc = fitz.open("type3-font.pdf")
 type3_entry = next(item for item in type3_doc[0].get_fonts(full=True)
                    if item[2].replace(" ", "").casefold() == "type3")
@@ -224,8 +341,59 @@ check("Type3 glyph program renders and extracts its encoded character",
 check("font inventory classifies Type3 CharProcs as self-contained content",
       type3_record["embedded"] and type3_record["self_contained"]
       and type3_record["embedded_bytes"] == 0
+      and type3_record["charprocs_status"] == "verified"
       and type3_record["program_source"] == "type3-charprocs",
       type3_record)
+
+write_type3_pdf("type3-direct-charprocs.pdf", charprocs_kind="direct-dict")
+direct_charprocs_doc, direct_charprocs_record = type3_fixture_record(
+    "type3-direct-charprocs.pdf"
+)
+check("direct nonempty Type3 CharProcs with stream glyphs verifies",
+      direct_charprocs_record["charprocs_status"] == "verified"
+      and direct_charprocs_record["embedded"] is True
+      and direct_charprocs_doc[0].get_text().strip() == "A",
+      direct_charprocs_record)
+
+write_type3_pdf(
+    "type3-escaped-charproc-name.pdf", charprocs_kind="direct-escaped-name",
+)
+_, escaped_charproc_record = type3_fixture_record("type3-escaped-charproc-name.pdf")
+check("escaped PDF names in direct Type3 CharProcs remain verifiable",
+      escaped_charproc_record["charprocs_status"] == "verified"
+      and escaped_charproc_record["embedded"] is True,
+      escaped_charproc_record)
+
+write_type3_pdf(
+    "type3-direct-font.pdf", charprocs_kind="direct-dict", direct_font=True,
+)
+direct_font_doc, direct_font_record = type3_fixture_record("type3-direct-font.pdf")
+direct_font_xref = next(
+    entry[0] for entry in direct_font_doc[0].get_fonts(full=True)
+    if entry[2].replace(" ", "").casefold() == "type3"
+)
+check("direct Type3 font dictionary is uninspectable rather than falsely non-embedded",
+      direct_font_xref == 0
+      and direct_font_doc[0].get_text().strip() == "A"
+      and direct_font_record["charprocs_status"] == "uninspectable"
+      and direct_font_record["embedded"] is None
+      and direct_font_record["self_contained"] is None,
+      (direct_font_xref, direct_font_record))
+
+malformed_type3_records = {}
+for malformed_kind in (
+    "empty-direct", "direct-number-entry", "indirect-array",
+    "indirect-number", "indirect-null", "indirect-bad-glyph",
+):
+    malformed_path = f"type3-{malformed_kind}.pdf"
+    write_type3_pdf(malformed_path, charprocs_kind=malformed_kind)
+    _, malformed_type3_records[malformed_kind] = type3_fixture_record(malformed_path)
+check("empty, wrong-type, and non-stream Type3 CharProcs fail closed as malformed",
+      all(record["charprocs_status"] == "malformed"
+          and record["embedded"] is False
+          and record["self_contained"] is False
+          for record in malformed_type3_records.values()),
+      malformed_type3_records)
 
 # ---- SKILL.md postcheck: encrypted output is reopened with its password -------
 encrypted_writer = pypdf.PdfWriter()
@@ -331,6 +499,52 @@ def visible_clip(page, rectangle, *, already_rotated=False):
     rotated = rectangle if already_rotated else rectangle * page.rotation_matrix
     clip = rotated & page.rect
     return None if clip.is_empty else clip
+
+
+MAX_IMAGE_PLACEMENTS = 1_000
+MAX_IMAGE_SOURCE_PIXELS = 25_000_000
+MAX_TOTAL_IMAGE_SOURCE_PIXELS = 50_000_000
+MAX_IMAGE_RENDER_PIXELS = 4_000_000
+MAX_TOTAL_IMAGE_RENDER_PIXELS = 20_000_000
+
+
+def viewable_images(page):
+    try:
+        placements = page.get_image_info()
+    except (RuntimeError, ValueError):
+        return [], [], True
+    if len(placements) > MAX_IMAGE_PLACEMENTS:
+        return placements, [], True
+    visible = []
+    total_source_pixels = 0
+    total_render_pixels = 0
+    for placement in placements:
+        clip = visible_clip(page, placement.get("bbox"))
+        if clip is None:
+            continue
+        width, height = placement.get("width"), placement.get("height")
+        if (not isinstance(width, int) or isinstance(width, bool) or width <= 0
+                or not isinstance(height, int) or isinstance(height, bool) or height <= 0):
+            return placements, visible, True
+        source_pixels = width * height
+        total_source_pixels += source_pixels
+        if (source_pixels > MAX_IMAGE_SOURCE_PIXELS
+                or total_source_pixels > MAX_TOTAL_IMAGE_SOURCE_PIXELS):
+            return placements, visible, True
+        render_pixels = math.ceil(clip.width) * math.ceil(clip.height)
+        total_render_pixels += render_pixels
+        if (render_pixels > MAX_IMAGE_RENDER_PIXELS
+                or total_render_pixels > MAX_TOTAL_IMAGE_RENDER_PIXELS):
+            return placements, visible, True
+        try:
+            pixmap = page.get_pixmap(clip=clip, alpha=True, annots=False)
+        except (RuntimeError, ValueError):
+            return placements, visible, True
+        if not pixmap.alpha:
+            return placements, visible, True
+        if any(pixmap.samples[pixmap.n - 1::pixmap.n]):
+            visible.append(placement)
+    return placements, visible, False
 
 
 def rendered_interactives(page, items):
@@ -933,14 +1147,12 @@ form_only_annotations = list(form_only_page.annots() or ())
 
 
 def inspected_page_is_blank(page):
-    visible_images = [
-        info for info in page.get_image_info()
-        if visible_clip(page, info.get("bbox")) is not None
-    ]
+    _, visible_images, image_visibility_unknown = viewable_images(page)
     return not (
         page.get_text().strip() or visible_images
         or page.get_drawings() or list(page.widgets() or ())
         or list(page.annots() or ()) or page.get_links()
+        or image_visibility_unknown
     )
 
 
@@ -1002,6 +1214,95 @@ xobject_canvas = canvas.Canvas("xobject-image.pdf", pagesize=A4)
 xobject_canvas.drawImage("inline-only-source.png", 72, 700, width=80, height=80)
 xobject_canvas.showPage()
 xobject_canvas.save()
+
+def write_fully_clipped_image(path, *, inline):
+    clipped_canvas = canvas.Canvas(path, pagesize=(200, 200))
+    clip_path = clipped_canvas.beginPath()
+    clip_path.rect(0, 0, 10, 10)
+    clipped_canvas.saveState()
+    clipped_canvas.clipPath(clip_path, stroke=0, fill=0)
+    draw = clipped_canvas.drawInlineImage if inline else clipped_canvas.drawImage
+    draw("inline-only-source.png", 60, 60, width=80, height=80)
+    clipped_canvas.restoreState()
+    clipped_canvas.showPage()
+    clipped_canvas.save()
+
+
+clipped_image_results = {}
+for clipped_kind, clipped_inline in (("xobject", False), ("inline", True)):
+    clipped_path = f"fully-clipped-{clipped_kind}.pdf"
+    write_fully_clipped_image(clipped_path, inline=clipped_inline)
+    clipped_doc = fitz.open(clipped_path)
+    clipped_page = clipped_doc[0]
+    placements, visible, visibility_unknown = viewable_images(clipped_page)
+    clipped_alpha = clipped_page.get_pixmap(alpha=True, annots=False)
+    clipped_image_results[clipped_kind] = {
+        "placements": len(placements), "visible": len(visible),
+        "unknown": visibility_unknown,
+        "painted_alpha": any(clipped_alpha.samples[clipped_alpha.n - 1::clipped_alpha.n]),
+        "blank": inspected_page_is_blank(clipped_page),
+    }
+check("fully clipped XObject and inline placements remain diagnostic candidates",
+      all(result["placements"] == 1 for result in clipped_image_results.values()),
+      clipped_image_results)
+check("alpha render excludes fully clipped XObject and inline images from blank evidence",
+      all(result == {
+          "placements": 1, "visible": 0, "unknown": False,
+          "painted_alpha": False, "blank": True,
+      } for result in clipped_image_results.values()), clipped_image_results)
+
+rotated_image_writer = pypdf.PdfWriter()
+rotated_image_writer.append(pypdf.PdfReader("xobject-image.pdf"))
+rotated_image_writer.pages[0].rotate(90)
+with open("rotated-visible-image.pdf", "wb") as output:
+    rotated_image_writer.write(output)
+rotated_image_doc = fitz.open("rotated-visible-image.pdf")
+rotated_placements, rotated_visible, rotated_unknown = viewable_images(rotated_image_doc[0])
+check("visible image remains visible after page rotation",
+      len(rotated_placements) == len(rotated_visible) == 1
+      and not rotated_unknown and not inspected_page_is_blank(rotated_image_doc[0]),
+      (rotated_placements, rotated_visible, rotated_unknown))
+
+xobject_visibility_doc = fitz.open("xobject-image.pdf")
+budget_results = {}
+for budget_name in (
+    "MAX_IMAGE_PLACEMENTS", "MAX_IMAGE_SOURCE_PIXELS",
+    "MAX_TOTAL_IMAGE_SOURCE_PIXELS", "MAX_IMAGE_RENDER_PIXELS",
+    "MAX_TOTAL_IMAGE_RENDER_PIXELS",
+):
+    original_budget = globals()[budget_name]
+    globals()[budget_name] = 0
+    try:
+        budget_placements, budget_visible, budget_unknown = viewable_images(
+            xobject_visibility_doc[0]
+        )
+        budget_page_is_blank = inspected_page_is_blank(xobject_visibility_doc[0])
+    finally:
+        globals()[budget_name] = original_budget
+    budget_results[budget_name] = (
+        len(budget_placements), len(budget_visible),
+        budget_unknown, budget_page_is_blank,
+    )
+check("every image count/source/render budget fails closed as visibility unknown",
+      all(result == (1, 0, True, False) for result in budget_results.values()),
+      budget_results)
+
+class FailingImageRenderPage:
+    rotation_matrix = fitz.Matrix(1, 1)
+    rect = fitz.Rect(0, 0, 200, 200)
+
+    def get_image_info(self):
+        return [{"bbox": (20, 20, 80, 80), "width": 12, "height": 12}]
+
+    def get_pixmap(self, **kwargs):
+        raise RuntimeError("fixture image decoder failure")
+
+
+failed_placements, failed_visible, failed_unknown = viewable_images(
+    FailingImageRenderPage()
+)
+check("image decoder failure is reported as visibility unknown",
+      len(failed_placements) == 1 and not failed_visible and failed_unknown)
 
 # Editing can remove the only Do operation while leaving the image in /Resources.
 # The resource inventory is then nonempty, but no image is painted.

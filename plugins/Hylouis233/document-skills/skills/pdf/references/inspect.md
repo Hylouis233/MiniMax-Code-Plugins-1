@@ -3,6 +3,7 @@
 ```python
 import math
 import os
+import re
 import fitz
 
 doc = fitz.open("input.pdf")
@@ -11,19 +12,90 @@ if doc.needs_pass:
     if doc.authenticate(password) <= 0:
         raise RuntimeError("Encrypted PDF: set a valid PDF_PASSWORD before inspection")
 
+DIRECT_CHARPROC_NAME = re.compile(
+    r"/(?:#[0-9A-Fa-f]{2}|[^#\s()<>\[\]{}/%])+"
+)
+DIRECT_CHARPROC_REFERENCE = re.compile(r"\s+([1-9]\d*)\s+\d+\s+R")
+
+def indirect_xref(value):
+    match = re.fullmatch(r"\s*([1-9]\d*)\s+\d+\s+R\s*", value or "")
+    return int(match.group(1)) if match else None
+
+def direct_charproc_xrefs(value):
+    """Parse only a conservative direct dictionary of name -> indirect-object entries."""
+    value = (value or "").strip()
+    if not value.startswith("<<") or not value.endswith(">>"):
+        return "uninspectable", []
+    body = value[2:-2]
+    position = 0
+    references = []
+    while position < len(body):
+        while position < len(body) and body[position].isspace():
+            position += 1
+        if position == len(body):
+            break
+        name_match = DIRECT_CHARPROC_NAME.match(body, position)
+        if name_match is None:
+            return "uninspectable", []
+        reference_match = DIRECT_CHARPROC_REFERENCE.match(body, name_match.end())
+        if reference_match is None:
+            return "malformed", []
+        references.append(int(reference_match.group(1)))
+        position = reference_match.end()
+    return ("parsed", references) if references else ("malformed", [])
+
+def type3_charprocs_status(document, xref, font_type):
+    """Return verified, malformed, or uninspectable without reading glyph streams."""
+    if font_type.replace(" ", "").casefold() != "type3":
+        return None
+    if xref <= 0:  # A direct font dictionary has no xref for safe nested lookup.
+        return "uninspectable"
+    try:
+        charprocs_type, charprocs_value = document.xref_get_key(xref, "CharProcs")
+    except (RuntimeError, ValueError):
+        return "uninspectable"
+    if charprocs_type == "dict":
+        parse_status, glyph_xrefs = direct_charproc_xrefs(charprocs_value)
+        if parse_status != "parsed":
+            return parse_status
+    elif charprocs_type == "xref":
+        dictionary_xref = indirect_xref(charprocs_value)
+        if dictionary_xref is None:
+            return "malformed"
+        try:
+            dictionary_source = document.xref_object(dictionary_xref, compressed=True)
+            glyph_names = document.xref_get_keys(dictionary_xref)
+        except (RuntimeError, ValueError):
+            return "uninspectable"
+        if not dictionary_source.lstrip().startswith("<<") or not glyph_names:
+            return "malformed"
+        glyph_xrefs = []
+        for glyph_name in glyph_names:
+            try:
+                glyph_type, glyph_value = document.xref_get_key(dictionary_xref, glyph_name)
+            except (RuntimeError, ValueError):
+                return "uninspectable"
+            glyph_xref = indirect_xref(glyph_value) if glyph_type == "xref" else None
+            if glyph_xref is None:
+                return "malformed"
+            glyph_xrefs.append(glyph_xref)
+    else:
+        return "malformed"
+    for glyph_xref in glyph_xrefs:
+        try:
+            if not document.xref_is_stream(glyph_xref):
+                return "malformed"
+        except (RuntimeError, ValueError):
+            return "uninspectable"
+    return "verified"
+
 def font_inventory(document, page):
-    """Distinguish font files, self-contained Type3 glyphs, and referenced-only faces."""
+    """Distinguish font files, verified Type3 glyph streams, and unknown cases."""
     fonts = []
     for entry in page.get_fonts(full=True):
         xref, extension, font_type, base_name, resource_name, encoding = entry[:6]
         is_type3 = font_type.replace(" ", "").casefold() == "type3"
-        type3_self_contained = False
-        if is_type3 and xref > 0:
-            try:
-                charprocs_type, _ = document.xref_get_key(xref, "CharProcs")
-                type3_self_contained = charprocs_type in {"dict", "xref"}
-            except (RuntimeError, ValueError):
-                type3_self_contained = False
+        charprocs_status = type3_charprocs_status(document, xref, font_type)
         embedded_bytes = 0
         if xref > 0:
             try:
@@ -31,6 +103,17 @@ def font_inventory(document, page):
                 embedded_bytes = len(extracted[3] or b"")
             except (RuntimeError, ValueError):
                 embedded_bytes = 0
+        if is_type3:
+            embedded = (
+                True if charprocs_status == "verified" else
+                (False if charprocs_status == "malformed" else None)
+            )
+            self_contained = embedded
+            program_source = "type3-charprocs"
+        else:
+            embedded = embedded_bytes > 0
+            self_contained = None
+            program_source = "font-file" if embedded_bytes else None
         fonts.append({
             "xref": xref,
             "base_name": base_name,
@@ -38,13 +121,11 @@ def font_inventory(document, page):
             "type": font_type,
             "encoding": encoding,
             "extension": extension,
-            "embedded": type3_self_contained or embedded_bytes > 0,
+            "embedded": embedded,
             "embedded_bytes": embedded_bytes,
-            "self_contained": type3_self_contained,
-            "program_source": (
-                "type3-charprocs" if type3_self_contained else
-                ("font-file" if embedded_bytes else None)
-            ),
+            "self_contained": self_contained,
+            "charprocs_status": charprocs_status,
+            "program_source": program_source,
         })
     return fonts
 
@@ -78,6 +159,51 @@ def visible_clip(page, rectangle, *, already_rotated=False):
     rotated = rectangle if already_rotated else rectangle * page.rotation_matrix
     clip = rotated & page.rect
     return None if clip.is_empty else clip
+
+MAX_IMAGE_PLACEMENTS = 1_000
+MAX_IMAGE_SOURCE_PIXELS = 25_000_000
+MAX_TOTAL_IMAGE_SOURCE_PIXELS = 50_000_000
+MAX_IMAGE_RENDER_PIXELS = 4_000_000
+MAX_TOTAL_IMAGE_RENDER_PIXELS = 20_000_000
+
+def viewable_images(page):
+    """Render bounded placement clips; unknown visibility keeps the page nonblank."""
+    try:
+        placements = page.get_image_info()
+    except (RuntimeError, ValueError):
+        return [], [], True
+    if len(placements) > MAX_IMAGE_PLACEMENTS:
+        return placements, [], True
+    visible = []
+    total_source_pixels = 0
+    total_render_pixels = 0
+    for placement in placements:
+        clip = visible_clip(page, placement.get("bbox"))
+        if clip is None:
+            continue
+        width, height = placement.get("width"), placement.get("height")
+        if (not isinstance(width, int) or isinstance(width, bool) or width <= 0
+                or not isinstance(height, int) or isinstance(height, bool) or height <= 0):
+            return placements, visible, True
+        source_pixels = width * height
+        total_source_pixels += source_pixels
+        if (source_pixels > MAX_IMAGE_SOURCE_PIXELS
+                or total_source_pixels > MAX_TOTAL_IMAGE_SOURCE_PIXELS):
+            return placements, visible, True
+        render_pixels = math.ceil(clip.width) * math.ceil(clip.height)
+        total_render_pixels += render_pixels
+        if (render_pixels > MAX_IMAGE_RENDER_PIXELS
+                or total_render_pixels > MAX_TOTAL_IMAGE_RENDER_PIXELS):
+            return placements, visible, True
+        try:
+            pixmap = page.get_pixmap(clip=clip, alpha=True, annots=False)
+        except (RuntimeError, ValueError):
+            return placements, visible, True
+        if not pixmap.alpha:
+            return placements, visible, True
+        if any(pixmap.samples[pixmap.n - 1::pixmap.n]):
+            visible.append(placement)
+    return placements, visible, False
 
 def rendered_interactives(page, items):
     rendered = []
@@ -149,20 +275,21 @@ for page in doc:
         "crop_size": crop_size,
         "rotation": page.rotation,
     })
-    visible_images = [
-        info for info in page.get_image_info()
-        if visible_clip(page, info.get("bbox")) is not None
-    ]
+    image_placements, visible_images, image_visibility_unknown = viewable_images(page)
     drawings = page.get_drawings()
     widgets, annotations, links, interaction_visibility_unknown = viewable_interactives(page)
     is_blank = not (
         page.get_text().strip() or visible_images or drawings
-        or widgets or annotations or links or interaction_visibility_unknown
+        or widgets or annotations or links
+        or image_visibility_unknown or interaction_visibility_unknown
     )
     print(page.number + 1, "media_size:", media_size, "crop_size:", crop_size,
           "rotation:", page.rotation, "text_len:", len(page.get_text()),
           "resource_images:", len(page.get_images()),
-          "visible_image_placements:", len(visible_images), "drawings:", len(drawings),
+          "image_placements:", len(image_placements),
+          "visible_images:", len(visible_images),
+          "image_visibility_unknown:", image_visibility_unknown,
+          "drawings:", len(drawings),
           "widgets:", len(widgets), "annotations:", len(annotations),
           "links:", len(links), "interaction_visibility_unknown:",
           interaction_visibility_unknown, "blank:", is_blank)
@@ -177,16 +304,21 @@ print("crop_size_consistent:", len({row["crop_size"] for row in page_geometry}) 
   and viewable widgets, annotations, and links are all absent. Ignore interactive objects carrying
   invisible, hidden, or no-view flags, as well as empty, off-page, or unrendered appearances.
   `page.get_images()` lists every image XObject resource, including unused resources, and also
-  misses images embedded inline in the content stream. `page.get_image_info()` reports painted
-  inline and XObject placements without loading their bytes; retain only finite, nonempty placements
-  that intersect the rotated page via `visible_clip()`. Interactive form fields are widgets rather
+  misses images embedded inline in the content stream. `page.get_image_info()` reports invoked
+  inline and XObject placements without loading their bytes, but its boxes ignore graphics-state
+  clipping. Treat those boxes as diagnostics only. The bounded `viewable_images()` render checks
+  alpha for each page-intersecting placement; a count, source-pixel, render-pixel, or decoder limit
+  returns `image_visibility_unknown=True`, which must keep the page nonblank. Interactive form
+  fields are widgets rather
   than page text, so a three-content-stream predicate alone would misclassify a usable form
   page as blank. A blank page after generation usually means an overflowing flowable created it.
 - **Font inventory**: `page.get_fonts()` lists referenced fonts, including non-embedded base
   fonts. Use `doc.extract_font(xref)` as above for conventional font files. Type3 fonts are a
-  separate self-contained case: when the font dictionary has a `/CharProcs` dictionary, its glyph
-  programs are PDF content streams, so report `self_contained=True` and
-  `program_source="type3-charprocs"` even when no conventional font-file bytes extract.
+  separate case: report `charprocs_status="verified"` only for a nonempty `/CharProcs` dictionary
+  whose glyph entries point to actual streams. A direct font dictionary has no font xref and is
+  `uninspectable`, not falsely non-embedded. For Type3, `embedded` and `self_contained` are tri-state:
+  `True` for verified, `False` for malformed, and `None` when uninspectable. Its
+  `program_source="type3-charprocs"` remains explicit even when conventional bytes do not extract.
   Other referenced faces with no extractable program may be substituted on another machine.
 - **Page size consistency**: compare unrotated `(width, height)` pairs from `page.mediabox` and
   `page.cropbox`, and report `page.rotation` separately. Do not compare `page.rect`: it applies
@@ -196,6 +328,6 @@ print("crop_size_consistent:", len({row["crop_size"] for row in page_geometry}) 
   `pypdf.PdfReader` cross-check when provenance is unknown.
 
 Report findings as a table (page, media size, crop size, rotation, text chars, resource images,
-visible image placements, drawings, widgets, annotations, links, interaction
-visibility unknown, blank) - it
+image placements, visible images, image visibility unknown, drawings, widgets, annotations,
+links, interaction visibility unknown, blank) - it
 is what every downstream decision hangs off.
