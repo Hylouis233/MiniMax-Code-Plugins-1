@@ -135,14 +135,6 @@ def open_validated_presentation(path):
         source.seek(0)
         return Presentation(source)
 
-def iter_shapes(shapes):
-    """Walk shapes recursively so content nested inside group shapes is counted too."""
-    for shape in shapes:
-        if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
-            yield from iter_shapes(shape.shapes)
-        else:
-            yield shape
-
 OOXML_TRUE = {"1", "true"}
 OOXML_FALSE = {"0", "false"}
 
@@ -160,6 +152,16 @@ def ooxml_bool(element, attribute, default):
 def shape_is_hidden(shape):
     properties = shape._element.find(".//" + qn("p:cNvPr"))
     return properties is not None and ooxml_bool(properties, "hidden", False)
+
+def iter_shapes(shapes):
+    """Yield visible leaf shapes, propagating a hidden group's visibility to its children."""
+    for shape in shapes:
+        if shape_is_hidden(shape):
+            continue
+        if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
+            yield from iter_shapes(shape.shapes)
+        else:
+            yield shape
 
 def layer_text_content(shapes, source, *, inherited):
     """Collect visible text from one layer; inherited placeholders are template prompts."""
@@ -210,16 +212,27 @@ def table_cells(table):
 
 def picture_content(shape):
     """Inventory ordinary pictures and populated picture placeholders alike."""
+    if getattr(type(shape), "image", None) is None:
+        return None
     try:
         image = shape.image
-    except (AttributeError, ValueError):
-        return None
-    return {
-        "name": shape.name,
-        "filename": image.filename,
-        "extension": image.ext,
-        "bytes": len(image.blob),
-    }
+        return {
+            "name": shape.name,
+            "filename": image.filename,
+            "extension": image.ext,
+            "bytes": len(image.blob),
+        }
+    except (AttributeError, KeyError, OSError, ValueError):
+        blips = shape._element.xpath(".//a:blip")
+        relationship_id = (
+            blips[0].get(qn("r:embed")) if len(blips) == 1 else None
+        )
+        return {
+            "name": shape.name,
+            "status": "unreadable",
+            "relationship_id": relationship_id,
+            "reason": "missing or invalid image relationship or payload",
+        }
 
 MAX_CHART_POINTS = 100_000
 MAX_CATEGORY_LEVELS = 16
@@ -254,6 +267,8 @@ def cached_numeric_points(
     caches = source.xpath("./c:numRef/c:numCache | ./c:numLit")
     if len(caches) != 1 or (point_count := cache_point_count(caches[0])) is None:
         return None
+    if not consume_point_budget(point_budget, point_count):
+        return None
     cached = {}
     for point in caches[0].findall(qn("c:pt")):
         value = point.find(qn("c:v"))
@@ -269,8 +284,6 @@ def cached_numeric_points(
             parsed = value.text              # preserve #N/A and other error markers
         cached[index] = parsed
     if fill_missing:
-        if not consume_point_budget(point_budget, point_count):
-            return None
         points = [(index, cached.get(index)) for index in range(point_count)]
     else:
         points = sorted(cached.items())
@@ -412,9 +425,12 @@ def series_content(series, *, include_categories=False, point_budget=None):
         if value_cache is None:
             return {**content, "values": None, "cache_status": "unavailable"}
         return {**content, "values": [value for _, value in value_cache["points"]]}
-    x_cache = cached_numeric_points(x_source, include_count=True)
+    x_cache = cached_numeric_points(
+        x_source, include_count=True, point_budget=point_budget
+    )
     y_cache = cached_numeric_points(
-        getattr(series._element, "yVal", None), include_count=True
+        getattr(series._element, "yVal", None), include_count=True,
+        point_budget=point_budget,
     )
     if x_cache is None or y_cache is None:
         return {**content, "points": None, "cache_status": "unavailable"}
@@ -424,7 +440,9 @@ def series_content(series, *, include_categories=False, point_budget=None):
     })
     size_source = getattr(series._element, "bubbleSize", None)
     if size_source is not None:
-        bubble_cache = cached_numeric_points(size_source, include_count=True)
+        bubble_cache = cached_numeric_points(
+            size_source, include_count=True, point_budget=point_budget
+        )
         if bubble_cache is None:
             return {**content, "points": None, "cache_status": "unavailable"}
         content.update({
@@ -515,9 +533,13 @@ print("slide size:", prs.slide_width, prs.slide_height)
 point_budget = {"remaining": MAX_CHART_POINTS}
 for i, slide in enumerate(prs.slides):
     layout = slide.slide_layout.name
-    title = slide.shapes.title.text_frame.text if slide.shapes.title is not None else ""
+    title_shape = slide.shapes.title
+    title = (
+        title_shape.text_frame.text
+        if title_shape is not None and not shape_is_hidden(title_shape) else ""
+    )
     notes = slide.notes_slide.notes_text_frame.text if slide.has_notes_slide else ""
-    shapes = list(iter_shapes(slide.shapes))   # flattened; groups are common in template decks
+    shapes = list(iter_shapes(slide.shapes))   # flattened and visible; hidden groups hide children
     text = slide_text_content(slide)
     tables = [
         table_cells(sh.table)
@@ -603,17 +625,10 @@ what you can and name the fallback explicitly:
 
 ```python
 import xml.etree.ElementTree as ET
-from pptx.enum.shapes import MSO_SHAPE_TYPE
 from pptx.opc.constants import RELATIONSHIP_TYPE as RT
 from pptx.oxml.ns import qn
 
-def iter_shapes(shapes):
-    """Local recursive walker for the font-triage continuation."""
-    for shape in shapes:
-        if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
-            yield from iter_shapes(shape.shapes)
-        else:
-            yield shape
+# Reuse the visibility-aware iter_shapes() walker from the content inventory above.
 
 # 1. Resolve the theme related to each slide's own layout/master. A package can contain
 # multiple masters with different themes, so the first /ppt/theme/* part is not a safe default.

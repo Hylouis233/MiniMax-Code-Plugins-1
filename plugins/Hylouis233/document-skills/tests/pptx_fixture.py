@@ -570,8 +570,28 @@ check("validated presentation parses the exact same open handle before closing i
       and parsed_source_open_states == [True]
       and validated_sources[0].closed)
 
-# ---- edit.md snippet: single-shape run replace keeps styling and hyperlink -----
-prs = Presentation("input.pptx")
+# ---- edit.md snippet: validated single-shape run replace keeps styling/link ----
+edit_loader_calls = []
+real_presentation_loader = Presentation
+
+
+def unexpected_edit_loader(source):
+    edit_loader_calls.append(source)
+    return real_presentation_loader(source)
+
+
+Presentation = unexpected_edit_loader
+try:
+    open_validated_presentation("compressed-bomb.pptx")
+    edit_bomb_rejected_before_parse = False
+except ValueError:
+    edit_bomb_rejected_before_parse = not edit_loader_calls
+finally:
+    Presentation = real_presentation_loader
+check("edit route rejects a package bomb before Presentation parses it",
+      edit_bomb_rejected_before_parse, edit_loader_calls)
+
+prs = open_validated_presentation("input.pptx")
 old, new = "old wording", "new wording"
 candidates = []
 for i, s in enumerate(prs.slides):
@@ -642,6 +662,8 @@ GRP = (
 
 def iter_shapes(shapes):
     for shape in shapes:
+        if shape_is_hidden(shape):
+            continue
         if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
             yield from iter_shapes(shape.shapes)
         else:
@@ -714,16 +736,27 @@ def table_cells(table):
 
 
 def picture_content(shape):
+    if getattr(type(shape), "image", None) is None:
+        return None
     try:
         image = shape.image
-    except (AttributeError, ValueError):
-        return None
-    return {
-        "name": shape.name,
-        "filename": image.filename,
-        "extension": image.ext,
-        "bytes": len(image.blob),
-    }
+        return {
+            "name": shape.name,
+            "filename": image.filename,
+            "extension": image.ext,
+            "bytes": len(image.blob),
+        }
+    except (AttributeError, KeyError, OSError, ValueError):
+        blips = shape._element.xpath(".//a:blip")
+        relationship_id = (
+            blips[0].get(qn("r:embed")) if len(blips) == 1 else None
+        )
+        return {
+            "name": shape.name,
+            "status": "unreadable",
+            "relationship_id": relationship_id,
+            "reason": "missing or invalid image relationship or payload",
+        }
 
 
 MAX_CHART_POINTS = 100_000
@@ -761,6 +794,8 @@ def cached_numeric_points(
     caches = source.xpath("./c:numRef/c:numCache | ./c:numLit")
     if len(caches) != 1 or (point_count := cache_point_count(caches[0])) is None:
         return None
+    if not consume_point_budget(point_budget, point_count):
+        return None
     cached = {}
     for point in caches[0].findall(qn("c:pt")):
         value = point.find(qn("c:v"))
@@ -776,8 +811,6 @@ def cached_numeric_points(
             parsed = value.text
         cached[index] = parsed
     if fill_missing:
-        if not consume_point_budget(point_budget, point_count):
-            return None
         points = [(index, cached.get(index)) for index in range(point_count)]
     else:
         points = sorted(cached.items())
@@ -923,9 +956,12 @@ def series_content(series, *, include_categories=False, point_budget=None):
         if value_cache is None:
             return {**content, "values": None, "cache_status": "unavailable"}
         return {**content, "values": [value for _, value in value_cache["points"]]}
-    x_cache = cached_numeric_points(x_source, include_count=True)
+    x_cache = cached_numeric_points(
+        x_source, include_count=True, point_budget=point_budget
+    )
     y_cache = cached_numeric_points(
-        getattr(series._element, "yVal", None), include_count=True
+        getattr(series._element, "yVal", None), include_count=True,
+        point_budget=point_budget,
     )
     if x_cache is None or y_cache is None:
         return {**content, "points": None, "cache_status": "unavailable"}
@@ -935,7 +971,9 @@ def series_content(series, *, include_categories=False, point_budget=None):
     })
     size_source = getattr(series._element, "bubbleSize", None)
     if size_source is not None:
-        bubble_cache = cached_numeric_points(size_source, include_count=True)
+        bubble_cache = cached_numeric_points(
+            size_source, include_count=True, point_budget=point_budget
+        )
         if bubble_cache is None:
             return {**content, "points": None, "cache_status": "unavailable"}
         content.update({
@@ -1885,6 +1923,179 @@ check("picture inventory includes populated picture placeholders and image metad
       and placeholder_inventory[0]["bytes"] == len(placeholder_png),
       placeholder_inventory)
 
+# A dangling r:embed must produce an unreadable record and allow later slides to inventory.
+broken_picture_source = Presentation("picture-placeholder.pptx")
+later_picture_slide = broken_picture_source.slides.add_slide(
+    broken_picture_source.slide_layouts[6]
+)
+later_picture_slide.shapes.add_picture(
+    "placeholder-picture.png", Inches(1), Inches(1), Inches(1), Inches(1)
+)
+broken_picture_source.save("broken-picture-source.pptx")
+with zipfile.ZipFile("broken-picture-source.pptx") as source_archive:
+    broken_picture_payload = {
+        info.filename: source_archive.read(info) for info in source_archive.infolist()
+    }
+broken_slide_root = etree.fromstring(broken_picture_payload["ppt/slides/slide1.xml"])
+broken_blips = broken_slide_root.findall(".//" + qn("a:blip"))
+require(len(broken_blips) == 1, "broken-picture fixture expected one slide-1 image")
+broken_relationship_id = broken_blips[0].get(qn("r:embed"))
+relationships_path = "ppt/slides/_rels/slide1.xml.rels"
+relationships_root = etree.fromstring(broken_picture_payload[relationships_path])
+package_relationship_ns = "http://schemas.openxmlformats.org/package/2006/relationships"
+broken_relationships = [
+    relation for relation in relationships_root.findall(
+        f"{{{package_relationship_ns}}}Relationship"
+    )
+    if relation.get("Id") == broken_relationship_id
+]
+require(len(broken_relationships) == 1,
+        "broken-picture fixture expected one matching relationship")
+relationships_root.remove(broken_relationships[0])
+broken_picture_payload[relationships_path] = etree.tostring(
+    relationships_root, xml_declaration=True, encoding="UTF-8", standalone=True,
+)
+with zipfile.ZipFile("broken-picture-relationship.pptx", "w", zipfile.ZIP_DEFLATED) as archive:
+    for member_name, member_data in broken_picture_payload.items():
+        archive.writestr(member_name, member_data)
+broken_picture_deck = open_validated_presentation("broken-picture-relationship.pptx")
+broken_picture_inventory = [
+    extract_slide_content(slide)["pictures"] for slide in broken_picture_deck.slides
+]
+check("broken picture relationship is explicit instead of aborting inventory",
+      broken_picture_inventory[0] == [{
+          "name": reopened_picture.name,
+          "status": "unreadable",
+          "relationship_id": broken_relationship_id,
+          "reason": "missing or invalid image relationship or payload",
+      }], broken_picture_inventory[0])
+check("picture inventory continues to a healthy later slide after a broken relationship",
+      len(broken_picture_inventory[1]) == 1
+      and broken_picture_inventory[1][0]["extension"] == "png",
+      broken_picture_inventory[1])
+
+# Directly hidden leaf shapes and children of a hidden group must be absent from every
+# non-text inventory, while visible siblings after them remain discoverable.
+hidden_inventory_prs = Presentation()
+hidden_inventory_slide = hidden_inventory_prs.slides.add_slide(
+    hidden_inventory_prs.slide_layouts[6]
+)
+
+def set_shape_hidden(shape):
+    properties = shape._element.find(".//" + qn("p:cNvPr"))
+    require(properties is not None, f"shape {shape.name!r} has no cNvPr")
+    properties.set("hidden", "1")
+
+hidden_table_shape = hidden_inventory_slide.shapes.add_table(
+    1, 1, Inches(0.2), Inches(0.2), Inches(1), Inches(0.5)
+)
+hidden_table_shape.table.cell(0, 0).text = "secret table"
+set_shape_hidden(hidden_table_shape)
+
+hidden_chart_data = ChartData()
+hidden_chart_data.categories = ["secret"]
+hidden_chart_data.add_series("secret", (9,))
+hidden_chart_shape = hidden_inventory_slide.shapes.add_chart(
+    XL_CHART_TYPE.COLUMN_CLUSTERED,
+    Inches(1.3), Inches(0.2), Inches(1.5), Inches(1), hidden_chart_data,
+)
+set_shape_hidden(hidden_chart_shape)
+
+hidden_picture_shape = hidden_inventory_slide.shapes.add_picture(
+    "placeholder-picture.png", Inches(3), Inches(0.2), Inches(1), Inches(1)
+)
+set_shape_hidden(hidden_picture_shape)
+
+def smartart_frame(shape_id, name, relationship_id, *, hidden=False):
+    hidden_attribute = ' hidden="1"' if hidden else ""
+    return etree.fromstring(f'''<p:graphicFrame
+        xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+        xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+        xmlns:dgm="{DIAGRAM_NS}"
+        xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+      <p:nvGraphicFramePr>
+        <p:cNvPr id="{shape_id}" name="{name}"{hidden_attribute}/>
+        <p:cNvGraphicFramePr/><p:nvPr/>
+      </p:nvGraphicFramePr>
+      <p:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/></p:xfrm>
+      <a:graphic><a:graphicData uri="{DIAGRAM_NS}">
+        <dgm:relIds r:dm="{relationship_id}"/>
+      </a:graphicData></a:graphic>
+    </p:graphicFrame>'''.encode())
+
+hidden_inventory_slide.shapes._spTree.append(
+    smartart_frame(910, "Hidden SmartArt", "rIdHiddenSmart", hidden=True)
+)
+
+nested_hidden_table = hidden_inventory_slide.shapes.add_table(
+    1, 1, Inches(4.2), Inches(0.2), Inches(1), Inches(0.5)
+)
+nested_hidden_table.table.cell(0, 0).text = "secret grouped table"
+nested_hidden_element = nested_hidden_table._element
+hidden_group_element = parse_xml(GRP)
+hidden_group_element.find(".//" + qn("p:cNvPr")).set("hidden", "1")
+nested_hidden_element.getparent().replace(nested_hidden_element, hidden_group_element)
+hidden_group_element.append(nested_hidden_element)
+
+visible_table_shape = hidden_inventory_slide.shapes.add_table(
+    1, 1, Inches(0.2), Inches(2), Inches(1), Inches(0.5)
+)
+visible_table_shape.table.cell(0, 0).text = "visible table"
+visible_chart_data = ChartData()
+visible_chart_data.categories = ["visible"]
+visible_chart_data.add_series("visible", (1,))
+visible_chart_shape = hidden_inventory_slide.shapes.add_chart(
+    XL_CHART_TYPE.COLUMN_CLUSTERED,
+    Inches(1.3), Inches(2), Inches(1.5), Inches(1), visible_chart_data,
+)
+visible_picture_shape = hidden_inventory_slide.shapes.add_picture(
+    "placeholder-picture.png", Inches(3), Inches(2), Inches(1), Inches(1)
+)
+hidden_inventory_slide.shapes._spTree.append(
+    smartart_frame(911, "Visible SmartArt", "rIdVisibleSmart")
+)
+hidden_inventory_prs.save("hidden-nontext-inventory.pptx")
+hidden_inventory_reopened = open_validated_presentation("hidden-nontext-inventory.pptx")
+hidden_inventory_slide = hidden_inventory_reopened.slides[0]
+hidden_raw_names = [shape.name for shape in hidden_inventory_slide.shapes]
+hidden_visible_names = [shape.name for shape in iter_shapes(hidden_inventory_slide.shapes)]
+hidden_inventory = extract_slide_content(hidden_inventory_slide)
+check("hidden non-text fixture retains direct and group-hidden objects (negative control)",
+      {"Hidden SmartArt", hidden_table_shape.name, hidden_chart_shape.name,
+       hidden_picture_shape.name, "demo group"} <= set(hidden_raw_names),
+      hidden_raw_names)
+check("visibility walker prunes direct hidden leaves and every child of a hidden group",
+      "Hidden SmartArt" not in hidden_visible_names
+      and hidden_table_shape.name not in hidden_visible_names
+      and hidden_chart_shape.name not in hidden_visible_names
+      and hidden_picture_shape.name not in hidden_visible_names
+      and "secret grouped table" not in str(hidden_inventory),
+      (hidden_visible_names, hidden_inventory))
+check("all non-text inventories retain only visible siblings after hidden shapes",
+      len(hidden_inventory["tables"]) == 1
+      and hidden_inventory["tables"][0][0][0]["text"] == "visible table"
+      and len(hidden_inventory["charts"]) == 1
+      and hidden_inventory["charts"][0]["plots"][0]["series"][0]["values"] == [1.0]
+      and len(hidden_inventory["pictures"]) == 1
+      and hidden_inventory["pictures"][0]["extension"] == "png"
+      and hidden_inventory["smartart"] == [{
+          "name": "Visible SmartArt", "status": "unreadable",
+          "reason": "rIdVisibleSmart",
+      }], hidden_inventory)
+
+hidden_title_prs = Presentation()
+hidden_title_slide = hidden_title_prs.slides.add_slide(hidden_title_prs.slide_layouts[5])
+hidden_title_slide.shapes.title.text = "confidential hidden title"
+set_shape_hidden(hidden_title_slide.shapes.title)
+hidden_title_prs.save("hidden-title.pptx")
+hidden_title_slide = open_validated_presentation("hidden-title.pptx").slides[0]
+hidden_title_shape = hidden_title_slide.shapes.title
+guarded_title = (
+    hidden_title_shape.text_frame.text
+    if hidden_title_shape is not None and not shape_is_hidden(hidden_title_shape) else ""
+)
+check("main slide summary does not expose a hidden title", guarded_title == "", guarded_title)
+
 merged_prs = Presentation()
 merged_slide = merged_prs.slides.add_slide(merged_prs.slide_layouts[6])
 merged_table = merged_slide.shapes.add_table(
@@ -1992,6 +2203,11 @@ check("sparse XY cache reports ptCount without densifying trailing blanks",
       cached_numeric_points(sparse_source, include_count=True)
       == {"point_count": 3, "points": [(0, 1.0)]},
       cached_numeric_points(sparse_source, include_count=True))
+sparse_declared_budget = {"remaining": 3}
+check("sparse numeric cache charges declared ptCount before materializing present points",
+      cached_numeric_points(sparse_source, point_budget=sparse_declared_budget)
+      == [(0, 1.0)] and sparse_declared_budget["remaining"] == 0,
+      sparse_declared_budget)
 check("category numeric cache can densify sparse positions as blanks",
       cached_numeric_points(sparse_source, fill_missing=True)
       == [(0, 1.0), (1, None), (2, None)],
@@ -2007,6 +2223,53 @@ huge_count_source.xpath("./c:numRef/c:numCache/c:ptCount")[0].set(
 )
 check("oversized logical numeric counts fail before allocation",
       cached_numeric_points(huge_count_source, fill_missing=True) is None)
+
+# Sparse XY/bubble caches reserve their declared logical counts from one shared deck
+# budget before iterating or materializing the few present <c:pt> nodes.
+budgeted_xy_element = copy.deepcopy(xy_item._element)
+for source_name in ("xVal", "yVal"):
+    numeric_cache = budgeted_xy_element.find(qn(f"c:{source_name}"))
+    numeric_cache = numeric_cache.find(qn("c:numRef") + "/" + qn("c:numCache"))
+    numeric_cache.find(qn("c:ptCount")).set("val", "60000")
+    for point in numeric_cache.findall(qn("c:pt"))[1:]:
+        numeric_cache.remove(point)
+budgeted_xy_series = type("BudgetedXySeries", (), {
+    "_element": budgeted_xy_element,
+})()
+xy_declared_budget = {"remaining": MAX_CHART_POINTS}
+xy_budgeted_content = series_content(
+    budgeted_xy_series, point_budget=xy_declared_budget
+)
+check("scatter X/Y caches charge declared sparse counts from the shared budget",
+      xy_budgeted_content.get("cache_status") == "unavailable"
+      and xy_declared_budget["remaining"] == 40000,
+      (xy_budgeted_content, xy_declared_budget))
+
+bubble_plot = next(
+    plot for shape in Presentation("xy-bubble.pptx").slides[0].shapes
+    if shape.has_chart for plot in shape.chart.plots
+    if type(plot).__name__ == "BubblePlot"
+)
+bubble_item = list(bubble_plot.series)[0]
+budgeted_bubble_element = copy.deepcopy(bubble_item._element)
+for source_name in ("xVal", "yVal", "bubbleSize"):
+    numeric_cache = budgeted_bubble_element.find(qn(f"c:{source_name}"))
+    numeric_cache = numeric_cache.find(qn("c:numRef") + "/" + qn("c:numCache"))
+    numeric_cache.find(qn("c:ptCount")).set("val", "40000")
+    for point in numeric_cache.findall(qn("c:pt"))[1:]:
+        numeric_cache.remove(point)
+budgeted_bubble_series = type("BudgetedBubbleSeries", (), {
+    "_element": budgeted_bubble_element,
+})()
+bubble_declared_budget = {"remaining": MAX_CHART_POINTS}
+bubble_budgeted_content = series_content(
+    budgeted_bubble_series, point_budget=bubble_declared_budget
+)
+check("bubble X/Y/size caches share one declared-count budget",
+      bubble_budgeted_content.get("cache_status") == "unavailable"
+      and bubble_declared_budget["remaining"] == 20000,
+      (bubble_budgeted_content, bubble_declared_budget))
+
 actual_cache = x_source.xpath("./c:numRef/c:numCache")[0]
 x_source.xpath("./c:numRef")[0].remove(actual_cache)
 check("XY series with an unavailable cache is explicit",
@@ -2681,6 +2944,13 @@ check("font triage marks both charts and SmartArt as unresolved regions",
 check("ordinary table graphic frames are not mislabeled as chart or SmartArt",
       all(item["shape"] != triage_table_shape.name for item in unresolved_graphics),
       unresolved_graphics)
+hidden_deck_unresolved_graphics = list(unresolved_graphic_font_regions(
+    iter_shapes(hidden_inventory_slide.shapes)
+))
+check("font-region inventory excludes hidden charts and SmartArt while retaining visible siblings",
+      {item["shape"] for item in hidden_deck_unresolved_graphics}
+      == {visible_chart_shape.name, "Visible SmartArt"},
+      hidden_deck_unresolved_graphics)
 try:
     if unresolved_graphics:
         raise LookupError(f"unresolved chart/SmartArt fonts: {unresolved_graphics}")

@@ -12,6 +12,10 @@ import sys
 import fitz
 import pypdf
 import reportlab
+from pypdf.generic import (
+    ArrayObject, DecodedStreamObject, DictionaryObject, FloatObject,
+    NameObject, NumberObject,
+)
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
@@ -129,6 +133,14 @@ def font_inventory(document, page):
     fonts = []
     for entry in page.get_fonts(full=True):
         xref, extension, font_type, base_name, resource_name, encoding = entry[:6]
+        is_type3 = font_type.replace(" ", "").casefold() == "type3"
+        type3_self_contained = False
+        if is_type3 and xref > 0:
+            try:
+                charprocs_type, _ = document.xref_get_key(xref, "CharProcs")
+                type3_self_contained = charprocs_type in {"dict", "xref"}
+            except (RuntimeError, ValueError):
+                type3_self_contained = False
         embedded_bytes = 0
         if xref > 0:
             try:
@@ -136,8 +148,14 @@ def font_inventory(document, page):
             except (RuntimeError, ValueError):
                 embedded_bytes = 0
         fonts.append({
-            "base_name": base_name, "embedded": embedded_bytes > 0,
+            "base_name": base_name, "type": font_type,
+            "embedded": type3_self_contained or embedded_bytes > 0,
             "embedded_bytes": embedded_bytes,
+            "self_contained": type3_self_contained,
+            "program_source": (
+                "type3-charprocs" if type3_self_contained else
+                ("font-file" if embedded_bytes else None)
+            ),
         })
     return fonts
 
@@ -147,6 +165,67 @@ check("font inventory labels the embedded TrueType face",
       any("Vera" in item["base_name"] and item["embedded"] for item in fonts), fonts)
 check("font inventory labels referenced-only Helvetica as non-embedded",
       any("Helvetica" in item["base_name"] and not item["embedded"] for item in fonts), fonts)
+
+# A Type3 font stores each glyph as PDF content in /CharProcs rather than as an
+# extractable conventional font file.
+type3_writer = pypdf.PdfWriter()
+type3_page = type3_writer.add_blank_page(width=612, height=792)
+type3_glyph = DecodedStreamObject()
+type3_glyph.set_data(b"500 0 0 0 500 700 d1 0 0 500 700 re f")
+type3_glyph_ref = type3_writer._add_object(type3_glyph)
+type3_charprocs_ref = type3_writer._add_object(DictionaryObject({
+    NameObject("/A"): type3_glyph_ref,
+}))
+type3_encoding = DictionaryObject({
+    NameObject("/Type"): NameObject("/Encoding"),
+    NameObject("/Differences"): ArrayObject([
+        NumberObject(65), NameObject("/A"),
+    ]),
+})
+type3_font = DictionaryObject({
+    NameObject("/Type"): NameObject("/Font"),
+    NameObject("/Subtype"): NameObject("/Type3"),
+    NameObject("/Name"): NameObject("/FType3"),
+    NameObject("/FontBBox"): ArrayObject([
+        NumberObject(0), NumberObject(0), NumberObject(500), NumberObject(700),
+    ]),
+    NameObject("/FontMatrix"): ArrayObject([
+        FloatObject(0.001), NumberObject(0), NumberObject(0),
+        FloatObject(0.001), NumberObject(0), NumberObject(0),
+    ]),
+    NameObject("/CharProcs"): type3_charprocs_ref,
+    NameObject("/Encoding"): type3_encoding,
+    NameObject("/FirstChar"): NumberObject(65),
+    NameObject("/LastChar"): NumberObject(65),
+    NameObject("/Widths"): ArrayObject([NumberObject(500)]),
+    NameObject("/Resources"): DictionaryObject(),
+})
+type3_font_ref = type3_writer._add_object(type3_font)
+type3_page[NameObject("/Resources")] = DictionaryObject({
+    NameObject("/Font"): DictionaryObject({NameObject("/FType3"): type3_font_ref}),
+})
+type3_content = DecodedStreamObject()
+type3_content.set_data(b"BT /FType3 72 Tf 72 700 Td (A) Tj ET")
+type3_page[NameObject("/Contents")] = type3_writer._add_object(type3_content)
+with open("type3-font.pdf", "wb") as output:
+    type3_writer.write(output)
+type3_doc = fitz.open("type3-font.pdf")
+type3_entry = next(item for item in type3_doc[0].get_fonts(full=True)
+                   if item[2].replace(" ", "").casefold() == "type3")
+type3_extracted_bytes = type3_doc.extract_font(type3_entry[0])[3] or b""
+type3_fonts = font_inventory(type3_doc, type3_doc[0])
+type3_record = next(item for item in type3_fonts
+                    if item["type"].replace(" ", "").casefold() == "type3")
+check("Type3 negative control has no conventional extractable font-file bytes",
+      type3_extracted_bytes == b"", len(type3_extracted_bytes))
+check("Type3 glyph program renders and extracts its encoded character",
+      type3_doc[0].get_text().strip() == "A"
+      and min(type3_doc[0].get_pixmap(alpha=False).samples) < 250)
+check("font inventory classifies Type3 CharProcs as self-contained content",
+      type3_record["embedded"] and type3_record["self_contained"]
+      and type3_record["embedded_bytes"] == 0
+      and type3_record["program_source"] == "type3-charprocs",
+      type3_record)
 
 # ---- SKILL.md postcheck: encrypted output is reopened with its password -------
 encrypted_writer = pypdf.PdfWriter()
@@ -854,12 +933,12 @@ form_only_annotations = list(form_only_page.annots() or ())
 
 
 def inspected_page_is_blank(page):
-    image_blocks = [
-        block for block in page.get_text("dict")["blocks"]
-        if block["type"] == 1
+    visible_images = [
+        info for info in page.get_image_info()
+        if visible_clip(page, info.get("bbox")) is not None
     ]
     return not (
-        page.get_text().strip() or page.get_images() or image_blocks
+        page.get_text().strip() or visible_images
         or page.get_drawings() or list(page.widgets() or ())
         or list(page.annots() or ()) or page.get_links()
     )
@@ -923,6 +1002,43 @@ xobject_canvas = canvas.Canvas("xobject-image.pdf", pagesize=A4)
 xobject_canvas.drawImage("inline-only-source.png", 72, 700, width=80, height=80)
 xobject_canvas.showPage()
 xobject_canvas.save()
+
+# Editing can remove the only Do operation while leaving the image in /Resources.
+# The resource inventory is then nonempty, but no image is painted.
+unused_image_writer = pypdf.PdfWriter()
+unused_image_writer.append(pypdf.PdfReader("xobject-image.pdf"))
+empty_page_content = DecodedStreamObject()
+empty_page_content.set_data(b"")
+unused_image_writer.pages[0][NameObject("/Contents")] = (
+    unused_image_writer._add_object(empty_page_content)
+)
+with open("unused-image-resource.pdf", "wb") as output:
+    unused_image_writer.write(output)
+unused_image_doc = fitz.open("unused-image-resource.pdf")
+unused_image_page = unused_image_doc[0]
+check("unused image fixture retains an XObject resource (negative control)",
+      bool(unused_image_page.get_images()), unused_image_page.get_images())
+check("unused image resource has no painted placement",
+      unused_image_page.get_image_info(xrefs=True) == [],
+      unused_image_page.get_image_info(xrefs=True))
+check("unused image resource does not exempt an otherwise blank rendered page",
+      inspected_page_is_blank(unused_image_page)
+      and min(unused_image_page.get_pixmap(alpha=False).samples) == 255)
+
+# Placement geometry, rather than mere presence in the content stream, decides visibility.
+placement_canvas = canvas.Canvas("image-placement-visibility.pdf", pagesize=(200, 200))
+placement_canvas.drawImage("inline-only-source.png", -40, 80, width=80, height=80)
+placement_canvas.showPage()
+placement_canvas.drawImage("inline-only-source.png", 250, 80, width=80, height=80)
+placement_canvas.showPage()
+placement_canvas.save()
+placement_doc = fitz.open("image-placement-visibility.pdf")
+check("partly intersecting image placement keeps a page nonblank",
+      not inspected_page_is_blank(placement_doc[0]),
+      placement_doc[0].get_image_info(xrefs=True))
+check("fully off-page image placement does not exempt a blank page",
+      inspected_page_is_blank(placement_doc[1]),
+      placement_doc[1].get_image_info(xrefs=True))
 
 
 def extract_images_without_duplicates(document, page, prefix):

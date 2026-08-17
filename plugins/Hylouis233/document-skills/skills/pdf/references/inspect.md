@@ -12,10 +12,18 @@ if doc.needs_pass:
         raise RuntimeError("Encrypted PDF: set a valid PDF_PASSWORD before inspection")
 
 def font_inventory(document, page):
-    """Distinguish fonts with extractable programs from referenced-only faces."""
+    """Distinguish font files, self-contained Type3 glyphs, and referenced-only faces."""
     fonts = []
     for entry in page.get_fonts(full=True):
         xref, extension, font_type, base_name, resource_name, encoding = entry[:6]
+        is_type3 = font_type.replace(" ", "").casefold() == "type3"
+        type3_self_contained = False
+        if is_type3 and xref > 0:
+            try:
+                charprocs_type, _ = document.xref_get_key(xref, "CharProcs")
+                type3_self_contained = charprocs_type in {"dict", "xref"}
+            except (RuntimeError, ValueError):
+                type3_self_contained = False
         embedded_bytes = 0
         if xref > 0:
             try:
@@ -30,8 +38,13 @@ def font_inventory(document, page):
             "type": font_type,
             "encoding": encoding,
             "extension": extension,
-            "embedded": embedded_bytes > 0,
+            "embedded": type3_self_contained or embedded_bytes > 0,
             "embedded_bytes": embedded_bytes,
+            "self_contained": type3_self_contained,
+            "program_source": (
+                "type3-charprocs" if type3_self_contained else
+                ("font-file" if embedded_bytes else None)
+            ),
         })
     return fonts
 
@@ -136,18 +149,20 @@ for page in doc:
         "crop_size": crop_size,
         "rotation": page.rotation,
     })
-    blocks = page.get_text("dict")["blocks"]
-    image_blocks = [block for block in blocks if block["type"] == 1]
+    visible_images = [
+        info for info in page.get_image_info()
+        if visible_clip(page, info.get("bbox")) is not None
+    ]
     drawings = page.get_drawings()
     widgets, annotations, links, interaction_visibility_unknown = viewable_interactives(page)
     is_blank = not (
-        page.get_text().strip() or page.get_images() or image_blocks or drawings
+        page.get_text().strip() or visible_images or drawings
         or widgets or annotations or links or interaction_visibility_unknown
     )
     print(page.number + 1, "media_size:", media_size, "crop_size:", crop_size,
           "rotation:", page.rotation, "text_len:", len(page.get_text()),
           "resource_images:", len(page.get_images()),
-          "image_blocks:", len(image_blocks), "drawings:", len(drawings),
+          "visible_image_placements:", len(visible_images), "drawings:", len(drawings),
           "widgets:", len(widgets), "annotations:", len(annotations),
           "links:", len(links), "interaction_visibility_unknown:",
           interaction_visibility_unknown, "blank:", is_blank)
@@ -158,17 +173,21 @@ print("crop_size_consistent:", len({row["crop_size"] for row in page_geometry}) 
 
 ## Checks worth automating
 
-- **Blank page detection**: flag only when text, resource images, type-1 image blocks, drawings,
+- **Blank page detection**: flag only when text, visible painted image placements, drawings,
   and viewable widgets, annotations, and links are all absent. Ignore interactive objects carrying
   invisible, hidden, or no-view flags, as well as empty, off-page, or unrendered appearances.
-  `page.get_images()` lists image XObjects but
-  misses images embedded inline in the content stream; type-1 blocks from `get_text("dict")`
-  cover both inline and XObject image placements. Interactive form fields are widgets rather
+  `page.get_images()` lists every image XObject resource, including unused resources, and also
+  misses images embedded inline in the content stream. `page.get_image_info()` reports painted
+  inline and XObject placements without loading their bytes; retain only finite, nonempty placements
+  that intersect the rotated page via `visible_clip()`. Interactive form fields are widgets rather
   than page text, so a three-content-stream predicate alone would misclassify a usable form
   page as blank. A blank page after generation usually means an overflowing flowable created it.
 - **Font inventory**: `page.get_fonts()` lists referenced fonts, including non-embedded base
-  fonts. Use `doc.extract_font(xref)` as above and report `embedded` separately; a referenced
-  face with no extractable program may be substituted on another machine.
+  fonts. Use `doc.extract_font(xref)` as above for conventional font files. Type3 fonts are a
+  separate self-contained case: when the font dictionary has a `/CharProcs` dictionary, its glyph
+  programs are PDF content streams, so report `self_contained=True` and
+  `program_source="type3-charprocs"` even when no conventional font-file bytes extract.
+  Other referenced faces with no extractable program may be substituted on another machine.
 - **Page size consistency**: compare unrotated `(width, height)` pairs from `page.mediabox` and
   `page.cropbox`, and report `page.rotation` separately. Do not compare `page.rect`: it applies
   `/Rotate`, so otherwise identical paper appears to swap width and height at 90 or 270 degrees.
@@ -177,5 +196,6 @@ print("crop_size_consistent:", len({row["crop_size"] for row in page_geometry}) 
   `pypdf.PdfReader` cross-check when provenance is unknown.
 
 Report findings as a table (page, media size, crop size, rotation, text chars, resource images,
-image blocks, drawings, widgets, annotations, links, interaction visibility unknown, blank) - it
+visible image placements, drawings, widgets, annotations, links, interaction
+visibility unknown, blank) - it
 is what every downstream decision hangs off.
