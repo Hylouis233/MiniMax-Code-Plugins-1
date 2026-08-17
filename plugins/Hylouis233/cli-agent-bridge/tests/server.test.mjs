@@ -12,9 +12,10 @@ import { fileURLToPath } from "node:url";
 import {
   localHostIdentity, WORKSPACE_LOCK_REF_PREFIX, workspaceLockRef,
 } from "../workspace-lock.mjs";
-import { resolvePathCommand } from "../git-executable.mjs";
+import { resolvePathCommand, safeGitInvocation } from "../git-executable.mjs";
 import {
-  closestExistingBase, committedDelta, populateCommitishCache, runCommand, runGitCommand,
+  backendGitProvenanceEnvironment, closestExistingBase, committedDelta, markWorkspaceQuarantined,
+  populateCommitishCache, readBackendGitProvenance, runCommand, runGitCommand,
 } from "../server.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -40,6 +41,69 @@ test("failed backend command resolutions are retried after installation", async 
   await copyFile(process.execPath, executable);
   if (process.platform !== "win32") await chmod(executable, 0o755);
   assert.equal(await resolvePathCommand(command), await realpath(executable));
+});
+
+test("safe Git invocations use an unpopulatable hook sink and ignore inherited repositories", async (context) => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), "cli-agent-safe-git-env-test-"));
+  const workspace = path.join(tempRoot, "workspace");
+  const unrelated = path.join(tempRoot, "unrelated.git");
+  await mkdir(workspace);
+  await initializeFixtureRepository(workspace);
+  await execFileAsync("git", ["init", "--bare", unrelated]);
+  context.after(() => rm(tempRoot, { recursive: true, force: true }));
+
+  const invocation = await safeGitInvocation(["rev-parse", "--git-common-dir"], {
+    ...process.env,
+    GIT_COMMON_DIR: unrelated,
+    Git_Dir: unrelated,
+    GIT_NAMESPACE: "foreign-namespace",
+    GIT_CONFIG_COUNT: "1",
+    GIT_CONFIG_KEY_0: "core.hooksPath",
+    GIT_CONFIG_VALUE_0: path.join(tempRoot, "attacker-controlled-hooks"),
+  });
+  assert.ok(invocation.args.includes("core.hooksPath=/dev/null"));
+  assert.deepEqual(
+    Object.keys(invocation.env).filter((name) => /^GIT_/iu.test(name)).sort(),
+    ["GIT_OPTIONAL_LOCKS", "GIT_PAGER"],
+  );
+  const { stdout } = await execFileAsync(invocation.command, invocation.args, {
+    cwd: workspace,
+    env: invocation.env,
+  });
+  assert.equal(
+    await realpath(path.resolve(workspace, stdout.trim())),
+    await realpath(path.join(workspace, ".git")),
+  );
+
+  const tracePath = path.join(tempRoot, "packet.trace");
+  const backendEnv = backendGitProvenanceEnvironment(tracePath, {
+    ...process.env,
+    GIT_COMMON_DIR: unrelated,
+    GIT_DIR: unrelated,
+    GIT_WORK_TREE: tempRoot,
+    GIT_CONFIG_COUNT: "1",
+    GIT_CONFIG_KEY_0: "core.worktree",
+    GIT_CONFIG_VALUE_0: tempRoot,
+    GIT_REFLOG_ACTION: "fetch",
+    GIT_TRACE2_EVENT: path.join(tempRoot, "attacker-trace2"),
+    git_config_count: "1",
+    git_config_key_0: "core.abbrev",
+    git_config_value_0: "12",
+  });
+  assert.equal(backendEnv.GIT_COMMON_DIR, undefined);
+  assert.equal(backendEnv.GIT_DIR, undefined);
+  assert.equal(backendEnv.GIT_WORK_TREE, undefined);
+  assert.equal(backendEnv.GIT_CONFIG_COUNT, undefined);
+  assert.equal(backendEnv.GIT_REFLOG_ACTION, undefined);
+  assert.equal(backendEnv.GIT_TRACE_PACKET, undefined);
+  assert.equal(backendEnv.GIT_TRACE2_EVENT, tracePath);
+  const backendDiscovery = await execFileAsync(invocation.command, ["rev-parse", "--git-common-dir"], {
+    cwd: workspace, env: backendEnv,
+  });
+  assert.equal(
+    await realpath(path.resolve(workspace, backendDiscovery.stdout.trim())),
+    await realpath(path.join(workspace, ".git")),
+  );
 });
 
 function unconfirmedGitResult(overrides = {}) {
@@ -1006,6 +1070,23 @@ test("porcelain status preserves the unstaged first-column space", async (contex
   assert.match(response.result.structuredContent.git.statusShort, /^ M baseline\.txt$/u);
 });
 
+test("a staged-only diff stat keeps its staged source label", async (context) => {
+  const { workspace, client } = await makeHarness(context);
+  await writeFile(path.join(workspace, "staged-only.txt"), "staged\n");
+  await execFileAsync("git", ["add", "staged-only.txt"], { cwd: workspace });
+  const { stdout: unstaged } = await execFileAsync("git", ["diff", "--stat"], { cwd: workspace });
+  assert.equal(unstaged, "", "the fixture must contain no unstaged diff");
+
+  const response = await client.request("tools/call", {
+    name: "workspace_status", arguments: { workspacePath: workspace },
+  });
+  const out = response.result.structuredContent;
+  assert.equal(out.ok, true, JSON.stringify(out));
+  assert.match(out.git.diffStat, /staged-only\.txt/u);
+  assert.ok(out.git.diffStat.split(/\r?\n/u).every((line) => line.startsWith("staged: ")),
+    out.git.diffStat);
+});
+
 test("the private lock store inherits the repository sharing mode", async (context) => {
   const { workspace, client } = await makeHarness(context);
   await execFileAsync("git", ["config", "core.sharedRepository", "group"], { cwd: workspace });
@@ -1544,7 +1625,7 @@ test("unconfirmed termination after lease loss quarantines delegation and status
     await client.initialize();
     const canonicalRoot = await canonicalGitCommonDirectory(workspace);
     ({ quarantinePath } = await repositoryStatePaths(canonicalRoot));
-    context.after(() => rm(quarantinePath, { force: true }));
+    context.after(() => rm(quarantinePath, { recursive: true, force: true }));
     const key = await repositoryKey(canonicalRoot);
     ref = workspaceLockRef(key);
     lockStore = await coordinationLockStore(workspace);
@@ -1593,7 +1674,7 @@ test("unconfirmed termination after lease loss quarantines delegation and status
 
     await execFileAsync(realTaskkill, ["/PID", String(workerPid), "/T", "/F"]);
     workerPid = null;
-    await rm(quarantinePath, { force: true });
+    await rm(quarantinePath, { recursive: true, force: true });
     await execFileAsync("git", ["update-ref", "-d", ref, replacementOid], { cwd: lockStore });
     replacementOid = null;
     const recovered = await client.request("tools/call", taskArguments(workspace, {
@@ -1624,7 +1705,7 @@ test("a quarantine marker blocks delegations in every server process", async (co
       await canonicalGitCommonDirectory(workspace),
     );
     await mkdir(root, { recursive: true });
-    context.after(() => rm(quarantinePath, { force: true }));
+    context.after(() => rm(quarantinePath, { recursive: true, force: true }));
     await writeFile(quarantinePath, JSON.stringify({ terminationError: "fixture" }));
     const response = await secondClient.request("tools/call", taskArguments(workspace, {
       name: "must-not-run", writeFile: "quarantine-bypass.txt",
@@ -1636,6 +1717,24 @@ test("a quarantine marker blocks delegations in every server process", async (co
   } finally {
     await secondClient.close();
   }
+});
+
+test("quarantine publication uses an exclusive directory claim without hard links", async (context) => {
+  const key = "quarantine-directory-publication:" + String(process.pid) + ":" + String(Date.now());
+  const quarantine = await markWorkspaceQuarantined(key, {
+    backend: "fixture", terminationError: "descendants remain uncertain",
+  });
+  context.after(() => rm(quarantine.quarantinePath, { recursive: true, force: true }));
+  assert.equal((await stat(quarantine.quarantinePath)).isDirectory(), true);
+  const record = JSON.parse(await readFile(
+    path.join(quarantine.quarantinePath, "record.json"), "utf8",
+  ));
+  assert.equal(record.quarantineId, quarantine.quarantineId);
+  assert.equal(record.terminationError, "descendants remain uncertain");
+  await assert.rejects(
+    markWorkspaceQuarantined(key, { terminationError: "must not replace the first incident" }),
+    /quarantine marker already exists/iu,
+  );
 });
 
 test("quarantine recovery requires an explicit incident-bound approval", async (context) => {
@@ -1672,8 +1771,8 @@ test("quarantine recovery requires an explicit incident-bound approval", async (
 
   const { root, quarantinePath, recoveryPath } = await repositoryStatePaths(commonDir);
   await mkdir(root, { recursive: true });
-  context.after(() => rm(quarantinePath, { force: true }));
-  context.after(() => rm(recoveryPath, { force: true }));
+  context.after(() => rm(quarantinePath, { recursive: true, force: true }));
+  context.after(() => rm(recoveryPath, { recursive: true, force: true }));
   const record = JSON.stringify({ quarantineId, terminationError: "fixture" });
   await writeFile(quarantinePath, record);
   // Simulate routine temp cleanup. Absence alone must leave the live
@@ -1689,7 +1788,8 @@ test("quarantine recovery requires an explicit incident-bound approval", async (
 
   // Renaming the incident record is the documented explicit approval. The CAS
   // winner consumes it only after acquiring the exact quarantined lease.
-  await writeFile(quarantinePath, record);
+  await mkdir(quarantinePath);
+  await writeFile(path.join(quarantinePath, "record.json"), record);
   await rename(quarantinePath, recoveryPath);
   const recovered = await client.request("tools/call", taskArguments(workspace, {
     name: "after-explicit-recovery", eventFile, delayMs: 10,
@@ -2462,7 +2562,7 @@ test("new-branch attribution considers baselines beyond the first 256 tips", {
   assert.match(out.commits.diffStat, /late-worker\.txt/u);
 });
 
-test("fetched remote history is excluded from worker-created commits", async (context) => {
+test("direct remote-tracking ref writes do not hide worker-created commits", async (context) => {
   const { workspace, client } = await makeHarness(context);
   const response = await client.request("tools/call", taskArguments(workspace, {
     name: "fetch-then-work", fetchAndCommit: true,
@@ -2471,17 +2571,17 @@ test("fetched remote history is excluded from worker-created commits", async (co
   }));
   const out = response.result.structuredContent;
   assert.equal(out.ok, true, JSON.stringify(out.error));
-  assert.equal(out.commits.newCommitCount, 1, out.commits.log);
+  assert.equal(out.commits.newCommitCount, 2, out.commits.log);
   assert.match(out.commits.log, /worker commit after fetch/u);
-  assert.doesNotMatch(out.commits.log, /fetched upstream commit/u);
-  assert.match(out.commits.log, /refs\/remotes\/origin\/main moved to externally sourced history/u);
-  assert.doesNotMatch(out.commits.diffStat, /upstream\.txt/u,
-    "external fetched content is part of the attribution baseline");
+  assert.match(out.commits.log, /fetched upstream commit/u);
+  assert.match(out.commits.diffStat, /upstream\.txt/u);
   assert.match(out.commits.diffStat, /worker-after-fetch\.txt/u);
 });
 
-test("fetch history directed into a local ref remains an external baseline", async (context) => {
+test("a workspace fetch makes commit attribution explicitly unavailable", async (context) => {
   const { tempRoot, workspace, client } = await makeHarness(context);
+  const requestDirectory = path.join(workspace, "nested-request-directory");
+  await mkdir(requestDirectory);
   const upstream = path.join(tempRoot, "local-ref-upstream");
   await mkdir(upstream);
   await execFileAsync("git", ["init"], { cwd: upstream });
@@ -2492,24 +2592,171 @@ test("fetch history directed into a local ref remains an external baseline", asy
   await execFileAsync("git", ["commit", "-m", "externally fetched local-ref commit"], { cwd: upstream });
   await execFileAsync("git", ["branch", "-M", "topic"], { cwd: upstream });
 
-  const response = await client.request("tools/call", taskArguments(workspace, {
+  const response = await client.request("tools/call", taskArguments(requestDirectory, {
     name: "fetch-local-ref-then-work", fetchIntoLocalRef: true, remotePath: upstream,
     importedRef: "refs/heads/imported-upstream", branchName: "local-fetch-work",
     writeFile: "worker-after-local-fetch.txt", commitMessage: "worker commit after local-ref fetch",
   }));
   const out = response.result.structuredContent;
   assert.equal(out.ok, true, JSON.stringify(out));
-  assert.equal(out.commits.newCommitCount, 1, out.commits.log);
-  assert.match(out.commits.log, /worker commit after local-ref fetch/u);
-  assert.doesNotMatch(out.commits.log, /externally fetched local-ref commit/u);
-  assert.match(out.commits.log, /FETCH_HEAD recorded externally fetched history/u);
+  assert.equal(out.commits.attributionUnavailable, true, JSON.stringify(out.commits));
+  assert.equal(out.commits.newCommitCount, null);
+  assert.equal(out.commits.log, "");
+  assert.equal(out.commits.diffStat, null);
   assert.ok(out.commits.refsChanged.some((item) => item.ref === "refs/heads/imported-upstream"),
     JSON.stringify(out.commits.refsChanged));
-  assert.doesNotMatch(out.commits.diffStat, /external-local-ref\.txt/u);
-  assert.match(out.commits.diffStat, /worker-after-local-fetch\.txt/u);
 });
 
-test("a fetched tag tip is an external baseline for later worker commits", async (context) => {
+test("successive fetches are detected even after FETCH_HEAD is overwritten", async (context) => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), "cli-agent-successive-fetch-test-"));
+  const workspace = path.join(tempRoot, "workspace");
+  await mkdir(workspace);
+  await initializeFixtureRepository(workspace);
+  context.after(() => rm(tempRoot, { recursive: true, force: true }));
+  const makeUpstream = async (name, fileName, message) => {
+    const upstream = path.join(tempRoot, name);
+    await mkdir(upstream);
+    await execFileAsync("git", ["init"], { cwd: upstream });
+    await execFileAsync("git", ["config", "user.name", "Upstream Fixture"], { cwd: upstream });
+    await execFileAsync("git", ["config", "user.email", "upstream@example.invalid"], { cwd: upstream });
+    await writeFile(path.join(upstream, fileName), message + "\n");
+    await execFileAsync("git", ["add", fileName], { cwd: upstream });
+    await execFileAsync("git", ["commit", "-m", message], { cwd: upstream });
+    await execFileAsync("git", ["branch", "-M", "topic"], { cwd: upstream });
+    const { stdout } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: upstream });
+    return { upstream, oid: stdout.trim() };
+  };
+  const first = await makeUpstream("multi-fetch-a", "external-a.txt", "externally fetched A");
+  const second = await makeUpstream("multi-fetch-b", "external-b.txt", "externally fetched B");
+  const third = await makeUpstream("multi-fetch-c", "external-c.txt", "externally fetched C");
+  // Preload A and B without retaining a ref/FETCH_HEAD baseline. Both in-run
+  // fetches are up to date (no packet want); A also uses no destination and
+  // suppresses FETCH_HEAD, so only the Trace2-bound explicit source
+  // advertisement can prove its tip is external.
+  await execFileAsync("git", ["fetch", first.upstream, "refs/heads/topic"], { cwd: workspace });
+  await execFileAsync("git", ["fetch", second.upstream, "refs/heads/topic"], { cwd: workspace });
+  await rm(path.join(workspace, ".git", "FETCH_HEAD"), { force: true });
+
+  const tracePath = path.join(tempRoot, "successive-fetch.trace2");
+  await writeFile(tracePath, "");
+  const env = backendGitProvenanceEnvironment(tracePath);
+  await execFileAsync("git", [
+    "-c", "protocol.version=0", "fetch", "--no-write-fetch-head",
+    first.upstream, "refs/heads/topic",
+  ], { cwd: workspace, env });
+  await execFileAsync("git", ["update-ref", "refs/custom/imported-a", first.oid], { cwd: workspace, env });
+  await execFileAsync("git", [
+    "fetch", second.upstream, "refs/heads/topic:refs/custom/imported-b",
+  ], { cwd: workspace, env });
+  await execFileAsync("git", ["fetch", third.upstream, "refs/heads/topic"], { cwd: workspace, env });
+  await execFileAsync("git", ["update-ref", "refs/custom/imported-c", third.oid], { cwd: workspace, env });
+
+  const provenance = await readBackendGitProvenance({ tracePath }, workspace);
+  assert.equal(provenance.sawFetch, true);
+  assert.equal(provenance.uncertain, true,
+    "any successful target-repository fetch makes commit attribution unavailable");
+  const fetchHead = await readFile(path.join(workspace, ".git", "FETCH_HEAD"), "utf8");
+  assert.match(fetchHead, new RegExp(third.oid, "u"));
+  assert.doesNotMatch(fetchHead, new RegExp(first.oid + "|" + second.oid, "u"),
+    "the fixture must demonstrate that later fetches overwrote both earlier tips");
+  for (const ref of ["refs/custom/imported-a", "refs/custom/imported-b", "refs/custom/imported-c"]) {
+    const { stdout } = await execFileAsync("git", ["rev-parse", "--verify", ref], { cwd: workspace });
+    assert.match(stdout, /^[0-9a-f]{40,64}\s*$/u);
+  }
+});
+
+test("pull makes commit attribution explicitly unavailable", async (context) => {
+  const { tempRoot, workspace, client } = await makeHarness(context);
+  const upstream = path.join(tempRoot, "pull-upstream");
+  await execFileAsync("git", ["clone", workspace, upstream], { cwd: tempRoot });
+  await execFileAsync("git", ["config", "user.name", "Upstream Fixture"], { cwd: upstream });
+  await execFileAsync("git", ["config", "user.email", "upstream@example.invalid"], { cwd: upstream });
+  await writeFile(path.join(upstream, "external-pull.txt"), "external\n");
+  await execFileAsync("git", ["add", "external-pull.txt"], { cwd: upstream });
+  await execFileAsync("git", ["commit", "-m", "external pull parent"], { cwd: upstream });
+  await execFileAsync("git", ["branch", "-M", "topic"], { cwd: upstream });
+  await writeFile(path.join(workspace, "local-before-pull.txt"), "local\n");
+  await execFileAsync("git", ["add", "local-before-pull.txt"], { cwd: workspace });
+  await execFileAsync("git", ["commit", "-m", "local baseline before pull"], { cwd: workspace });
+
+  const response = await client.request("tools/call", taskArguments(workspace, {
+    name: "pull-with-local-merge", pullNoRebase: true, remotePath: upstream,
+  }));
+  const out = response.result.structuredContent;
+  assert.equal(out.ok, true, JSON.stringify(out));
+  assert.equal(out.commits.attributionUnavailable, true, JSON.stringify(out.commits));
+  assert.equal(out.commits.newCommitCount, null);
+  assert.equal(out.commits.log, "");
+});
+
+test("a fetch in another repository does not disable target attribution", async (context) => {
+  const { tempRoot, workspace, client } = await makeHarness(context);
+  const otherRepository = path.join(tempRoot, "other-repository");
+  const upstream = path.join(tempRoot, "other-upstream");
+  await mkdir(otherRepository);
+  await mkdir(upstream);
+  for (const repository of [otherRepository, upstream]) {
+    await execFileAsync("git", ["init"], { cwd: repository });
+    await execFileAsync("git", ["config", "user.name", "Other Fixture"], { cwd: repository });
+    await execFileAsync("git", ["config", "user.email", "other@example.invalid"], { cwd: repository });
+    await writeFile(path.join(repository, "base.txt"), repository + "\n");
+    await execFileAsync("git", ["add", "base.txt"], { cwd: repository });
+    await execFileAsync("git", ["commit", "-m", "other baseline"], { cwd: repository });
+  }
+  await execFileAsync("git", ["branch", "-M", "topic"], { cwd: upstream });
+
+  const response = await client.request("tools/call", taskArguments(workspace, {
+    name: "cross-repository-fetch", fetchOtherRepositoryThenCommit: true,
+    otherRepository, remotePath: upstream,
+    writeFile: "target-after-other-fetch.txt", commitMessage: "target commit after other fetch",
+  }));
+  const out = response.result.structuredContent;
+  assert.equal(out.ok, true, JSON.stringify(out));
+  assert.equal(out.commits.attributionUnavailable, undefined, JSON.stringify(out.commits));
+  assert.equal(out.commits.newCommitCount, 1, out.commits.log);
+  assert.match(out.commits.log, /target commit after other fetch/u);
+  assert.match(out.commits.diffStat, /target-after-other-fetch\.txt/u);
+});
+
+test("fetch-only runs disclose unavailable attribution and retain worktree files", async (context) => {
+  const { tempRoot, workspace, client } = await makeHarness(context);
+  const upstream = path.join(tempRoot, "fetch-only-upstream");
+  await mkdir(upstream);
+  await execFileAsync("git", ["init"], { cwd: upstream });
+  await execFileAsync("git", ["config", "user.name", "Upstream Fixture"], { cwd: upstream });
+  await execFileAsync("git", ["config", "user.email", "upstream@example.invalid"], { cwd: upstream });
+  await writeFile(path.join(upstream, "external.txt"), "external\n");
+  await execFileAsync("git", ["add", "external.txt"], { cwd: upstream });
+  await execFileAsync("git", ["commit", "-m", "external fetch-only commit"], { cwd: upstream });
+  await execFileAsync("git", ["branch", "-M", "topic"], { cwd: upstream });
+
+  const response = await client.request("tools/call", taskArguments(workspace, {
+    name: "fetch-only", fetchOnlyThenWrite: true, remotePath: upstream,
+    writeFile: "after-fetch-only.txt",
+  }));
+  const out = response.result.structuredContent;
+  assert.equal(out.ok, true, JSON.stringify(out));
+  assert.equal(out.commits.attributionUnavailable, true, JSON.stringify(out.commits));
+  assert.deepEqual(out.commits.refsChanged, []);
+  assert.equal(out.commits.newCommitCount, null);
+  assert.ok(out.git.changedFiles.includes("after-fetch-only.txt"), JSON.stringify(out.git.changedFiles));
+});
+
+test("malformed provenance cannot discard a completed worktree snapshot", async (context) => {
+  const { workspace, client } = await makeHarness(context);
+  const response = await client.request("tools/call", taskArguments(workspace, {
+    name: "malformed-provenance", corruptTraceThenWrite: true,
+    writeFile: "after-malformed-provenance.txt",
+  }));
+  const out = response.result.structuredContent;
+  assert.equal(out.ok, true, JSON.stringify(out));
+  assert.equal(out.commits.attributionUnavailable, true, JSON.stringify(out.commits));
+  assert.equal(out.commits.newCommitCount, null);
+  assert.ok(out.git.changedFiles.includes("after-malformed-provenance.txt"),
+    JSON.stringify(out.git.changedFiles));
+});
+
+test("direct tag writes do not hide worker-created commits", async (context) => {
   const { workspace, client } = await makeHarness(context);
   const response = await client.request("tools/call", taskArguments(workspace, {
     name: "fetch-tag-then-work", fetchAndCommit: true, fetchTagOnly: true,
@@ -2518,15 +2765,14 @@ test("a fetched tag tip is an external baseline for later worker commits", async
   }));
   const out = response.result.structuredContent;
   assert.equal(out.ok, true, JSON.stringify(out.error));
-  assert.equal(out.commits.newCommitCount, 1, out.commits.log);
+  assert.equal(out.commits.newCommitCount, 2, out.commits.log);
   assert.match(out.commits.log, /worker commit after fetched tag/u);
-  assert.doesNotMatch(out.commits.log, /fetched upstream commit/u);
-  assert.match(out.commits.log, /refs\/tags\/fetched-tag moved to externally sourced history/u);
-  assert.doesNotMatch(out.commits.diffStat, /upstream\.txt/u);
+  assert.match(out.commits.log, /fetched upstream commit/u);
+  assert.match(out.commits.diffStat, /upstream\.txt/u);
   assert.match(out.commits.diffStat, /worker-after-tag\.txt/u);
 });
 
-test("prefetch refs are external baselines for later worker commits", async (context) => {
+test("direct prefetch ref writes do not hide worker-created commits", async (context) => {
   const { workspace, client } = await makeHarness(context);
   const response = await client.request("tools/call", taskArguments(workspace, {
     name: "prefetch-then-work", fetchAndCommit: true, fetchPrefetch: true,
@@ -2535,11 +2781,10 @@ test("prefetch refs are external baselines for later worker commits", async (con
   }));
   const out = response.result.structuredContent;
   assert.equal(out.ok, true, JSON.stringify(out.error));
-  assert.equal(out.commits.newCommitCount, 1, out.commits.log);
+  assert.equal(out.commits.newCommitCount, 2, out.commits.log);
   assert.match(out.commits.log, /worker commit after prefetch/u);
-  assert.doesNotMatch(out.commits.log, /fetched upstream commit/u);
-  assert.match(out.commits.log, /refs\/prefetch\/remotes\/origin\/main moved to externally sourced history/u);
-  assert.doesNotMatch(out.commits.diffStat, /upstream\.txt/u);
+  assert.match(out.commits.log, /fetched upstream commit/u);
+  assert.match(out.commits.diffStat, /upstream\.txt/u);
   assert.match(out.commits.diffStat, /worker-after-prefetch\.txt/u);
 });
 

@@ -86,6 +86,27 @@ if (spec.branchRoundTrip) {
   execFileSync("git", ["commit", "-m", spec.commitMessage ?? "worker commit after local-ref fetch"]);
   execFileSync("git", ["checkout", original]);
   event("end");
+} else if (spec.pullNoRebase) {
+  event("start");
+  execFileSync("git", ["pull", "--no-rebase", "--no-edit", spec.remotePath, "topic"]);
+  event("end");
+} else if (spec.fetchOtherRepositoryThenCommit) {
+  event("start");
+  execFileSync("git", ["-C", spec.otherRepository, "fetch", spec.remotePath, "refs/heads/topic"]);
+  writeFileSync(path.resolve(process.cwd(), spec.writeFile), "target work\n");
+  execFileSync("git", ["add", spec.writeFile]);
+  execFileSync("git", ["commit", "-m", spec.commitMessage]);
+  event("end");
+} else if (spec.fetchOnlyThenWrite) {
+  event("start");
+  execFileSync("git", ["fetch", spec.remotePath, "refs/heads/topic"]);
+  writeFileSync(path.resolve(process.cwd(), spec.writeFile), "worktree-only change\n");
+  event("end");
+} else if (spec.corruptTraceThenWrite) {
+  event("start");
+  appendFileSync(process.env.GIT_TRACE2_EVENT, "{malformed-trace2-event\n");
+  writeFileSync(path.resolve(process.cwd(), spec.writeFile), "trace fallback worktree change\n");
+  event("end");
 } else if (spec.mirrorPush) {
   event("start");
   execFileSync("git", ["push", "--mirror", spec.remotePath]);

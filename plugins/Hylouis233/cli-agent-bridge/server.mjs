@@ -8,7 +8,7 @@
 
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { chmod, link, mkdir, mkdtemp, open, readFile, realpath, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, open, readFile, realpath, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -38,6 +38,8 @@ const KILL_GRACE_MS = Number.isInteger(TEST_KILL_GRACE_MS) && TEST_KILL_GRACE_MS
   : 10_000;
 const MAX_CAPTURE_CHARS = 5_000_000;
 const RAW_TAIL_CHARS = 60_000;
+const FETCH_PROVENANCE_TIPS = Symbol("fetchProvenanceTips");
+const QUARANTINE_RECORD_FILE = "record.json";
 const TEST_RUNTIME_PLATFORM = process.env.NODE_ENV === "test"
   ? process.env.CLI_AGENT_BRIDGE_TEST_PLATFORM
   : "";
@@ -1040,6 +1042,117 @@ class GitProcessTreeUnconfirmedError extends Error {
   }
 }
 
+const BACKEND_GIT_ROUTING_VARIABLES = new Set([
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR", "GIT_CONFIG",
+  "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS", "GIT_DIR", "GIT_GRAFT_FILE",
+  "GIT_IMPLICIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_NAMESPACE", "GIT_OBJECT_DIRECTORY",
+  "GIT_PREFIX", "GIT_QUARANTINE_PATH", "GIT_REPLACE_REF_BASE", "GIT_SHALLOW_FILE",
+  "GIT_WORK_TREE",
+]);
+
+function gitCommandIndex(argv) {
+  const valueOptions = new Set([
+    "-C", "-c", "--config-env", "--exec-path", "--git-dir", "--namespace",
+    "--super-prefix", "--work-tree",
+  ]);
+  for (let index = 1; index < argv.length; index += 1) {
+    const value = String(argv[index] ?? "");
+    if (value === "--") return index + 1 < argv.length ? index + 1 : -1;
+    if (!value.startsWith("-")) return index;
+    if (!value.includes("=") && valueOptions.has(value)) index += 1;
+  }
+  return -1;
+}
+
+export function backendGitProvenanceEnvironment(tracePath, baseEnvironment = process.env) {
+  if (typeof tracePath !== "string" || !path.isAbsolute(tracePath)) {
+    throw new Error("Git fetch provenance trace path is unavailable");
+  }
+  const env = { ...baseEnvironment };
+  for (const name of Object.keys(env)) {
+    const canonical = process.platform === "win32" ? name.toUpperCase() : name;
+    if (BACKEND_GIT_ROUTING_VARIABLES.has(canonical) ||
+        /^GIT_CONFIG_(?:KEY|VALUE)_\d+$/u.test(canonical) ||
+        canonical === "GIT_REFLOG_ACTION" || canonical.startsWith("GIT_TRACE")) {
+      delete env[name];
+    }
+  }
+  // Trace2 identifies successful fetch/pull commands in the canonical target
+  // repository. Git does not expose a complete, cross-version per-fetch tip
+  // log, so their presence makes commit attribution explicitly unavailable
+  // instead of relying on the last (overwritable) FETCH_HEAD contents.
+  env.GIT_TRACE2_EVENT = tracePath;
+  return env;
+}
+
+async function createBackendGitProvenance(baseEnvironment = process.env) {
+  const root = await mkdtemp(path.join(os.tmpdir(), "minimax-cli-agent-fetch-"));
+  const tracePath = path.join(root, "git.trace");
+  try {
+    await chmod(root, 0o700);
+    await writeFile(tracePath, "", { flag: "wx", mode: 0o600 });
+    return {
+      root, tracePath,
+      env: backendGitProvenanceEnvironment(tracePath, baseEnvironment),
+    };
+  } catch (error) {
+    await rm(root, { recursive: true, force: true }).catch(() => {});
+    throw error;
+  }
+}
+
+export async function readBackendGitProvenance(provenance, worktreeRoot) {
+  const traceStat = await stat(provenance.tracePath);
+  if (traceStat.size > MAX_CAPTURE_CHARS) {
+    throw new Error("Git fetch provenance trace exceeded the capture limit");
+  }
+  const trace = await readFile(provenance.tracePath, "utf8");
+  const sessions = new Map();
+  const normalizeWorktree = (value) => {
+    const normalized = path.resolve(String(value ?? ""));
+    return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+  };
+  const targetWorktree = normalizeWorktree(worktreeRoot);
+  for (const line of trace.split(/\r?\n/u)) {
+    if (!line.startsWith("{")) continue;
+    let event;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      throw new Error("Git fetch provenance trace contained malformed Trace2 JSON");
+    }
+    if (event?.event === "start") {
+      const commandIndex = Array.isArray(event.argv) ? gitCommandIndex(event.argv) : -1;
+      const command = commandIndex >= 0 ? event.argv[commandIndex] : "";
+      if (command === "fetch" || command === "pull") {
+        sessions.set(event.sid, { command, worktree: null, exitCode: null, exited: false });
+      }
+    } else if (event?.event === "def_repo") {
+      const session = sessions.get(event.sid);
+      if (session) session.worktree = normalizeWorktree(event.worktree);
+    } else if (event?.event === "exit") {
+      const session = sessions.get(event.sid);
+      if (session) {
+        session.exited = true;
+        session.exitCode = event.code;
+      }
+    }
+  }
+  let uncertain = false;
+  let sawFetch = false;
+  for (const session of sessions.values()) {
+    if (session.worktree === null || !session.exited) {
+      uncertain = true;
+      continue;
+    }
+    if (session.worktree === targetWorktree && session.exitCode === 0) {
+      sawFetch = true;
+      uncertain = true;
+    }
+  }
+  return { uncertain, sawFetch };
+}
+
 export async function runGitCommand(args, {
   cwd,
   cancel = null,
@@ -1164,9 +1277,12 @@ async function gitSnapshot(worktreeRoot, options = {}) {
     ...nulNames(out.cachedDiffNames),
     ...nulNames(out.untracked),
   ].filter((f) => (seen.has(f) ? false : (seen.add(f), true)));
-  const diffStat = [String(out.diffStat ?? "").trim(), String(out.cachedDiffStat ?? "").trim()]
-    .filter(Boolean)
-    .map((s, i) => (i === 0 ? s : s.split(/\r?\n/).map((l) => "staged: " + l).join("\n")))
+  const diffStat = [
+    ["", String(out.diffStat ?? "").trim()],
+    ["staged: ", String(out.cachedDiffStat ?? "").trim()],
+  ]
+    .filter(([, value]) => Boolean(value))
+    .map(([prefix, value]) => value.split(/\r?\n/u).map((line) => prefix + line).join("\n"))
     .join("\n");
   const refs = {};
   for (const line of String(out.refs ?? "").split(/\r?\n/u)) {
@@ -1237,7 +1353,7 @@ async function gitSnapshot(worktreeRoot, options = {}) {
       if (active) concurrentDelegations += 1;
     } catch { /* malformed owner blob: ignore for disclosure */ }
   }
-  return {
+  const snapshot = {
     // The leading space in porcelain's first XY column is significant (for
     // example, " M" means unstaged). Remove only Git's final line terminator.
     statusShort: String(out.status ?? "").replace(/\r?\n$/u, ""),
@@ -1249,6 +1365,7 @@ async function gitSnapshot(worktreeRoot, options = {}) {
     fetchHeads,
     concurrentDelegations,
   };
+  return snapshot;
 }
 
 // Peel an object id to a commit id. Returns null for blob/tree objects (legal
@@ -1339,6 +1456,17 @@ export async function committedDelta(worktreeRoot, before, after, options = {}) 
     const afterOid = after.refs?.[ref] ?? "";
     return beforeOid === afterOid ? [] : [{ ref, before: beforeOid, after: afterOid }];
   });
+  const provenance = after?.[FETCH_PROVENANCE_TIPS] ?? null;
+  if (provenance?.uncertain) {
+    return {
+      attributionUnavailable: true,
+      attributionError: "Git fetch or pull ran in the workspace; per-fetch external tips could not be proven completely",
+      refsChanged,
+      newCommitCount: null,
+      log: "",
+      diffStat: null,
+    };
+  }
   if (before.head === after.head && before.headRef === after.headRef && refsChanged.length === 0) return null;
 
   let emptyTreeId = "";
@@ -1365,7 +1493,6 @@ export async function committedDelta(worktreeRoot, before, after, options = {}) 
     ...(before.fetchHeads ?? []),
     after.head,
     ...Object.values(after.refs ?? {}),
-    ...(after.fetchHeads ?? []),
     ...refsChanged.flatMap((change) => [change.before, change.after]),
   ], cache, options);
   // Baseline: every commit that already existed before the worker ran. New
@@ -1385,38 +1512,6 @@ export async function committedDelta(worktreeRoot, before, after, options = {}) 
   ])) {
     await addBaseline(oid);
   }
-  // Commits introduced by fetch live under remote-tracking refs and were
-  // created outside this worker. Add their after-state tips to the exclusion
-  // baseline before attributing any local branch/tag that builds on them.
-  const movedLocalTargets = new Set([
-    before.head === after.head ? "" : after.head,
-    ...refsChanged
-      .filter((change) => change.ref.startsWith("refs/heads/"))
-      .map((change) => change.after),
-  ].filter(Boolean));
-  const externalRefChanges = [];
-  for (const change of refsChanged) {
-    if (change.ref.startsWith("refs/remotes/") || change.ref.startsWith("refs/prefetch/")) {
-      externalRefChanges.push(change);
-      continue;
-    }
-    if (!change.ref.startsWith("refs/tags/") || change.before || !change.after) continue;
-    const tagCommit = await peelCommitish(worktreeRoot, change.after, cache, options);
-    // A newly arriving tag without a moved local HEAD/branch at the same commit
-    // is conservatively treated as fetch-sourced. Existing tags may be moved by
-    // the worker (including from a non-commit object) and remain attribution
-    // labels because a before/after snapshot cannot prove such a move was fetch.
-    if (tagCommit && !movedLocalTargets.has(tagCommit)) externalRefChanges.push(change);
-  }
-  for (const change of externalRefChanges) await addBaseline(change.after);
-  // FETCH_HEAD records the actual objects downloaded by fetch independently
-  // of its arbitrary destination refspec. A fetch can write directly into
-  // refs/heads or any custom namespace, so namespace alone cannot establish
-  // provenance. Exclude every recorded fetched tip while retaining the local
-  // destination movement as an attribution target for any later worker commit.
-  for (const oid of after.fetchHeads ?? []) await addBaseline(oid);
-  const externalRefNames = new Set(externalRefChanges.map((change) => change.ref));
-
   // A worker committing on the checked-out branch moves HEAD and its branch ref
   // across the same object pair; deduplicate by that pair so the log, diff, and
   // commit count are emitted once with both labels.
@@ -1434,22 +1529,10 @@ export async function committedDelta(worktreeRoot, before, after, options = {}) 
   }
   addTarget("HEAD", before.head, after.head);
   for (const change of refsChanged) {
-    if (externalRefNames.has(change.ref)) continue;
     addTarget(change.ref, change.before, change.after);
   }
 
-  const movementLogs = externalRefChanges.map((change) =>
-    change.ref + " moved to externally sourced history; excluded from worker-created commits",
-  );
-  const beforeFetchHeads = new Set(before.fetchHeads ?? []);
-  for (const oid of after.fetchHeads ?? []) {
-    if (!beforeFetchHeads.has(oid)) {
-      movementLogs.push(
-        "FETCH_HEAD recorded externally fetched history at " + oid.slice(0, 12) +
-        "; excluded from worker-created commits",
-      );
-    }
-  }
+  const movementLogs = [];
   if ((before.headRef ?? "") !== (after.headRef ?? "")) {
     movementLogs.push(
       "HEAD symbolic target " + (before.headRef || "(detached)") +
@@ -1635,9 +1718,22 @@ function workspaceQuarantineRecoveryPath(key) {
 async function readWorkspaceQuarantine(key) {
   const quarantinePath = workspaceQuarantinePath(key);
   try {
-    const raw = await readFile(quarantinePath, "utf8");
+    const marker = await stat(quarantinePath);
+    let raw = null;
+    if (marker.isDirectory()) {
+      try {
+        raw = await readFile(path.join(quarantinePath, QUARANTINE_RECORD_FILE), "utf8");
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error;
+      }
+    } else if (marker.isFile()) {
+      // Compatibility with quarantine marker files created by older bridges.
+      raw = await readFile(quarantinePath, "utf8");
+    }
     let details;
-    try { details = JSON.parse(raw); } catch { details = { error: "invalid quarantine record" }; }
+    try {
+      details = typeof raw === "string" ? JSON.parse(raw) : { error: "invalid quarantine record" };
+    } catch { details = { error: "invalid quarantine record" }; }
     return { quarantinePath, details };
   } catch (error) {
     if (error.code === "ENOENT") return null;
@@ -1651,7 +1747,11 @@ async function readWorkspaceQuarantine(key) {
 // over to a later incident.
 async function quarantineRecoveryApproved(key, owner) {
   try {
-    const raw = await readFile(workspaceQuarantineRecoveryPath(key), "utf8");
+    const recoveryPath = workspaceQuarantineRecoveryPath(key);
+    const marker = await stat(recoveryPath);
+    const raw = marker.isDirectory()
+      ? await readFile(path.join(recoveryPath, QUARANTINE_RECORD_FILE), "utf8")
+      : await readFile(recoveryPath, "utf8");
     const record = JSON.parse(raw);
     return typeof owner?.quarantineId === "string" &&
       record?.quarantineId === owner.quarantineId;
@@ -1661,15 +1761,15 @@ async function quarantineRecoveryApproved(key, owner) {
 }
 
 async function clearQuarantineRecoveryApproval(key) {
-  await unlink(workspaceQuarantineRecoveryPath(key)).catch((error) => {
-    if (error.code !== "ENOENT") throw error;
-  });
+  await rm(workspaceQuarantineRecoveryPath(key), { recursive: true, force: true });
 }
 
-async function markWorkspaceQuarantined(key, details) {
+export async function markWorkspaceQuarantined(key, details, quarantineId = randomUUID()) {
+  if (typeof quarantineId !== "string" || !quarantineId) {
+    throw new Error("quarantine id is unavailable");
+  }
   await mkdir(WORKSPACE_LOCK_ROOT, { recursive: true, mode: 0o700 });
   const quarantinePath = workspaceQuarantinePath(key);
-  const quarantineId = randomUUID();
   const token = process.pid + "-" + randomUUID();
   const temporaryPath = quarantinePath + ".owner-" + token;
   const record = {
@@ -1679,18 +1779,38 @@ async function markWorkspaceQuarantined(key, details) {
     processIdentity: await cachedProcessStartIdentity(process.pid),
     quarantinedAt: new Date().toISOString(),
   };
-  await writeFile(temporaryPath, JSON.stringify(record), { flag: "wx", mode: 0o600 });
+  await mkdir(temporaryPath, { mode: 0o700 });
+  await writeFile(path.join(temporaryPath, QUARANTINE_RECORD_FILE), JSON.stringify(record), {
+    flag: "wx", mode: 0o600,
+  });
+  let preserveTemporary = false;
+  let published = false;
   try {
     try {
-      await link(temporaryPath, quarantinePath);
+      await stat(quarantinePath);
+      throw new Error("workspace quarantine marker already exists at " + quarantinePath);
     } catch (error) {
-      if (error.code === "EEXIST") {
+      if (error.code !== "ENOENT") throw error;
+    }
+    try {
+      // A populated directory is complete before its same-filesystem rename
+      // makes the final marker visible. Concurrent publishers cannot replace a
+      // non-empty winner, and no hard-link support is required.
+      await rename(temporaryPath, quarantinePath);
+      published = true;
+    } catch (error) {
+      try {
+        await stat(quarantinePath);
         throw new Error("workspace quarantine marker already exists at " + quarantinePath);
+      } catch (observed) {
+        if (observed.code !== "ENOENT") throw observed;
       }
+      preserveTemporary = true;
+      error.message += "; complete recovery record remains at " + temporaryPath;
       throw error;
     }
   } finally {
-    try { await unlink(temporaryPath); } catch (error) { if (error.code !== "ENOENT") throw error; }
+    if (!preserveTemporary) await rm(temporaryPath, { recursive: true, force: true });
   }
   return { quarantinePath, quarantineId, details: record };
 }
@@ -1764,13 +1884,13 @@ async function quarantineLeaseForProcessTree({
 }) {
   quarantinedWorkspaces.add(lockKey);
   workspaceLease.retain();
+  const quarantineId = randomUUID();
+  await workspaceLease.markWorkerQuarantinePending(quarantineId);
   const details = {
     backend, workspacePath, worktreeRoot, lockRef: workspaceLease.ref, terminationError,
   };
-  const quarantine = await markWorkspaceQuarantined(lockKey, details);
-  try {
-    await workspaceLease.markWorkerQuarantined(quarantine.quarantineId);
-  } catch { /* the retained lease remains fail-closed; the marker explains recovery */ }
+  const quarantine = await markWorkspaceQuarantined(lockKey, details, quarantineId);
+  await workspaceLease.markWorkerQuarantined(quarantine.quarantineId);
   quarantinedWorkspaces.delete(lockKey);
   return { quarantinePath: quarantine.quarantinePath, details: quarantine.details };
 }
@@ -2237,74 +2357,99 @@ async function delegateTask(rawArgs, cancel) {
       ownershipLostError ??= error;
     });
     let workerLockUpdate = Promise.resolve();
-    const result = await runCommand(backendCommand, args, {
-      cwd: workspacePath,
-      timeoutMs: remaining,
-      manageProcessTree: true,
-      shouldCancel: () => Boolean(cancel && cancel.cancelled),
-      onChild: (controller) => {
-        workerController = controller;
-        if (cancel) cancel.controller = controller;
-        if (ownershipLostError) void recordOwnershipLoss(ownershipLostError);
-        workerLockUpdate = workspaceLease.markWorkerRunning(controller.child.pid, { cancel, deadline })
-          .catch((error) => {
-            // Interruption of the state update is expected during cancellation
-            // or timeout: the worker lifecycle itself is managed by terminate().
-            if (error instanceof WorkspaceLockCancelledError ||
-                error instanceof WorkspaceLockDeadlineError) {
-              return;
-            }
-            return recordOwnershipLoss(error);
-          });
-      },
-    });
-    // Keep the controller live while runCommand is still inspecting or
-    // terminating escaped descendants after the leader closes. Once the full
-    // command result settles, clear it before any further await so a late lease
-    // notification cannot signal a reused PID/process-group identifier.
-    workerFinished = true;
-    if (cancel?.controller === workerController) cancel.controller = null;
-    workerController = null;
-    await workerLockUpdate;
-    let quarantinePath = "";
-    if (!result.treeTerminated) {
-      quarantinedWorkspaces.add(lockKey);
-      workspaceLease.retain();
-      // Persist the operator-visible marker before making the retained lease
-      // recoverable. If persistence fails, the lease remains in the
-      // unreclaimable running state instead of mistaking temporary-file cleanup
-      // for an explicit operator recovery authorization.
-      const quarantine = await markWorkspaceQuarantined(lockKey, {
-        backend,
-        workspacePath,
-        worktreeRoot,
-        lockRef: workspaceLease.ref,
-        terminationError: result.terminationError,
+    const gitProvenance = await createBackendGitProvenance();
+    let fetchProvenanceTips = { uncertain: false, sawFetch: false };
+    let result;
+    try {
+      result = await runCommand(backendCommand, args, {
+        cwd: workspacePath,
+        // Git's private per-run Trace2 stream detects target-repository
+        // fetch/pull commands without trusting the overwritable FETCH_HEAD.
+        env: gitProvenance.env,
+        timeoutMs: remaining,
+        manageProcessTree: true,
+        shouldCancel: () => Boolean(cancel && cancel.cancelled),
+        onChild: (controller) => {
+          workerController = controller;
+          if (cancel) cancel.controller = controller;
+          if (ownershipLostError) void recordOwnershipLoss(ownershipLostError);
+          workerLockUpdate = workspaceLease.markWorkerRunning(controller.child.pid, { cancel, deadline })
+            .catch((error) => {
+              // Interruption of the state update is expected during cancellation
+              // or timeout: the worker lifecycle itself is managed by terminate().
+              if (error instanceof WorkspaceLockCancelledError ||
+                  error instanceof WorkspaceLockDeadlineError) {
+                return;
+              }
+              return recordOwnershipLoss(error);
+            });
+        },
       });
-      quarantinePath = quarantine.quarantinePath;
-      try {
+    } finally {
+      // Once runCommand settles it has completed tree cleanup. Clear the
+      // numeric-PID controller before any later I/O can fail or yield.
+      workerFinished = true;
+      if (cancel?.controller === workerController) cancel.controller = null;
+      workerController = null;
+    }
+    let quarantinePath = "";
+    try {
+      // The controller is already cleared above; only the ref-state update may
+      // still be settling here. Quarantine an unconfirmed tree before touching
+      // its trace, which a surviving descendant may still be writing.
+      await workerLockUpdate;
+      if (!result.treeTerminated) {
+        quarantinedWorkspaces.add(lockKey);
+        workspaceLease.retain();
+        const quarantineId = randomUUID();
+        await workspaceLease.markWorkerQuarantinePending(quarantineId);
+        // The pending CAS above makes a crash during marker publication
+        // unreclaimable. Only a complete, atomically published record advances
+        // the lease to the operator-recoverable quarantined state.
+        const quarantine = await markWorkspaceQuarantined(lockKey, {
+          backend,
+          workspacePath,
+          worktreeRoot,
+          lockRef: workspaceLease.ref,
+          terminationError: result.terminationError,
+        }, quarantineId);
+        quarantinePath = quarantine.quarantinePath;
         await workspaceLease.markWorkerQuarantined(quarantine.quarantineId);
-      } catch { /* running state remains fail-closed; the marker still explains manual recovery */ }
-      // The shared marker is now authoritative and can be explicitly renamed
-      // by an operator after inspection; retain the local fallback only when
-      // writing that marker failed.
-      quarantinedWorkspaces.delete(lockKey);
-    } else if (!ownershipLostError) {
-      try {
-        await workspaceLease.markWorkerIdle({ cancel, deadline });
-      } catch (error) {
-        if (!(error instanceof WorkspaceLockCancelledError) &&
-            !(error instanceof WorkspaceLockDeadlineError)) {
-          await recordOwnershipLoss(error);
+        // The shared marker is now authoritative and can be explicitly renamed
+        // by an operator after inspection; retain the local fallback only when
+        // writing that marker failed.
+        quarantinedWorkspaces.delete(lockKey);
+      } else if (!ownershipLostError) {
+        try {
+          await workspaceLease.markWorkerIdle({ cancel, deadline });
+        } catch (error) {
+          if (!(error instanceof WorkspaceLockCancelledError) &&
+              !(error instanceof WorkspaceLockDeadlineError)) {
+            await recordOwnershipLoss(error);
+          }
         }
       }
-    }
-    if (ownershipLostError) {
-      await ownershipTermination;
-      if (ownershipTerminationError && ownershipLostError.cause === undefined) {
-        ownershipLostError.cause = ownershipTerminationError;
+      if (ownershipLostError) {
+        await ownershipTermination;
+        if (ownershipTerminationError && ownershipLostError.cause === undefined) {
+          ownershipLostError.cause = ownershipTerminationError;
+        }
+        throw ownershipLostError;
       }
-      throw ownershipLostError;
+      if (result.treeTerminated) {
+        try {
+          fetchProvenanceTips = await readBackendGitProvenance(gitProvenance, worktreeRoot);
+        } catch {
+          // A malformed, truncated, or missing trace cannot justify commit
+          // attribution. Preserve the completed worker result and disclose the
+          // uncertainty instead of letting trace I/O bypass workspace safety.
+          fetchProvenanceTips = { uncertain: true, sawFetch: false };
+        }
+      }
+    } finally {
+      // Cleanup is privacy hygiene, not a workspace-safety gate. In particular,
+      // it must never replace a durable quarantine result with a released lease.
+      await rm(gitProvenance.root, { recursive: true, force: true }).catch(() => {});
     }
     let after = null;
     let commits = null;
@@ -2319,6 +2464,7 @@ async function delegateTask(rawArgs, cancel) {
           concurrencyWindowStart: attributionWindowStart,
           onUnconfirmedProcessTree: quarantineGitProcessTree,
         });
+        Object.defineProperty(after, FETCH_PROVENANCE_TIPS, { value: fetchProvenanceTips });
         commits = await committedDelta(worktreeRoot, before, after, { cancel, deadline });
       } catch (error) {
         if (error instanceof GitProcessTreeUnconfirmedError) {

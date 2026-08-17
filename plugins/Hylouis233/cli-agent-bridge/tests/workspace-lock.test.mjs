@@ -448,6 +448,29 @@ test("a quarantined lease without proof of a durable marker fails closed", async
     "approval is invalid unless marker persistence and an incident id were recorded");
 });
 
+test("a quarantine publication interrupted before its marker remains fail closed", async (context) => {
+  const repo = await makeRepo(context);
+  const key = "git-worktree:" + repo;
+  const now = Date.now();
+  await installOwner(repo, workspaceLockRef(key), {
+    version: 1,
+    token: "quarantine-publication-pending",
+    hostIdentity: localHostIdentity(),
+    ownerPid: 12345,
+    workerState: "quarantine-pending",
+    quarantineMarkerPersisted: false,
+    quarantineId: "pending-incident",
+    workerPid: null,
+    acquiredAt: now - 120_000,
+    heartbeatAt: now - 120_000,
+  });
+  const result = await tryAcquireGitWorkspaceLock({
+    cwd: repo, key, now, staleMs: 30_000, processProbe: () => "dead",
+    operatorRecoveryApproved: () => true,
+  });
+  assert.deepEqual(result, { acquired: false, reason: "held" });
+});
+
 test("a different OS user cannot clear another user's quarantined lease", async (context) => {
   const repo = await makeRepo(context);
   const key = "git-worktree:" + repo;

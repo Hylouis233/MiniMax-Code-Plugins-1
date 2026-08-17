@@ -170,7 +170,8 @@ you already obtained a valid ID from that backend outside this Plugin.
   Coordination-store Git commands use the same hook-free configuration, while operations that
   create the store or a temporary tree remain process-contained. If termination cannot be
   confirmed, the bridge writes a shared
-  quarantine marker, moves its lease into the recoverable `quarantined` state, and every bridge
+  quarantine marker after first moving its lease into a non-reclaimable `quarantine-pending` state,
+  then advances the lease into the recoverable `quarantined` state, and every bridge
   process refuses further delegation until an operator checks for leftovers and deliberately
   renames the reported `quarantinePath` to `quarantinePath.recovery-approved`. That durable,
   incident-bound rename authorizes the next delegation to reclaim the quarantined lease; simple
@@ -183,7 +184,9 @@ you already obtained a valid ID from that backend outside this Plugin.
   and `git --git-dir=<lock-store> cat-file blob <object-id>`. The JSON owner record contains the
   server/worker state and PIDs. Only after checking those processes and escaped descendants are
   gone, clear the listed ref with `git --git-dir=<lock-store> update-ref -d <lock-ref>`. The
-  quarantine marker itself lives in a current-user-scoped OS temporary directory.
+  quarantine marker itself lives in a current-user-scoped OS temporary directory. New markers are
+  atomically claimed directories (legacy marker files remain readable), so publication does not
+  depend on hard-link support and the reported path is renamed the same way during recovery.
   On Linux, zombie-only tracked trees count as terminated; zombies cannot edit the workspace and
   may otherwise persist when container PID 1 does not reap them.
 - Cancelling a workspace_status request interrupts its queued lock wait or Git snapshot and returns
@@ -197,10 +200,13 @@ you already obtained a valid ID from that backend outside this Plugin.
   existing divergent branch is reported as a HEAD move with no new commits, and refs pointing at
   non-commit objects (for example a blob tag) are reported without failing the delegation. A commit
   reached through multiple moved refs is counted and logged once with all contributing labels;
-  remote-tracking updates and fetched tag-only tips are treated as externally sourced history.
-  FETCH_HEAD tips supply the same external baseline when fetch writes through an arbitrary refspec
-  directly into a local branch or custom ref, including when a local worker commit builds on the
-  fetched tip. Commit-tip classification is batched and each changed target uses one boundary graph
+  ref namespaces alone never prove that a commit came from outside the worker.
+  Git exposes only the final, overwritable FETCH_HEAD and no complete cross-version per-fetch tip log.
+  A private, per-delegation Trace2 event stream therefore detects successful fetch/pull operations in
+  the canonical workspace; when one occurred, the response keeps the worktree/ref snapshot but marks
+  commit attribution unavailable instead of guessing which commits were worker-created. The trace is
+  user-private, bounded, consumed after worker cleanup, and removed before the response. Runs without
+  fetch/pull batch commit-tip classification, and each changed target uses one boundary graph
   walk, so repositories with thousands of refs do not spawn one Git process per baseline. Any
   bounded Git capture that truncates is rejected as an unreliable snapshot; backend output
   truncation is disclosed.

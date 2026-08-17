@@ -303,6 +303,10 @@ async function canReclaim(owner, {
     }
     return false;
   }
+  // Publication starts by persisting this state before any temporary marker
+  // work. A bridge crash in that window cannot turn an uncertain escaped tree
+  // back into a reclaimable idle lease.
+  if (owner.workerState === "quarantine-pending") return false;
   if (now - owner.heartbeatAt < staleMs) return false;
   if (await originalOwnerStatus(owner, processProbe, processIdentityProbe) !== "dead") return false;
   if (owner.workerState === "idle" && owner.workerPid === null) return true;
@@ -435,6 +439,14 @@ function createLease({ cwd, ref, oid, owner, heartbeatMs }) {
     },
     async markWorkerIdle(interrupt = {}) {
       await queueUpdate({ workerState: "idle", workerPid: null }, interrupt);
+    },
+    async markWorkerQuarantinePending(quarantineId) {
+      if (typeof quarantineId !== "string" || !quarantineId) {
+        throw new Error("quarantine id is unavailable");
+      }
+      await queueUpdate({
+        workerState: "quarantine-pending", quarantineMarkerPersisted: false, quarantineId,
+      });
     },
     async markWorkerQuarantined(quarantineId) {
       if (typeof quarantineId !== "string" || !quarantineId) {

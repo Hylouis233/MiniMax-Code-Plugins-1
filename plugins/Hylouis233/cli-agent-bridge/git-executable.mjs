@@ -1,29 +1,9 @@
-import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { access, mkdir, realpath, stat } from "node:fs/promises";
-import os from "node:os";
+import { access, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 
 let executablePromise = null;
-let hooksRootPromise = null;
 const pathCommandPromises = new Map();
-
-function userScope() {
-  let identity;
-  try {
-    const user = os.userInfo();
-    identity = Number.isInteger(user.uid) && user.uid >= 0
-      ? process.platform + ":uid:" + String(user.uid)
-      : process.platform + ":" + user.username + ":" + user.homedir;
-  } catch {
-    identity = process.platform + ":" + (process.env.USERNAME ?? process.env.USER ?? os.homedir());
-  }
-  return createHash("sha256").update(identity).digest("hex").slice(0, 20);
-}
-
-const DISABLED_HOOKS_ROOT = path.join(
-  os.tmpdir(), "minimax-cli-agent-bridge-git-" + userScope(), "disabled-hooks",
-);
 
 async function resolveGitExecutable() {
   const names = process.platform === "win32" ? ["git.exe", "git.com"] : ["git"];
@@ -96,37 +76,29 @@ export function trustedGitExecutable() {
   return executablePromise;
 }
 
-async function disabledHooksRoot() {
-  hooksRootPromise ??= mkdir(DISABLED_HOOKS_ROOT, { recursive: true, mode: 0o700 })
-    .then(() => DISABLED_HOOKS_ROOT)
-    .catch((error) => {
-      hooksRootPromise = null;
-      throw error;
-    });
-  return await hooksRootPromise;
-}
-
-export async function safeGitInvocation(args) {
+export async function safeGitInvocation(args, baseEnvironment = process.env) {
   const safeArgs = [
-    "-c", "core.hooksPath=" + await disabledHooksRoot(),
+    // Git documents /dev/null as the way to disable hooks. Unlike a shared
+    // empty directory, this sink cannot be pre-created or populated by another
+    // local user before a coordination update-ref operation.
+    "-c", "core.hooksPath=/dev/null",
     "-c", "core.fsmonitor=false",
     "-c", "gc.autoDetach=false",
     "-c", "maintenance.auto=false",
     ...args,
   ];
   if (args[0] === "diff") safeArgs.splice(9, 0, "--no-ext-diff", "--no-textconv");
-  const env = {
-    ...process.env,
+  // Repository-routing variables must never leak from the process that
+  // launched the bridge. Clear every case variant of GIT_* (Windows
+  // environment names are case-insensitive), then restore only the settings
+  // required by these local, non-interactive bridge operations.
+  const env = Object.fromEntries(
+    Object.entries(baseEnvironment).filter(([name]) => !/^GIT_/iu.test(name)),
+  );
+  Object.assign(env, {
     GIT_OPTIONAL_LOCKS: "0",
     GIT_PAGER: "",
     PAGER: "",
-  };
-  for (const name of [
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG_COUNT", "GIT_DIR", "GIT_DIFF_OPTS",
-    "GIT_EXTERNAL_DIFF", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_WORK_TREE",
-  ]) delete env[name];
-  for (const name of Object.keys(env)) {
-    if (/^GIT_CONFIG_(?:KEY|VALUE)_\d+$/u.test(name)) delete env[name];
-  }
+  });
   return { command: await trustedGitExecutable(), args: safeArgs, env };
 }
