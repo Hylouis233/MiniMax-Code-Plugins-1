@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { access, chmod, copyFile, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { createServer } from "node:net";
 import { createInterface } from "node:readline";
 import test from "node:test";
 import { promisify } from "node:util";
@@ -17,8 +18,9 @@ import {
   trustedGitExecutable,
 } from "../git-executable.mjs";
 import {
-  backendEntryFromProbe, backendGitProvenanceEnvironment, closestExistingBase, committedDelta,
-  loadBackends, markWorkspaceQuarantined,
+  backendConfigurationReaderEnvironment, backendEntryFromProbe, backendGitProvenanceEnvironment,
+  closestExistingBase, committedDelta,
+  gitCommonDirectory, gitWorktreeRoot, loadBackends, markWorkspaceQuarantined,
   populateCommitishCache, readBackendGitProvenance, readWorkspaceQuarantine, runCommand, runGitCommand,
 } from "../server.mjs";
 
@@ -313,6 +315,47 @@ test("Git commands do not launch after invocation setup crosses the deadline", a
     },
   }), /deadline/iu);
   assert.equal(runnerCalls, 0);
+});
+
+test("Git path canonicalization preserves cancellation and deadline errors", async () => {
+  const gitResult = (stdout) => unconfirmedGitResult({
+    stdout, stderr: "", exitCode: 0, timedOut: false, killed: false,
+    orphanedProcesses: false, treeTerminated: true, terminationError: "",
+  });
+
+  const cancelled = testCancellation();
+  let resolveWorktreeStarted;
+  const worktreeStarted = new Promise((resolve) => { resolveWorktreeStarted = resolve; });
+  const worktree = gitWorktreeRoot(pluginRoot, {
+    cancel: cancelled,
+    commandRunner: async () => gitResult(pluginRoot + "\n"),
+    fsOps: {
+      realpath: () => {
+        resolveWorktreeStarted();
+        return new Promise(() => {});
+      },
+    },
+  });
+  await worktreeStarted;
+  cancelled.cancel();
+  await assert.rejects(worktree, (error) =>
+    /cancelled/iu.test(error.message) && !/canonicalize/iu.test(error.message));
+
+  let resolveCommonStarted;
+  const commonStarted = new Promise((resolve) => { resolveCommonStarted = resolve; });
+  const common = gitCommonDirectory(pluginRoot, {
+    deadline: Date.now() + 250,
+    commandRunner: async () => gitResult(".git\n"),
+    fsOps: {
+      realpath: () => {
+        resolveCommonStarted();
+        return new Promise(() => {});
+      },
+    },
+  });
+  await commonStarted;
+  await assert.rejects(common, (error) =>
+    /deadline/iu.test(error.message) && !/canonicalize/iu.test(error.message));
 });
 
 test("committed-delta baseline preparation uses bounded batch queries", async () => {
@@ -1171,6 +1214,8 @@ test("explicit backend configuration overrides fail closed atomically", async (c
     { name: "empty-path", configPath: "" },
     { name: "missing-file", configPath: path.join(root, "missing.json") },
     { name: "malformed-json", content: "{" },
+    { name: "invalid-utf8", content: Buffer.from([0xc3, 0x28]) },
+    { name: "oversized", content: Buffer.alloc(1_000_001, 0x20) },
     { name: "missing-backends", content: "{}" },
     { name: "array-backends", content: JSON.stringify({ backends: [] }) },
     { name: "empty-backends", content: JSON.stringify({ backends: {} }) },
@@ -1202,6 +1247,27 @@ test("explicit backend configuration overrides fail closed atomically", async (c
   }
 });
 
+test("backend configuration helper control environment excludes inherited injection", () => {
+  const env = backendConfigurationReaderEnvironment({
+    SystemRoot: "C:\\Windows",
+    PATH: "trusted-path",
+    GH_TOKEN: "secret-token",
+    SSH_AUTH_SOCK: "secret-agent",
+    NODE_OPTIONS: "--require=attacker.cjs",
+    Node_Path: "attacker-modules",
+    LD_PRELOAD: "attacker.so",
+    DyLd_InSeRt_LiBrArIeS: "attacker.dylib",
+    GIT_DIR: "attacker.git",
+    Git_Config_Count: "1",
+  });
+  assert.deepEqual(env, {
+    LANG: "C.UTF-8",
+    LC_ALL: "C.UTF-8",
+    ...(process.platform === "win32" ? { PATHEXT: ".COM;.EXE;.BAT;.CMD" } : {}),
+    SystemRoot: "C:\\Windows",
+  });
+});
+
 test("an unset backend override still loads the bundled configuration", async (context) => {
   const original = process.env.CLI_AGENT_BRIDGE_BACKENDS;
   delete process.env.CLI_AGENT_BRIDGE_BACKENDS;
@@ -1212,6 +1278,108 @@ test("an unset backend override still loads the bundled configuration", async (c
   const backends = await loadBackends();
   assert.ok(backends.codex);
   assert.deepEqual(backends.codex.buildArgs, ["exec", "--", "<task>"]);
+});
+
+test("backend configuration reads obey cancellation, deadline, and shutdown", async (context) => {
+  const stallRoot = await mkdtemp(path.join(os.tmpdir(), "cli-agent-config-read-stall-test-"));
+  const startedFile = path.join(stallRoot, "started.txt");
+  context.after(() => rm(stallRoot, { recursive: true, force: true }));
+  const { tempRoot, workspace, client } = await makeHarness(context, {
+    extraEnv: {
+      CLI_AGENT_BRIDGE_TEST_BACKEND_CONFIG_READ_STALL_FILE: startedFile,
+    },
+  });
+  const eventFile = path.join(tempRoot, "config-read-events.jsonl");
+
+  const timed = await client.request("tools/call", taskArguments(workspace, {
+    name: "config-read-deadline", eventFile,
+  }, { timeoutMs: 5_000 }), 50_101);
+  assert.ok(timed.result, JSON.stringify({ timed, stderr: client.stderr }));
+  assert.equal(timed.result.structuredContent.timedOut, true, JSON.stringify(timed));
+  assert.match(timed.result.structuredContent.error, /loading backend configuration/iu);
+  assert.deepEqual(await events(eventFile), [], "the backend must not start after a config timeout");
+
+  await rm(startedFile, { force: true });
+  const listing = client.request("tools/call", {
+    name: "list_backends", arguments: {},
+  }, 50_102);
+  await waitFor(async () => {
+    try { return (await readFile(startedFile, "utf8")).includes("started"); } catch { return false; }
+  });
+  const cancelledAt = Date.now();
+  client.notify("notifications/cancelled", { requestId: 50_102 });
+  const cancelled = await listing;
+  assert.ok(Date.now() - cancelledAt < 1_500, "configuration cancellation must return promptly");
+  assert.deepEqual(cancelled.result.structuredContent.backends, []);
+
+  await rm(startedFile, { force: true });
+  const pending = client.request("tools/call", {
+    name: "list_backends", arguments: {},
+  }, 50_103);
+  void pending.catch(() => {});
+  await waitFor(async () => {
+    try { return (await readFile(startedFile, "utf8")).includes("started"); } catch { return false; }
+  });
+  const shutdownAt = Date.now();
+  await client.disconnectInput();
+  assert.ok(Date.now() - shutdownAt < 3_000,
+    "stdin shutdown must detach a stalled backend-configuration read");
+});
+
+test("Windows config reader termination closes real named-pipe I/O", {
+  skip: process.platform !== "win32",
+}, async (context) => {
+  const pipePath = "\\\\.\\pipe\\cli-agent-config-" + String(process.pid) + "-" +
+    String(Date.now());
+  const sockets = new Set();
+  const queued = [];
+  const waiters = [];
+  const pipeServer = createServer((socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+    const waiter = waiters.shift();
+    if (waiter) waiter(socket);
+    else queued.push(socket);
+  });
+  await new Promise((resolve, reject) => {
+    pipeServer.once("error", reject);
+    pipeServer.listen(pipePath, resolve);
+  });
+  const nextConnection = () => queued.length > 0
+    ? Promise.resolve(queued.shift())
+    : new Promise((resolve) => waiters.push(resolve));
+  context.after(() => {
+    for (const socket of sockets) socket.destroy();
+    pipeServer.close();
+  });
+
+  const cancelledClient = new McpClient(pipePath);
+  await cancelledClient.initialize();
+  context.after(() => { if (cancelledClient.child.exitCode === null) cancelledClient.child.kill(); });
+  const listing = cancelledClient.request("tools/call", {
+    name: "list_backends", arguments: {},
+  }, 50_201);
+  await nextConnection();
+  const cancelledAt = Date.now();
+  cancelledClient.notify("notifications/cancelled", { requestId: 50_201 });
+  const cancelled = await listing;
+  assert.deepEqual(cancelled.result.structuredContent.backends, []);
+  assert.ok(Date.now() - cancelledAt < 1_500,
+    "cancelling a named-pipe config read must terminate its managed helper");
+  await cancelledClient.close();
+
+  const shutdownClient = new McpClient(pipePath);
+  await shutdownClient.initialize();
+  context.after(() => { if (shutdownClient.child.exitCode === null) shutdownClient.child.kill(); });
+  const pending = shutdownClient.request("tools/call", {
+    name: "list_backends", arguments: {},
+  }, 50_202);
+  void pending.catch(() => {});
+  await nextConnection();
+  const shutdownAt = Date.now();
+  await shutdownClient.disconnectInput();
+  assert.ok(Date.now() - shutdownAt < 3_000,
+    "stdin shutdown must kill a helper blocked in real named-pipe readFile I/O");
 });
 
 test("explicit invalid delegation timeouts are rejected before side effects", async (context) => {

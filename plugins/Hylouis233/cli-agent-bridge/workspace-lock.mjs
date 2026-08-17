@@ -8,7 +8,8 @@ import { safeGitInvocation, subscribeTrustedGitExecutable } from "./git-executab
 
 export const WORKSPACE_LOCK_REF_PREFIX = "refs/cli-agent-bridge/workspace-locks/";
 const WORKSPACE_HISTORY_REF_SUFFIX = ".history";
-const WORKSPACE_RECOVERY_REF_SUFFIX = ".recovery";
+const LEGACY_WORKSPACE_RECOVERY_REF_SUFFIX = ".recovery";
+const WORKSPACE_RECOVERY_REF_PREFIX = "refs/cli-agent-bridge/workspace-recoveries/";
 const DEFAULT_STALE_MS = 30_000;
 const DEFAULT_HEARTBEAT_MS = 5_000;
 const DEFAULT_POLL_MS = 100;
@@ -17,6 +18,7 @@ const CAPTURE_LIMIT = 64_000;
 const PIPE_DRAIN_MS = 100;
 const RELEASE_RETRY_MS = 50;
 const RELEASE_ATTEMPTS = 3;
+const locallyAbandonedRefs = new Map();
 export class WorkspaceLockCancelledError extends Error {}
 export class WorkspaceLockDeadlineError extends Error {}
 
@@ -64,27 +66,57 @@ async function writeRunHistory(cwd, lockRef, owner) {
   }
 }
 
+export function workspaceRecoveryRef(lockRef, ownerOid) {
+  const lockDigest = lockRef.startsWith(WORKSPACE_LOCK_REF_PREFIX)
+    ? lockRef.slice(WORKSPACE_LOCK_REF_PREFIX.length)
+    : "";
+  if (!/^[0-9a-f]{64}$/u.test(lockDigest) || !/^[0-9a-f]{40,64}$/u.test(ownerOid)) {
+    throw new Error("workspace recovery authorization identity is invalid");
+  }
+  return WORKSPACE_RECOVERY_REF_PREFIX + lockDigest + "/" + ownerOid;
+}
+
+function validRecoveryAuthorization(observed, lockRef, ownerOid, ownerToken) {
+  return Boolean(
+    observed?.owner?.version === 1 &&
+    observed.owner.lockRef === lockRef &&
+    observed.owner.ownerOid === ownerOid &&
+    observed.owner.ownerToken === ownerToken,
+  );
+}
+
 async function writeRecoveryAuthorization(cwd, lockRef, ownerOid, ownerToken) {
-  const recoveryRef = lockRef + WORKSPACE_RECOVERY_REF_SUFFIX;
+  const recoveryRef = workspaceRecoveryRef(lockRef, ownerOid);
   const record = {
     version: 1,
     lockRef,
     ownerOid,
     ownerToken,
-    authorizedAt: Date.now(),
   };
   const recordOid = await writeOwnerBlob(cwd, record);
-  const result = await runGit(cwd, ["update-ref", "--no-deref", recoveryRef, recordOid]);
-  if (result.exitCode !== 0) {
-    throw new Error("cannot persist workspace lock recovery authorization: " + (
-      result.stderr.trim() || "git update-ref exited with code " + String(result.exitCode)
-    ));
+  const zeroOid = "0".repeat(recordOid.length);
+  if (!await compareAndSwap(cwd, recoveryRef, recordOid, zeroOid)) {
+    const observed = await readCurrentOwner(cwd, recoveryRef);
+    if (observed?.oid !== recordOid ||
+        !validRecoveryAuthorization(observed, lockRef, ownerOid, ownerToken)) {
+      throw new Error("workspace lock recovery authorization conflicts with another record");
+    }
   }
-  return { ref: recoveryRef, oid: recordOid };
+  return { ref: recoveryRef, oid: recordOid, owner: record, legacy: false };
 }
 
-async function readRecoveryAuthorization(cwd, lockRef, options = {}) {
-  return await readCurrentOwner(cwd, lockRef + WORKSPACE_RECOVERY_REF_SUFFIX, options);
+async function readRecoveryAuthorization(cwd, lockRef, ownerOid, ownerToken, options = {}) {
+  const recoveryRef = workspaceRecoveryRef(lockRef, ownerOid);
+  const current = await readCurrentOwner(cwd, recoveryRef, options);
+  if (validRecoveryAuthorization(current, lockRef, ownerOid, ownerToken)) {
+    return { ...current, ref: recoveryRef, legacy: false };
+  }
+  const legacyRef = lockRef + LEGACY_WORKSPACE_RECOVERY_REF_SUFFIX;
+  const legacy = await readCurrentOwner(cwd, legacyRef, options);
+  if (validRecoveryAuthorization(legacy, lockRef, ownerOid, ownerToken)) {
+    return { ...legacy, ref: legacyRef, legacy: true };
+  }
+  return null;
 }
 
 async function clearRecoveryAuthorization(cwd, authorization) {
@@ -140,6 +172,18 @@ function checkInterrupted(cancel, deadline) {
   if (cancel?.cancelled) throw new WorkspaceLockCancelledError("workspace lock acquisition cancelled");
   if (deadline !== null && Date.now() >= deadline) {
     throw new WorkspaceLockDeadlineError("workspace lock acquisition deadline exceeded");
+  }
+}
+
+function localAbandonmentKey(cwd, ref) {
+  return String(cwd) + "\0" + ref;
+}
+
+function clearExactLocalAbandonment(cwd, ref, ownerOid, ownerToken) {
+  const key = localAbandonmentKey(cwd, ref);
+  const abandoned = locallyAbandonedRefs.get(key);
+  if (abandoned?.ownerOid === ownerOid && abandoned.ownerToken === ownerToken) {
+    locallyAbandonedRefs.delete(key);
   }
 }
 
@@ -247,6 +291,23 @@ async function runGit(cwd, args, {
     child.on("close", (code) => finish(code ?? exitCode));
     if (child.stdin) child.stdin.end(stdinText);
   });
+  if (process.env.NODE_ENV === "test" && args[0] === "update-ref" &&
+      args.length === 5 && !args.includes("-d") &&
+      process.env.CLI_AGENT_BRIDGE_TEST_WORKSPACE_CAS_RESULT_STARTED_FILE &&
+      process.env.CLI_AGENT_BRIDGE_TEST_WORKSPACE_CAS_RESULT_RELEASE_FILE) {
+    await appendFile(
+      process.env.CLI_AGENT_BRIDGE_TEST_WORKSPACE_CAS_RESULT_STARTED_FILE, "started\n",
+    );
+    while (true) {
+      try {
+        readFileSync(process.env.CLI_AGENT_BRIDGE_TEST_WORKSPACE_CAS_RESULT_RELEASE_FILE);
+        break;
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    }
+  }
   checkInterrupted(cancel, deadline);
   if (result.timedOut && !returnOnTimeout) {
     throw new Error("git " + args[0] + " timed out while managing the workspace lock");
@@ -319,6 +380,62 @@ async function compareAndDelete(cwd, ref, expectedOid) {
   throw new Error("cannot delete workspace lock ref: " + (
     result.stderr.trim() || "git update-ref exited with code " + String(result.exitCode)
   ));
+}
+
+async function removeOwnedRefWithRecovery(cwd, ref, ownerOid, ownerToken) {
+  let authorization = null;
+  let authorizationError = null;
+  let deleteError = null;
+  let deleted = false;
+  let ownershipChanged = false;
+  for (let attempt = 0; attempt < RELEASE_ATTEMPTS; attempt += 1) {
+    if (!authorization) {
+      try {
+        authorization = await writeRecoveryAuthorization(cwd, ref, ownerOid, ownerToken);
+        authorizationError = null;
+      } catch (error) {
+        authorizationError = error;
+      }
+    }
+    try {
+      deleted = await compareAndDelete(cwd, ref, ownerOid);
+      deleteError = null;
+      ownershipChanged = !deleted;
+      break;
+    } catch (error) {
+      deleteError = error;
+    }
+    if (attempt + 1 < RELEASE_ATTEMPTS) {
+      await new Promise((resolve) => setTimeout(resolve, RELEASE_RETRY_MS));
+    }
+  }
+  if (deleted || ownershipChanged) {
+    clearExactLocalAbandonment(cwd, ref, ownerOid, ownerToken);
+    if (authorization) {
+      await clearRecoveryAuthorization(cwd, authorization);
+    } else if (deleted) {
+      try {
+        const observedAuthorization = await readRecoveryAuthorization(
+          cwd, ref, ownerOid, ownerToken,
+        );
+        await clearRecoveryAuthorization(cwd, observedAuthorization);
+      } catch { /* deletion succeeded; stale exact authorization cleanup is best effort */ }
+    }
+    return { deleted, authorization: null };
+  }
+  if (deleteError && authorization) throw deleteError;
+  if (authorizationError && deleteError) {
+    // Both durable recovery publication and exact deletion failed. release()
+    // is called only before worker launch or after its tree was confirmed
+    // terminated, so the next FIFO holder in this module may safely retry one
+    // exact expected-OID CAS. Other processes/modules remain fail-closed.
+    locallyAbandonedRefs.set(localAbandonmentKey(cwd, ref), { ownerOid, ownerToken });
+    throw new AggregateError(
+      [authorizationError, deleteError],
+      "cannot persist recovery authorization or delete the workspace lock ref",
+    );
+  }
+  throw authorizationError ?? deleteError ?? new Error("cannot release workspace lock ref");
 }
 
 async function canReclaim(owner, {
@@ -525,30 +642,15 @@ function createLease({ cwd, ref, oid, owner, heartbeatMs }) {
             if (observed && observed.owner?.token === ownerToken) currentOid = observed.oid;
           } catch { /* best effort; the delete below still uses the last known OID */ }
         }
-        // Persist authorization before deleting. If deletion exhausts its
-        // retries, every bridge process sharing this lock store can safely CAS
-        // away only this exact completed owner record.
-        const recoveryAuthorization = await writeRecoveryAuthorization(
+        // Retry recovery publication and the exact owner delete together. A
+        // transient recovery-ref lock must not prevent deletion of our owner
+        // ref; if deletion also fails, a successfully published authorization
+        // lets the next request safely recover this exact OID and token.
+        const { deleted } = await removeOwnedRefWithRecovery(
           cwd, ref, currentOid, ownerToken,
         );
-        let deleted = false;
-        let deleteError = null;
-        for (let attempt = 0; attempt < RELEASE_ATTEMPTS; attempt += 1) {
-          try {
-            deleted = await compareAndDelete(cwd, ref, currentOid);
-            deleteError = null;
-            break;
-          } catch (error) {
-            deleteError = error;
-            if (attempt + 1 < RELEASE_ATTEMPTS) {
-              await new Promise((resolve) => setTimeout(resolve, RELEASE_RETRY_MS));
-            }
-          }
-        }
-        if (deleteError) throw deleteError;
         released = true;
         if (deleted) await writeRunHistory(cwd, ref, currentOwner);
-        await clearRecoveryAuthorization(cwd, recoveryAuthorization);
         await maintainLockStore(cwd);
         if (lostError) throw lostError;
         if (!deleted) throw new Error("workspace lock ownership changed before release");
@@ -580,14 +682,21 @@ export async function tryAcquireGitWorkspaceLock({
   checkInterrupted(cancel, deadline);
   const ref = workspaceLockRef(key);
   const current = await readCurrentOwner(cwd, ref, { cancel, deadline });
-  const recovery = await readRecoveryAuthorization(cwd, ref, { cancel, deadline });
-  const sharedRecoveryAuthorized = Boolean(
-    current && recovery?.owner?.version === 1 &&
-    recovery.owner.lockRef === ref &&
-    recovery.owner.ownerOid === current.oid &&
-    recovery.owner.ownerToken === current.owner?.token,
+  const abandonmentKey = localAbandonmentKey(cwd, ref);
+  const localAbandonment = locallyAbandonedRefs.get(abandonmentKey);
+  const localRecoveryAuthorized = Boolean(
+    current && localAbandonment?.ownerOid === current.oid &&
+    localAbandonment.ownerToken === current.owner?.token,
   );
-  if (current && !sharedRecoveryAuthorized && !await canReclaim(current.owner, {
+  if (!localRecoveryAuthorized && localAbandonment) locallyAbandonedRefs.delete(abandonmentKey);
+  const recovery = current
+    ? await readRecoveryAuthorization(
+      cwd, ref, current.oid, current.owner?.token, { cancel, deadline },
+    )
+    : null;
+  const sharedRecoveryAuthorized = Boolean(recovery);
+  if (current && !sharedRecoveryAuthorized && !localRecoveryAuthorized &&
+      !await canReclaim(current.owner, {
     now, staleMs, hostIdentity, processProbe, processIdentityProbe, operatorRecoveryApproved,
   })) {
     return { acquired: false, reason: "held" };
@@ -595,20 +704,45 @@ export async function tryAcquireGitWorkspaceLock({
   const owner = makeOwner({ hostIdentity, ownerPid, ownerIdentity, now });
   const newOid = await writeOwnerBlob(cwd, owner, { cancel, deadline });
   let acquired = false;
-  if (!current) {
-    const zeroOid = "0".repeat(newOid.length);
-    checkInterrupted(cancel, deadline);
-    acquired = await compareAndSwap(cwd, ref, newOid, zeroOid, { cancel, deadline });
-  } else {
-    checkInterrupted(cancel, deadline);
-    acquired = await compareAndSwap(cwd, ref, newOid, current.oid, { cancel, deadline });
+  try {
+    if (!current) {
+      const zeroOid = "0".repeat(newOid.length);
+      checkInterrupted(cancel, deadline);
+      acquired = await compareAndSwap(cwd, ref, newOid, zeroOid, { cancel, deadline });
+    } else {
+      checkInterrupted(cancel, deadline);
+      acquired = await compareAndSwap(cwd, ref, newOid, current.oid, { cancel, deadline });
+    }
+  } catch (error) {
+    if (!(error instanceof WorkspaceLockCancelledError) &&
+        !(error instanceof WorkspaceLockDeadlineError)) throw error;
+    let observed = null;
+    let readbackError = null;
+    try {
+      // The request token is already interrupted, so reconciliation uses only
+      // runGit's internal five-second bound. Never let a triggered token hide
+      // a CAS that Git committed before its process closed.
+      observed = await readRefOid(cwd, ref);
+    } catch (readError) {
+      readbackError = readError;
+    }
+    if (observed === newOid || readbackError) {
+      try {
+        await removeOwnedRefWithRecovery(cwd, ref, newOid, owner.token);
+      } catch (cleanupError) {
+        if (error.cause === undefined) {
+          error.cause = readbackError
+            ? new AggregateError([readbackError, cleanupError], "cannot reconcile interrupted acquisition")
+            : cleanupError;
+        }
+      }
+    }
+    throw error;
   }
   if (!acquired) return { acquired: false, reason: "contended" };
+  if (localRecoveryAuthorized) locallyAbandonedRefs.delete(abandonmentKey);
   if (recovery) {
-    await clearRecoveryAuthorization(cwd, {
-      ref: ref + WORKSPACE_RECOVERY_REF_SUFFIX,
-      oid: recovery.oid,
-    });
+    await clearRecoveryAuthorization(cwd, recovery);
   }
   const lease = createLease({ cwd, ref, oid: newOid, owner, heartbeatMs });
   try {

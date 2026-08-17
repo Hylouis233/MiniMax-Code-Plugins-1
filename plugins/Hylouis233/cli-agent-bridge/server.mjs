@@ -31,6 +31,7 @@ const DEFAULT_TIMEOUT_MS = 1_200_000;
 const MIN_TIMEOUT_MS = 5_000;
 const MAX_TIMEOUT_MS = 3_600_000;
 const VERSION_CHECK_TIMEOUT_MS = 15_000;
+const BACKEND_CONFIG_READ_TIMEOUT_MS = 15_000;
 const GIT_TIMEOUT_MS = 30_000;
 const TEST_KILL_GRACE_MS = process.env.NODE_ENV === "test"
   ? Number(process.env.CLI_AGENT_BRIDGE_TEST_KILL_GRACE_MS)
@@ -232,11 +233,85 @@ function trackBackgroundFinalizer(promise) {
   return finalizer;
 }
 
-async function readBackendConfiguration(file) {
-  return validateBackendConfiguration(JSON.parse(await readFile(file, "utf8")), file);
+export function backendConfigurationReaderEnvironment(source = process.env) {
+  const env = { LANG: "C.UTF-8", LC_ALL: "C.UTF-8" };
+  // Node's Windows spawn path requires PATHEXT even for the absolute .exe
+  // handed to the Job runner. Use a fixed native-only value, never caller
+  // input that could add script shims.
+  if (process.platform === "win32") env.PATHEXT = ".COM;.EXE;.BAT;.CMD";
+  const entries = Object.entries(source);
+  for (const canonicalName of ["SystemRoot", "WINDIR", "TEMP", "TMP"]) {
+    const entry = entries.find(([name, value]) =>
+      name.toLowerCase() === canonicalName.toLowerCase() && typeof value === "string" && value,
+    );
+    if (entry) env[canonicalName] = entry[1];
+  }
+  // Test-only synchronization stays explicit; no caller credentials, Git
+  // routing, loader injection, or user PATH are inherited by the helper.
+  if (source.NODE_ENV === "test") {
+    env.NODE_ENV = "test";
+    if (typeof source.CLI_AGENT_BRIDGE_TEST_BACKEND_CONFIG_READ_STALL_FILE === "string" &&
+        source.CLI_AGENT_BRIDGE_TEST_BACKEND_CONFIG_READ_STALL_FILE) {
+      env.CLI_AGENT_BRIDGE_TEST_BACKEND_CONFIG_READ_STALL_FILE =
+        source.CLI_AGENT_BRIDGE_TEST_BACKEND_CONFIG_READ_STALL_FILE;
+    }
+  }
+  return env;
 }
 
-export async function loadBackends() {
+async function readBackendConfiguration(file, options = {}) {
+  let raw;
+  if (options.readFile) {
+    raw = await interruptibleFilesystemOperation(
+      () => options.readFile(file, "utf8"), options,
+    );
+  } else if (process.platform === "win32" || (process.env.NODE_ENV === "test" &&
+      process.env.CLI_AGENT_BRIDGE_TEST_BACKEND_CONFIG_READ_STALL_FILE)) {
+    await interruptibleFilesystemOperation(() => Promise.resolve(), options);
+    const remaining = options.deadline === null || options.deadline === undefined
+      ? BACKEND_CONFIG_READ_TIMEOUT_MS
+      : options.deadline - Date.now();
+    if (remaining <= 0) throw new DeadlineExceededError("delegation deadline exceeded");
+    let controller = null;
+    const result = await runCommand(process.execPath, [
+      path.join(path.dirname(fileURLToPath(import.meta.url)), "config-reader.mjs"), file,
+    ], {
+      env: backendConfigurationReaderEnvironment(),
+      timeoutMs: Math.min(BACKEND_CONFIG_READ_TIMEOUT_MS, remaining),
+      manageProcessTree: true,
+      shouldCancel: () => Boolean(options.cancel?.cancelled),
+      onChild: (current) => {
+        controller = current;
+        if (options.cancel) options.cancel.controller = current;
+      },
+    });
+    if (options.cancel?.controller === controller) options.cancel.controller = null;
+    if (options.cancel?.cancelled) {
+      throw new OperationCancelledError("operation cancelled by client");
+    }
+    if (options.deadline !== null && options.deadline !== undefined &&
+        Date.now() >= options.deadline) {
+      throw new DeadlineExceededError("delegation deadline exceeded");
+    }
+    if (result.treeTerminated !== true) {
+      throw new Error(
+        "backend configuration reader cleanup could not be confirmed: " +
+        (result.terminationError || "process tree termination was unconfirmed"),
+      );
+    }
+    if (result.timedOut) throw new Error("backend configuration read timed out");
+    if (result.exitCode !== 0) {
+      throw new Error(result.stderr.trim() || "backend configuration reader failed");
+    }
+    if (result.stdoutTruncated) throw new Error("backend configuration exceeds the capture limit");
+    raw = result.stdout;
+  } else {
+    raw = await interruptibleFilesystemOperation(() => readFile(file, "utf8"), options);
+  }
+  return validateBackendConfiguration(JSON.parse(raw), file);
+}
+
+export async function loadBackends(options = {}) {
   const hasOverride = Object.prototype.hasOwnProperty.call(
     process.env, "CLI_AGENT_BRIDGE_BACKENDS",
   );
@@ -247,15 +322,21 @@ export async function loadBackends() {
     }
     const file = path.resolve(override);
     try {
-      return await readBackendConfiguration(file);
+      return await readBackendConfiguration(file, options);
     } catch (error) {
+      if (error instanceof OperationCancelledError || error instanceof DeadlineExceededError) {
+        throw error;
+      }
       throw new Error("cannot load explicit backend configuration " + file + ": " + error.message);
     }
   }
   const bundled = path.join(path.dirname(fileURLToPath(import.meta.url)), "backends.json");
   try {
-    return await readBackendConfiguration(bundled);
-  } catch {
+    return await readBackendConfiguration(bundled, options);
+  } catch (error) {
+    if (error instanceof OperationCancelledError || error instanceof DeadlineExceededError) {
+      throw error;
+    }
     return FALLBACK_BACKENDS;
   }
 }
@@ -802,7 +883,7 @@ async function requireGitRepo(workspacePath, options = {}) {
   }
 }
 
-async function gitWorktreeRoot(workspacePath, options = {}) {
+export async function gitWorktreeRoot(workspacePath, options = {}) {
   const result = await runGitCommand(["rev-parse", "--show-toplevel"], {
     cwd: workspacePath, ...options,
   });
@@ -814,13 +895,15 @@ async function gitWorktreeRoot(workspacePath, options = {}) {
     throw new Error("cannot identify Git worktree root: " + (failure || "empty output"));
   }
   try {
-    return await interruptibleFilesystemOperation(realpath(output), options);
+    const canonicalize = options.fsOps?.realpath ?? realpath;
+    return await interruptibleFilesystemOperation(() => canonicalize(output), options);
   } catch (error) {
+    if (error instanceof OperationCancelledError || error instanceof DeadlineExceededError) throw error;
     throw new Error("cannot canonicalize Git worktree root: " + error.message);
   }
 }
 
-async function gitCommonDirectory(workspacePath, options = {}) {
+export async function gitCommonDirectory(workspacePath, options = {}) {
   const result = await runGitCommand(["rev-parse", "--git-common-dir"], {
     cwd: workspacePath, ...options,
   });
@@ -830,10 +913,12 @@ async function gitCommonDirectory(workspacePath, options = {}) {
     throw new Error("cannot identify Git common directory: " + (failure || "empty output"));
   }
   try {
+    const canonicalize = options.fsOps?.realpath ?? realpath;
     return await interruptibleFilesystemOperation(
-      realpath(path.resolve(workspacePath, output)), options,
+      () => canonicalize(path.resolve(workspacePath, output)), options,
     );
   } catch (error) {
+    if (error instanceof OperationCancelledError || error instanceof DeadlineExceededError) throw error;
     throw new Error("cannot canonicalize Git common directory: " + error.message);
   }
 }
@@ -2037,7 +2122,13 @@ async function listBackends(cancel = null) {
       notes: "No backend configuration or executable was inspected.",
     }];
   }
-  const backends = await loadBackends();
+  let backends;
+  try {
+    backends = await loadBackends({ cancel });
+  } catch (error) {
+    if (error instanceof OperationCancelledError) return [];
+    throw error;
+  }
   const entries = [];
   for (const [name, spec] of Object.entries(backends)) {
     // A hung `--version` probe must not pin the request: the client can cancel
@@ -2551,7 +2642,26 @@ async function delegateTask(rawArgs, cancel) {
   }
   const timeoutMs = hasTimeout ? rawArgs.timeoutMs : DEFAULT_TIMEOUT_MS;
   const deadline = Date.now() + timeoutMs;
-  const backends = await loadBackends();
+  const requestedBackend = typeof rawArgs?.backend === "string" ? rawArgs.backend.trim() : "";
+  let backends;
+  try {
+    backends = await loadBackends({ cancel, deadline });
+  } catch (error) {
+    const pending = {
+      backend: requestedBackend,
+      workspacePath: "",
+      worktreeRoot: "",
+      spec: {},
+    };
+    if (error instanceof OperationCancelledError) return cancelledDelegation(pending);
+    if (error instanceof DeadlineExceededError) {
+      return lockDeadlineDelegation({
+        ...pending,
+        error: "delegation timed out while loading backend configuration; the worker never started",
+      });
+    }
+    throw error;
+  }
   if (!rawArgs || typeof rawArgs.backend !== "string" || !rawArgs.backend.trim()) {
     throw new Error("backend must be a non-empty string");
   }
