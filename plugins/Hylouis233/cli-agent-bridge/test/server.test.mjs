@@ -18,7 +18,12 @@ const server = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "se
 
 function startServer(extraEnv = {}) {
   const child = spawn(process.execPath, [server], {
-    env: { ...process.env, ...extraEnv },
+    env: {
+      ...process.env,
+      NODE_ENV: "test",
+      CLI_AGENT_BRIDGE_TEST_PROCESS_TREE_MODE: "1",
+      ...extraEnv,
+    },
     stdio: ["pipe", "pipe", "pipe"],
   });
   let buf = "";

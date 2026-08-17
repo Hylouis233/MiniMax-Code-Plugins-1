@@ -19,7 +19,7 @@ import {
 import {
   backendEntryFromProbe, backendGitProvenanceEnvironment, closestExistingBase, committedDelta,
   loadBackends, markWorkspaceQuarantined,
-  populateCommitishCache, readBackendGitProvenance, runCommand, runGitCommand,
+  populateCommitishCache, readBackendGitProvenance, readWorkspaceQuarantine, runCommand, runGitCommand,
 } from "../server.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -971,7 +971,11 @@ async function repositoryStatePaths(canonicalGitCommonDir) {
 
 class McpClient {
   constructor(configPath, extraEnv = {}) {
-    this.child = execServer(configPath, extraEnv);
+    this.child = execServer(configPath, {
+      NODE_ENV: "test",
+      CLI_AGENT_BRIDGE_TEST_PROCESS_TREE_MODE: "1",
+      ...extraEnv,
+    });
     this.pending = new Map();
     this.stderr = "";
     this.nextId = 1;
@@ -1383,48 +1387,76 @@ test("Codex templates delimit option-looking task text", async () => {
   assert.match(source, /resumeArgs: \["exec", "resume", "<session>", "--", "<task>"\]/u);
 });
 
-test("unsupported POSIX platforms fail before probing Git or a backend", async (context) => {
+test("unsupported production platforms fail before config, workspace, Git, or backend access", async (context) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "cli-agent-unsupported-platform-test-"));
   const workspace = path.join(root, "workspace");
+  const missingWorkspace = path.join(root, "workspace-must-not-be-read");
   const marker = path.join(workspace, "backend-started.txt");
+  const gitResolutionMarker = path.join(root, "git-resolution-started.txt");
+  const backendResolutionMarker = path.join(root, "backend-resolution-started.txt");
   const sentinel = path.join(workspace, "sentinel.txt");
   const configPath = path.join(root, "backends.json");
   await mkdir(workspace);
   await writeFile(sentinel, "unchanged\n");
-  await writeFile(configPath, JSON.stringify({
-    backends: {
-      fake: {
-        label: "Fake backend",
-        command: process.execPath,
-        buildArgs: ["-e", `require('node:fs').writeFileSync(${JSON.stringify(marker)},'started')`],
-        resumeArgs: null,
-      },
-    },
-  }));
-  const client = new McpClient(configPath, {
-    NODE_ENV: "test", CLI_AGENT_BRIDGE_TEST_PLATFORM: "darwin",
-  });
-  await client.initialize();
   context.after(async () => {
-    await client.close();
     await rm(root, { recursive: true, force: true });
   });
 
-  const listed = await client.request("tools/call", {
-    name: "list_backends", arguments: {},
-  });
-  const backend = listed.result.structuredContent.backends[0];
-  assert.equal(backend.available, false);
-  assert.equal(backend.version, null);
-  assert.match(backend.error, /unsupported platform/iu);
+  for (const platform of ["linux", "darwin", "freebsd"]) {
+    // initialize does not load backend configuration. Removing the explicit
+    // file before tools/call proves the platform gate wins before config I/O.
+    await writeFile(configPath, JSON.stringify({
+      backends: {
+        fake: {
+          label: "Fake backend",
+          command: process.execPath,
+          buildArgs: ["-e", `require('node:fs').writeFileSync(${JSON.stringify(marker)},'started')`],
+          resumeArgs: null,
+        },
+      },
+    }));
+    const client = new McpClient(configPath, {
+      NODE_ENV: "test",
+      CLI_AGENT_BRIDGE_TEST_PLATFORM: platform,
+      CLI_AGENT_BRIDGE_TEST_PROCESS_TREE_MODE: "0",
+      CLI_AGENT_BRIDGE_TEST_GIT_RESOLUTION_DELAY_MS: "1",
+      CLI_AGENT_BRIDGE_TEST_GIT_RESOLUTION_STARTED_FILE: gitResolutionMarker,
+      CLI_AGENT_BRIDGE_TEST_COMMAND_RESOLUTION_DELAY_MS: "1",
+      CLI_AGENT_BRIDGE_TEST_COMMAND_RESOLUTION_STARTED_FILE: backendResolutionMarker,
+    });
+    await client.initialize();
+    await rm(configPath, { force: true });
+    try {
+      const listed = await client.request("tools/call", {
+        name: "list_backends", arguments: {},
+      });
+      const backend = listed.result.structuredContent.backends[0];
+      assert.equal(backend.name, "unsupported-platform");
+      assert.equal(backend.available, false);
+      assert.equal(backend.version, null);
+      assert.match(backend.error, new RegExp("unsupported on " + platform, "iu"));
 
-  const delegated = await client.request("tools/call", taskArguments(workspace, { name: "run" }));
-  const out = delegated.result.structuredContent;
-  assert.equal(out.ok, false);
-  assert.match(out.error, /unsupported on darwin/iu);
+      const delegated = await client.request(
+        "tools/call", taskArguments(missingWorkspace, { name: "run" }),
+      );
+      const out = delegated.result.structuredContent;
+      assert.equal(out.ok, false);
+      assert.match(out.error, new RegExp("unsupported on " + platform, "iu"));
+      const status = await client.request("tools/call", {
+        name: "workspace_status", arguments: { workspacePath: missingWorkspace },
+      });
+      assert.equal(status.result.structuredContent.ok, false);
+      assert.match(status.result.structuredContent.error,
+        new RegExp("unsupported on " + platform, "iu"));
+    } finally {
+      await client.close();
+    }
+  }
   assert.deepEqual(await readdir(workspace), ["sentinel.txt"]);
   assert.equal(await readFile(sentinel, "utf8"), "unchanged\n");
-  await assert.rejects(access(marker), /ENOENT/u);
+  for (const forbiddenMarker of [marker, gitResolutionMarker, backendResolutionMarker]) {
+    await assert.rejects(access(forbiddenMarker), /ENOENT/u);
+  }
 });
 
 test("a bare backend command never resolves from the workspace cwd", {
@@ -2402,6 +2434,103 @@ test("cancellation interrupts workspace filesystem canonicalization", async (con
   await assert.rejects(access(path.join(workspace, "canonicalization-bypass.txt")), /ENOENT/u);
 });
 
+test("quarantine marker operations obey cancellation and preflight deadlines", async () => {
+  const marker = { isDirectory: () => true, isFile: () => false };
+  for (const stalled of ["stat", "readFile", "realpath"]) {
+    const cancel = testCancellation();
+    let started = false;
+    const pending = new Promise(() => {});
+    const operation = readWorkspaceQuarantine("quarantine-root", "repository-key", {
+      cancel,
+      fsOps: {
+        stat: () => {
+          if (stalled === "stat") {
+            started = true;
+            return pending;
+          }
+          return Promise.resolve(marker);
+        },
+        readFile: () => {
+          if (stalled === "readFile") {
+            started = true;
+            return pending;
+          }
+          return Promise.resolve(JSON.stringify({ quarantineId: "fixture" }));
+        },
+        realpath: () => {
+          if (stalled === "realpath") {
+            started = true;
+            return pending;
+          }
+          return Promise.resolve("quarantine-record");
+        },
+      },
+    });
+    await waitFor(() => started);
+    cancel.cancel();
+    await assert.rejects(operation, /cancelled by client/iu, stalled);
+  }
+
+  let calls = 0;
+  await assert.rejects(
+    readWorkspaceQuarantine("quarantine-root", "repository-key", {
+      deadline: Date.now() - 1,
+      fsOps: {
+        stat: () => { calls += 1; return Promise.resolve(marker); },
+        readFile: () => { calls += 1; return Promise.resolve("{}"); },
+        realpath: () => { calls += 1; return Promise.resolve("quarantine-record"); },
+      },
+    }),
+    /deadline exceeded/iu,
+  );
+  assert.equal(calls, 0, "an expired request must not start quarantine filesystem I/O");
+});
+
+test("quarantine reads cannot pin cancellation before or after lease acquisition", async (context) => {
+  const scenarios = [
+    { label: "before-acquire", targetCall: 1, status: false, requestId: 621 },
+    { label: "after-acquire", targetCall: 3, status: false, requestId: 622 },
+    { label: "workspace-status", targetCall: 1, status: true, requestId: 623 },
+    { label: "deadline-before-acquire", targetCall: 1, status: false, deadline: true, requestId: 624 },
+  ];
+  for (const scenario of scenarios) {
+    const startedRoot = await mkdtemp(path.join(os.tmpdir(), "cli-agent-quarantine-read-test-"));
+    const startedFile = path.join(startedRoot, "started.txt");
+    context.after(() => rm(startedRoot, { recursive: true, force: true }));
+    const { tempRoot, workspace, client } = await makeHarness(context, {
+      extraEnv: {
+        NODE_ENV: "test",
+        CLI_AGENT_BRIDGE_TEST_QUARANTINE_READ_DELAY_MS: "60000",
+        CLI_AGENT_BRIDGE_TEST_QUARANTINE_READ_DELAY_CALL: String(scenario.targetCall),
+        CLI_AGENT_BRIDGE_TEST_QUARANTINE_READ_STARTED_FILE: startedFile,
+      },
+    });
+    const eventFile = path.join(tempRoot, scenario.label + "-events.jsonl");
+    const pending = scenario.status
+      ? client.request("tools/call", {
+          name: "workspace_status", arguments: { workspacePath: workspace },
+        }, scenario.requestId)
+      : client.request("tools/call", taskArguments(workspace, {
+          name: scenario.label, eventFile,
+        }, { timeoutMs: scenario.deadline ? 5_000 : 20_000 }), scenario.requestId);
+    await waitFor(() => access(startedFile).then(() => true, () => false));
+    if (scenario.deadline) {
+      const response = await pending;
+      assert.equal(response.result.structuredContent.timedOut, true, JSON.stringify(response));
+      assert.equal((await events(eventFile)).length, 0, "the backend must never start");
+      continue;
+    }
+    const cancelledAt = Date.now();
+    client.notify("notifications/cancelled", { requestId: scenario.requestId });
+    const response = await pending;
+    assert.ok(Date.now() - cancelledAt < 1_500,
+      scenario.label + " quarantine read must settle promptly after cancellation");
+    assert.ok(response.result, JSON.stringify(response));
+    assert.equal(response.result.structuredContent.cancelled, true, JSON.stringify(response));
+    assert.equal((await events(eventFile)).length, 0, "the backend must never start");
+  }
+});
+
 test("backend command resolution obeys cancellation and the absolute request deadline", async (context) => {
   const resolutionRoot = await mkdtemp(path.join(os.tmpdir(), "cli-agent-resolution-deadline-test-"));
   const resolutionStartedFile = path.join(resolutionRoot, "started.txt");
@@ -2951,9 +3080,126 @@ test("a ref moved from a blob to a new commit uses a commit-safe diff base", asy
   assert.doesNotMatch(commits.diffStat, new RegExp(blobOid.trim(), "u"));
 });
 
-test("a force-moved ref diffs from an ancestral pre-run baseline", async (context) => {
+test("a moved ref uses the nearest adjacent pre-run boundary", async (context) => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), "cli-agent-adjacent-boundary-test-"));
+  const workspace = path.join(tempRoot, "workspace");
+  await mkdir(workspace);
+  await initializeFixtureRepository(workspace);
+  context.after(() => rm(tempRoot, { recursive: true, force: true }));
+  const { stdout: oldMainText } = await execFileAsync("git", ["rev-parse", "HEAD"], {
+    cwd: workspace,
+  });
+  const oldMain = oldMainText.trim();
+
+  await execFileAsync("git", ["checkout", "-b", "pre-existing-source"], { cwd: workspace });
+  await writeFile(path.join(workspace, "pre-existing-source.txt"), "pre-existing source\n");
+  await execFileAsync("git", ["add", "pre-existing-source.txt"], { cwd: workspace });
+  await execFileAsync("git", ["commit", "-m", "pre-existing intermediate commit"], {
+    cwd: workspace,
+  });
+  const { stdout: intermediateText } = await execFileAsync("git", ["rev-parse", "HEAD"], {
+    cwd: workspace,
+  });
+  const intermediate = intermediateText.trim();
+  await execFileAsync("git", ["checkout", "-b", "temporary-worker-tip"], { cwd: workspace });
+  await writeFile(path.join(workspace, "adjacent-worker.txt"), "worker change\n");
+  await execFileAsync("git", ["add", "adjacent-worker.txt"], { cwd: workspace });
+  await execFileAsync("git", ["commit", "-m", "worker commit after adjacent baseline"], {
+    cwd: workspace,
+  });
+  const { stdout: workerText } = await execFileAsync("git", ["rev-parse", "HEAD"], {
+    cwd: workspace,
+  });
+  const worker = workerText.trim();
+  await execFileAsync("git", ["checkout", "main"], { cwd: workspace });
+  await execFileAsync("git", ["branch", "-D", "temporary-worker-tip"], { cwd: workspace });
+  await execFileAsync("git", ["update-ref", "refs/heads/main", worker, oldMain], {
+    cwd: workspace,
+  });
+
+  const selected = await closestExistingBase(workspace, worker, [oldMain, intermediate], {
+    preferredBase: oldMain,
+  });
+  assert.equal(selected, intermediate,
+    "a more distant per-ref old tip must not beat the adjacent pre-run boundary");
+  const commits = await committedDelta(workspace, {
+    head: oldMain,
+    headRef: "refs/heads/main",
+    refs: { "refs/heads/main": oldMain, "refs/heads/pre-existing-source": intermediate },
+    fetchHeads: [],
+  }, {
+    head: worker,
+    headRef: "refs/heads/main",
+    refs: { "refs/heads/main": worker, "refs/heads/pre-existing-source": intermediate },
+    fetchHeads: [],
+  });
+  assert.equal(commits.newCommitCount, 1, commits.log);
+  assert.match(commits.log, /worker commit after adjacent baseline/u);
+  assert.doesNotMatch(commits.log, /pre-existing intermediate commit/u);
+  assert.match(commits.diffStat, /adjacent-worker\.txt/u);
+  assert.doesNotMatch(commits.diffStat, /pre-existing-source\.txt/u);
+});
+
+test("a merge prefers the moved ref's equally adjacent previous tip", async (context) => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), "cli-agent-merge-boundary-test-"));
+  const workspace = path.join(tempRoot, "workspace");
+  await mkdir(workspace);
+  await initializeFixtureRepository(workspace);
+  context.after(() => rm(tempRoot, { recursive: true, force: true }));
+
+  await execFileAsync("git", ["checkout", "-b", "merge-side"], { cwd: workspace });
+  await writeFile(path.join(workspace, "merge-side.txt"), "side history\n");
+  await execFileAsync("git", ["add", "merge-side.txt"], { cwd: workspace });
+  await execFileAsync("git", ["commit", "-m", "pre-existing merge side"], { cwd: workspace });
+  const { stdout: sideText } = await execFileAsync("git", ["rev-parse", "HEAD"], {
+    cwd: workspace,
+  });
+  const side = sideText.trim();
+  await execFileAsync("git", ["checkout", "main"], { cwd: workspace });
+  await writeFile(path.join(workspace, "main-before-merge.txt"), "main history\n");
+  await execFileAsync("git", ["add", "main-before-merge.txt"], { cwd: workspace });
+  await execFileAsync("git", ["commit", "-m", "pre-existing main tip"], { cwd: workspace });
+  const { stdout: mainText } = await execFileAsync("git", ["rev-parse", "HEAD"], {
+    cwd: workspace,
+  });
+  const main = mainText.trim();
+  await execFileAsync("git", ["merge", "--no-ff", "merge-side", "-m", "worker merge commit"], {
+    cwd: workspace,
+  });
+  const { stdout: mergeText } = await execFileAsync("git", ["rev-parse", "HEAD"], {
+    cwd: workspace,
+  });
+  const merge = mergeText.trim();
+
+  const selected = await closestExistingBase(workspace, merge, [main, side], {
+    preferredBase: main,
+  });
+  assert.equal(selected, main,
+    "the moved ref's old tip must win when both merge parents are equally adjacent");
+  const commits = await committedDelta(workspace, {
+    head: main,
+    headRef: "refs/heads/main",
+    refs: { "refs/heads/main": main, "refs/heads/merge-side": side },
+    fetchHeads: [],
+  }, {
+    head: merge,
+    headRef: "refs/heads/main",
+    refs: { "refs/heads/main": merge, "refs/heads/merge-side": side },
+    fetchHeads: [],
+  });
+  assert.equal(commits.newCommitCount, 1, commits.log);
+  assert.match(commits.log, /worker merge commit/u);
+  assert.match(commits.diffStat, /merge-side\.txt/u);
+  assert.doesNotMatch(commits.diffStat, /main-before-merge\.txt/u);
+});
+
+test("a non-ancestral force-moved ref uses the closest pre-run lineage", async (context) => {
   const { workspace, client } = await makeHarness(context);
-  await execFileAsync("git", ["branch", "force-target"], { cwd: workspace });
+  await execFileAsync("git", ["checkout", "-b", "force-target"], { cwd: workspace });
+  await writeFile(path.join(workspace, "old-target-only.txt"), "old target history\n");
+  await execFileAsync("git", ["add", "old-target-only.txt"], { cwd: workspace });
+  await execFileAsync("git", ["commit", "-m", "pre-existing force target"], { cwd: workspace });
+  await execFileAsync("git", ["checkout", "main"], { cwd: workspace });
   await execFileAsync("git", ["checkout", "-b", "source-lineage"], { cwd: workspace });
   await writeFile(path.join(workspace, "source-only.txt"), "pre-existing source history\n");
   await execFileAsync("git", ["add", "source-only.txt"], { cwd: workspace });
@@ -2973,6 +3219,7 @@ test("a force-moved ref diffs from an ancestral pre-run baseline", async (contex
   assert.match(out.commits.diffStat, /forced-worker\.txt/u);
   assert.doesNotMatch(out.commits.diffStat, /source-only\.txt/u,
     "the old non-ancestral ref tip must not be used as the diff base");
+  assert.doesNotMatch(out.commits.diffStat, /old-target-only\.txt/u);
 });
 
 test("linked worktrees sharing Git refs serialize across server processes", async (context) => {

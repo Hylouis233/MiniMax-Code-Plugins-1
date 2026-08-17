@@ -53,6 +53,9 @@ inside the target git repository, and their results come back as a git diff for 
 - Run parallel comparison workers in separate clean clones at the same starting commit. Linked
   worktrees share refs and intentionally serialize; a second run in one checkout also inherits the
   first run's edits and is not independent.
+- Production delegation and workspace inspection require Windows Job Object containment. Linux,
+  macOS, and BSD return an unsupported result before backend configuration, workspace access, Git
+  resolution, or executable probing; do not bypass this lifecycle safety gate.
 - Timeouts: the default is 20 minutes; adjust timeoutMs for very large tasks. The deadline includes
   lock acquisition, preflight Git checks, the worker, and post-run snapshots. A
   timed-out worker has its complete process tree terminated before the lock is released; safe

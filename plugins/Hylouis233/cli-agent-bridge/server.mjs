@@ -43,6 +43,7 @@ const MAX_TRACE_EVENT_CHARS = 256_000;
 const TRACE_PARSE_YIELD_CHARS = 64 * 1024;
 const TRACE_CLEANUP_TIMEOUT_MS = 1_000;
 const backgroundFinalizers = new Set();
+let quarantineReadTestCallCount = 0;
 const RAW_TAIL_CHARS = 60_000;
 const FETCH_PROVENANCE_TIPS = Symbol("fetchProvenanceTips");
 const QUARANTINE_RECORD_FILE = "record.json";
@@ -53,9 +54,18 @@ const TEST_RUNTIME_PLATFORM = process.env.NODE_ENV === "test"
 const RUNTIME_PLATFORM = ["darwin", "freebsd", "linux", "win32"].includes(TEST_RUNTIME_PLATFORM)
   ? TEST_RUNTIME_PLATFORM
   : process.platform;
+// Deliberate double gate: NODE_ENV=test alone never enables an unsupported
+// production platform, and the explicit flag is honored only by test builds.
+const PROCESS_TREE_TEST_MODE = process.env.NODE_ENV === "test" &&
+  process.env.CLI_AGENT_BRIDGE_TEST_PROCESS_TREE_MODE === "1";
 
 function supportsReliableProcessContainment(platform = RUNTIME_PLATFORM) {
-  return platform === "linux" || platform === "win32";
+  return platform === "win32" || PROCESS_TREE_TEST_MODE;
+}
+
+function unsupportedPlatformMessage(operation) {
+  return operation + " is unsupported on " + RUNTIME_PLATFORM +
+    ": reliable worker and Git-helper lifecycle containment is available only on Windows";
 }
 
 function trustedWindowsPowerShell() {
@@ -673,6 +683,12 @@ function interruptibleFilesystemOperation(operation, { cancel = null, deadline =
   if (deadline !== null && Date.now() >= deadline) {
     return Promise.reject(new DeadlineExceededError("delegation deadline exceeded"));
   }
+  let pending;
+  try {
+    pending = typeof operation === "function" ? operation() : operation;
+  } catch (error) {
+    return Promise.reject(error);
+  }
   return new Promise((resolve, reject) => {
     let settled = false;
     let timer = null;
@@ -692,7 +708,7 @@ function interruptibleFilesystemOperation(operation, { cancel = null, deadline =
         reject, new DeadlineExceededError("delegation deadline exceeded"),
       ), Math.max(0, deadline - Date.now()));
     }
-    Promise.resolve(operation).then(
+    Promise.resolve(pending).then(
       (value) => finish(resolve, value),
       (error) => finish(reject, error),
     );
@@ -1728,27 +1744,66 @@ export async function populateCommitishCache(worktreeRoot, oids, cache, options 
 
 export async function closestExistingBase(worktreeRoot, target, baselineCommits, options = {}) {
   if (baselineCommits.length === 0) return null;
+  const { preferredBase = null, ...gitOptions } = options;
   // One boundary walk finds the pre-run commits immediately adjacent to the
   // target's new history. Supplying exclusions on stdin avoids command-line
   // limits and, unlike one merge-base/rev-list process per ref, keeps Git
   // process count constant even for repositories with thousands of tips.
   const walk = await runGitCommand([
-    "rev-list", "--topo-order", "--boundary", target, "--stdin",
+    "rev-list", "--topo-order", "--boundary", "--parents", target, "--stdin",
   ], {
     cwd: worktreeRoot,
-    ...options,
+    ...gitOptions,
     stdinText: baselineCommits.map((commit) => "^" + commit).join("\n") + "\n",
   });
   const failure = snapshotFailure("git rev-list --boundary " + target, walk);
   if (failure) throw new Error("cannot select committed-delta baseline: " + failure);
+  const parents = new Map();
+  const boundaries = [];
   for (const line of String(walk.stdout ?? "").split(/\r?\n/u)) {
-    if (!line.startsWith("-")) continue;
-    const boundary = line.slice(1).trim();
-    if (/^[0-9a-f]{40,64}$/u.test(boundary)) return boundary;
+    if (!line) continue;
+    const fields = line.trim().split(/\s+/u);
+    const isBoundary = fields[0].startsWith("-");
+    const commit = isBoundary ? fields[0].slice(1) : fields[0];
+    if (!/^[0-9a-f]{40,64}$/u.test(commit)) continue;
+    parents.set(commit, fields.slice(1).filter((oid) => /^[0-9a-f]{40,64}$/u.test(oid)));
+    if (isBoundary) boundaries.push(commit);
   }
+  if (boundaries.length === 0) return null;
+
+  // Boundary output is topological, not a distance ordering. Find the nearest
+  // excluded commits from the target so a more distant old ref tip cannot pull
+  // pre-existing intermediate history into the stat. When several boundaries
+  // are equally close (for example both parents of a merge), prefer this ref's
+  // own previous tip to report what the merge introduced into that ref.
+  const boundarySet = new Set(boundaries);
+  const distances = new Map([[target, 0]]);
+  const queue = [target];
+  for (let index = 0; index < queue.length; index += 1) {
+    const commit = queue[index];
+    const distance = distances.get(commit);
+    for (const parent of parents.get(commit) ?? []) {
+      if (distances.has(parent)) continue;
+      distances.set(parent, distance + 1);
+      if (!boundarySet.has(parent)) queue.push(parent);
+    }
+  }
+  let nearestDistance = Number.POSITIVE_INFINITY;
+  let nearest = [];
+  for (const boundary of boundaries) {
+    const distance = distances.get(boundary) ?? Number.POSITIVE_INFINITY;
+    if (distance < nearestDistance) {
+      nearestDistance = distance;
+      nearest = [boundary];
+    } else if (distance === nearestDistance) {
+      nearest.push(boundary);
+    }
+  }
+  if (nearest.includes(preferredBase)) return preferredBase;
+  if (nearest.length > 0 && Number.isFinite(nearestDistance)) return nearest[0];
   // Disjoint histories have no excluded boundary; callers use the empty tree
   // so the stat still represents the newly reachable target history.
-  return null;
+  return boundaries[0];
 }
 
 export async function committedDelta(worktreeRoot, before, after, options = {}) {
@@ -1893,16 +1948,19 @@ export async function committedDelta(worktreeRoot, before, after, options = {}) 
         attributedCommits.set(oid, { oid, subject, labels: new Set(labels) });
       }
     }
-    // Diff from the closest ancestral pre-run tip, even for an existing ref.
-    // A force update can move a ref onto a pre-existing descendant lineage;
-    // using its older (but still ancestral) tip would attribute that lineage's
-    // already-existing changes to the worker.
+    // Prefer an existing ref's own old tip when it is one of the target's
+    // adjacent pre-run boundaries. A merge can have several such parents, and
+    // choosing whichever rev-list prints first can omit the merged side. If a
+    // different pre-run tip lies between the old ref and target, use that
+    // closer boundary so already-existing intermediate history stays out.
     let base;
     const previousTarget = beforeOid
       ? await peelCommitish(worktreeRoot, beforeOid, cache, options)
       : null;
     if (baselineCommits.length > 0) {
-      base = await closestExistingBase(worktreeRoot, target, baselineCommits, options) ?? await emptyTree();
+      base = await closestExistingBase(worktreeRoot, target, baselineCommits, {
+        ...options, preferredBase: previousTarget,
+      }) ?? await emptyTree();
     } else if (previousTarget) {
       base = previousTarget;
     } else {
@@ -1966,6 +2024,19 @@ export function backendEntryFromProbe(name, spec, check) {
 }
 
 async function listBackends(cancel = null) {
+  if (!supportsReliableProcessContainment()) {
+    return [{
+      name: "unsupported-platform",
+      label: "Unsupported platform",
+      command: "",
+      available: false,
+      experimental: false,
+      version: null,
+      error: unsupportedPlatformMessage("list_backends"),
+      resumeSupported: false,
+      notes: "No backend configuration or executable was inspected.",
+    }];
+  }
   const backends = await loadBackends();
   const entries = [];
   for (const [name, spec] of Object.entries(backends)) {
@@ -1973,20 +2044,6 @@ async function listBackends(cancel = null) {
     // the discovery call, terminating the current probe and skipping the rest.
     if (cancel?.cancelled) break;
     if (!spec || typeof spec.command !== "string") continue;
-    if (!supportsReliableProcessContainment()) {
-      entries.push({
-        name,
-        label: typeof spec.label === "string" ? spec.label : name,
-        command: spec.command,
-        available: false,
-        experimental: Boolean(spec.experimental),
-        version: null,
-        error: "unsupported platform: reliable descendant containment is available only on Windows and Linux",
-        resumeSupported: Array.isArray(spec.resumeArgs),
-        notes: typeof spec.notes === "string" ? spec.notes : "",
-      });
-      continue;
-    }
     let resolvedCommand;
     try {
       resolvedCommand = await resolveBackendCommand(spec.command, { cancel });
@@ -2031,26 +2088,41 @@ function workspaceQuarantineRecoveryPath(quarantineRoot, key) {
   return workspaceQuarantinePath(quarantineRoot, key) + ".recovery-approved";
 }
 
-async function readWorkspaceQuarantine(quarantineRoot, key) {
+export async function readWorkspaceQuarantine(quarantineRoot, key, options = {}) {
+  const fsOps = options.fsOps ?? { stat, readFile, realpath };
+  const step = (operation) => interruptibleFilesystemOperation(operation, options);
   const quarantinePath = workspaceQuarantinePath(quarantineRoot, key);
   try {
-    const marker = await stat(quarantinePath);
+    if (process.env.NODE_ENV === "test") {
+      const delayMs = Number(process.env.CLI_AGENT_BRIDGE_TEST_QUARANTINE_READ_DELAY_MS ?? 0);
+      const targetCall = Number(process.env.CLI_AGENT_BRIDGE_TEST_QUARANTINE_READ_DELAY_CALL ?? 0);
+      const currentCall = ++quarantineReadTestCallCount;
+      if (delayMs > 0 && (!Number.isInteger(targetCall) || targetCall <= 0 ||
+          currentCall === targetCall)) {
+        const startedFile = process.env.CLI_AGENT_BRIDGE_TEST_QUARANTINE_READ_STARTED_FILE;
+        if (startedFile) await writeFile(startedFile, "started\n").catch(() => {});
+        await step(() => new Promise((resolve) => setTimeout(resolve, delayMs)));
+      }
+    }
+    const marker = await step(() => fsOps.stat(quarantinePath));
     let raw = null;
     if (marker.isDirectory()) {
       try {
-        raw = await readFile(path.join(quarantinePath, QUARANTINE_RECORD_FILE), "utf8");
+        raw = await step(() => fsOps.readFile(
+          path.join(quarantinePath, QUARANTINE_RECORD_FILE), "utf8",
+        ));
       } catch (error) {
         if (error.code !== "ENOENT") throw error;
       }
     } else if (marker.isFile()) {
       // Compatibility with quarantine marker files created by older bridges.
-      raw = await readFile(quarantinePath, "utf8");
+      raw = await step(() => fsOps.readFile(quarantinePath, "utf8"));
     }
     let details;
     try {
       details = typeof raw === "string" ? JSON.parse(raw) : { error: "invalid quarantine record" };
     } catch { details = { error: "invalid quarantine record" }; }
-    return { quarantinePath: await realpath(quarantinePath), details };
+    return { quarantinePath: await step(() => fsOps.realpath(quarantinePath)), details };
   } catch (error) {
     if (error.code === "ENOENT") return null;
     throw error;
@@ -2061,23 +2133,30 @@ async function readWorkspaceQuarantine(quarantineRoot, key) {
 // inference from an absent temporary file. The random id binds authorization
 // to the exact quarantined lease and prevents a stale approval from carrying
 // over to a later incident.
-async function quarantineRecoveryApproved(quarantineRoot, key, owner) {
+async function quarantineRecoveryApproved(quarantineRoot, key, owner, options = {}) {
+  const step = (operation) => interruptibleFilesystemOperation(operation, options);
   try {
     const recoveryPath = workspaceQuarantineRecoveryPath(quarantineRoot, key);
-    const marker = await stat(recoveryPath);
+    const marker = await step(() => stat(recoveryPath));
     const raw = marker.isDirectory()
-      ? await readFile(path.join(recoveryPath, QUARANTINE_RECORD_FILE), "utf8")
-      : await readFile(recoveryPath, "utf8");
+      ? await step(() => readFile(path.join(recoveryPath, QUARANTINE_RECORD_FILE), "utf8"))
+      : await step(() => readFile(recoveryPath, "utf8"));
     const record = JSON.parse(raw);
     return typeof owner?.quarantineId === "string" &&
       record?.quarantineId === owner.quarantineId;
-  } catch {
+  } catch (error) {
+    if (error instanceof OperationCancelledError || error instanceof DeadlineExceededError) {
+      throw error;
+    }
     return false;
   }
 }
 
-async function clearQuarantineRecoveryApproval(quarantineRoot, key) {
-  await rm(workspaceQuarantineRecoveryPath(quarantineRoot, key), { recursive: true, force: true });
+async function clearQuarantineRecoveryApproval(quarantineRoot, key, options = {}) {
+  await interruptibleFilesystemOperation(
+    () => rm(workspaceQuarantineRecoveryPath(quarantineRoot, key), { recursive: true, force: true }),
+    options,
+  );
 }
 
 export async function markWorkspaceQuarantined(
@@ -2293,6 +2372,14 @@ async function withWorkspaceLock(key, lockStoreRoot, fn, {
     }
     if (typeof onAcquired === "function") await onAcquired(lease);
     return await fn(lease);
+  } catch (error) {
+    if (error instanceof OperationCancelledError) {
+      return typeof onCancelled === "function" ? onCancelled() : undefined;
+    }
+    if (error instanceof DeadlineExceededError) {
+      return typeof onDeadline === "function" ? onDeadline() : undefined;
+    }
+    throw error;
   } finally {
     try {
       if (lease) {
@@ -2434,6 +2521,26 @@ function quarantinedWorkspaceStatus(id, { workspacePath = "", worktreeRoot = "" 
 }
 
 async function delegateTask(rawArgs, cancel) {
+  if (!supportsReliableProcessContainment()) {
+    return {
+      ok: false,
+      error: unsupportedPlatformMessage("delegate_task"),
+      backend: typeof rawArgs?.backend === "string" ? rawArgs.backend.trim() : "",
+      workspacePath: typeof rawArgs?.workspacePath === "string" ? rawArgs.workspacePath : "",
+      worktreeRoot: "",
+      exitCode: null,
+      timedOut: false,
+      killed: false,
+      cancelled: false,
+      treeTerminated: true,
+      outputTail: "",
+      stderrTail: "",
+      gitBefore: null,
+      git: null,
+      commits: null,
+      experimental: false,
+    };
+  }
   const hasTimeout = Boolean(rawArgs && Object.prototype.hasOwnProperty.call(rawArgs, "timeoutMs"));
   if (hasTimeout && (!Number.isInteger(rawArgs.timeoutMs) ||
       rawArgs.timeoutMs < MIN_TIMEOUT_MS || rawArgs.timeoutMs > MAX_TIMEOUT_MS)) {
@@ -2455,27 +2562,6 @@ async function delegateTask(rawArgs, cancel) {
   }
   if (typeof rawArgs.task !== "string" || !rawArgs.task.trim()) {
     throw new Error("task must be a non-empty string");
-  }
-  if (!supportsReliableProcessContainment()) {
-    return {
-      ok: false,
-      error: "delegate_task is unsupported on " + RUNTIME_PLATFORM +
-        ": reliable descendant containment is available only on Windows and Linux",
-      backend,
-      workspacePath: typeof rawArgs.workspacePath === "string" ? rawArgs.workspacePath : "",
-      worktreeRoot: "",
-      exitCode: null,
-      timedOut: false,
-      killed: false,
-      cancelled: false,
-      treeTerminated: true,
-      outputTail: "",
-      stderrTail: "",
-      gitBefore: null,
-      git: null,
-      commits: null,
-      experimental: Boolean(spec.experimental),
-    };
   }
   let backendCommand;
   try {
@@ -2553,33 +2639,39 @@ async function delegateTask(rawArgs, cancel) {
   }
   const lockKey = repositoryAccess.key;
   try {
-    const existingQuarantine = await readWorkspaceQuarantine(quarantineRoot, lockKey);
+    const existingQuarantine = await readWorkspaceQuarantine(
+      quarantineRoot, lockKey, { cancel, deadline },
+    );
     if (quarantinedWorkspaces.has(lockKey) || existingQuarantine) {
       return quarantinedDelegation({ backend, workspacePath, worktreeRoot, spec }, existingQuarantine);
     }
     let observedQuarantine = null;
     return await withWorkspaceLock(lockKey, lockStoreRoot, async (workspaceLease) => {
-    const sharedQuarantine = await readWorkspaceQuarantine(quarantineRoot, lockKey);
-    if (quarantinedWorkspaces.has(lockKey) || sharedQuarantine) {
-      return quarantinedDelegation({ backend, workspacePath, worktreeRoot, spec }, sharedQuarantine);
-    }
-    if (cancel && cancel.cancelled) {
-      return cancelledDelegation({ backend, workspacePath, worktreeRoot, spec });
-    }
-    let gitProcessQuarantine = null;
-    const quarantineGitProcessTree = async ({ label, terminationError }) => {
-      gitProcessQuarantine ??= await quarantineLeaseForProcessTree({
-        quarantineRoot,
-        lockKey,
-        workspaceLease,
-        backend: label,
-        workspacePath,
-        worktreeRoot,
-        terminationError,
-      });
-      return gitProcessQuarantine;
-    };
-    const allowDirty = rawArgs.allowDirty === true;
+      const sharedQuarantine = await readWorkspaceQuarantine(
+        quarantineRoot, lockKey, { cancel, deadline },
+      );
+      if (quarantinedWorkspaces.has(lockKey) || sharedQuarantine) {
+        return quarantinedDelegation(
+          { backend, workspacePath, worktreeRoot, spec }, sharedQuarantine,
+        );
+      }
+      if (cancel && cancel.cancelled) {
+        return cancelledDelegation({ backend, workspacePath, worktreeRoot, spec });
+      }
+      let gitProcessQuarantine = null;
+      const quarantineGitProcessTree = async ({ label, terminationError }) => {
+        gitProcessQuarantine ??= await quarantineLeaseForProcessTree({
+          quarantineRoot,
+          lockKey,
+          workspaceLease,
+          backend: label,
+          workspacePath,
+          worktreeRoot,
+          terminationError,
+        });
+        return gitProcessQuarantine;
+      };
+      const allowDirty = rawArgs.allowDirty === true;
     // Attribution window for concurrency disclosure: everything between the
     // before-snapshot and the after-snapshot.
     const attributionWindowStart = Date.now();
@@ -2944,17 +3036,29 @@ async function delegateTask(rawArgs, cancel) {
       onCancelled: () => cancelledDelegation({ backend, workspacePath, worktreeRoot, spec }),
       onDeadline: () => lockDeadlineDelegation({ backend, workspacePath, worktreeRoot, spec }),
       operatorRecoveryApproved: (owner) => quarantineRecoveryApproved(
-        quarantineRoot, lockKey, owner,
+        quarantineRoot, lockKey, owner, { cancel, deadline },
       ),
-      onAcquired: () => clearQuarantineRecoveryApproval(quarantineRoot, lockKey),
+      onAcquired: () => clearQuarantineRecoveryApproval(
+        quarantineRoot, lockKey, { cancel, deadline },
+      ),
       isUnavailable: async () => {
-        observedQuarantine = await readWorkspaceQuarantine(quarantineRoot, lockKey);
+        observedQuarantine = await readWorkspaceQuarantine(
+          quarantineRoot, lockKey, { cancel, deadline },
+        );
         return quarantinedWorkspaces.has(lockKey) || Boolean(observedQuarantine);
       },
       onUnavailable: () => quarantinedDelegation(
         { backend, workspacePath, worktreeRoot, spec }, observedQuarantine,
       ),
     });
+  } catch (error) {
+    if (error instanceof OperationCancelledError) {
+      return cancelledDelegation({ backend, workspacePath, worktreeRoot, spec });
+    }
+    if (error instanceof DeadlineExceededError) {
+      return lockDeadlineDelegation({ backend, workspacePath, worktreeRoot, spec });
+    }
+    throw error;
   } finally {
     await repositoryAccess.close().catch(() => {});
   }
@@ -3134,8 +3238,7 @@ async function handleMessage(message) {
           if (!supportsReliableProcessContainment()) {
             const out = {
               ok: false,
-              error: "workspace_status is unsupported on " + RUNTIME_PLATFORM +
-                ": reliable Git helper containment is available only on Windows and Linux",
+              error: unsupportedPlatformMessage("workspace_status"),
               cancelled: false,
               workspacePath: typeof args.workspacePath === "string" ? args.workspacePath : "",
               worktreeRoot: "",
@@ -3176,7 +3279,9 @@ async function handleMessage(message) {
             }
             if (cancel.cancelled) return cancelledWorkspaceStatus(message.id, { workspacePath, worktreeRoot });
             const lockKey = repositoryAccess.key;
-            const existingQuarantine = await readWorkspaceQuarantine(quarantineRoot, lockKey);
+            const existingQuarantine = await readWorkspaceQuarantine(
+              quarantineRoot, lockKey, { cancel },
+            );
             if (quarantinedWorkspaces.has(lockKey) || existingQuarantine) {
               return quarantinedWorkspaceStatus(
                 message.id, { workspacePath, worktreeRoot }, existingQuarantine,
@@ -3184,7 +3289,9 @@ async function handleMessage(message) {
             }
             let observedQuarantine = null;
             return await withWorkspaceLock(lockKey, lockStoreRoot, async (workspaceLease) => {
-              const sharedQuarantine = await readWorkspaceQuarantine(quarantineRoot, lockKey);
+              const sharedQuarantine = await readWorkspaceQuarantine(
+                quarantineRoot, lockKey, { cancel },
+              );
               if (quarantinedWorkspaces.has(lockKey) || sharedQuarantine) {
                 return quarantinedWorkspaceStatus(
                   message.id, { workspacePath, worktreeRoot }, sharedQuarantine,
@@ -3230,17 +3337,26 @@ async function handleMessage(message) {
               cancel,
               onCancelled: () => cancelledWorkspaceStatus(message.id, { workspacePath, worktreeRoot }),
               operatorRecoveryApproved: (owner) => quarantineRecoveryApproved(
-                quarantineRoot, lockKey, owner,
+                quarantineRoot, lockKey, owner, { cancel },
               ),
-              onAcquired: () => clearQuarantineRecoveryApproval(quarantineRoot, lockKey),
+              onAcquired: () => clearQuarantineRecoveryApproval(
+                quarantineRoot, lockKey, { cancel },
+              ),
               isUnavailable: async () => {
-                observedQuarantine = await readWorkspaceQuarantine(quarantineRoot, lockKey);
+                observedQuarantine = await readWorkspaceQuarantine(
+                  quarantineRoot, lockKey, { cancel },
+                );
                 return quarantinedWorkspaces.has(lockKey) || Boolean(observedQuarantine);
               },
               onUnavailable: () => quarantinedWorkspaceStatus(
                 message.id, { workspacePath, worktreeRoot }, observedQuarantine,
               ),
             });
+          } catch (error) {
+            if (error instanceof OperationCancelledError) {
+              return cancelledWorkspaceStatus(message.id, { workspacePath, worktreeRoot });
+            }
+            throw error;
           } finally {
             await repositoryAccess?.close().catch(() => {});
             finishRequest();

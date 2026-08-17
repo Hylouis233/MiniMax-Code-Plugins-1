@@ -48,11 +48,12 @@ repository lock; use separate clones when the comparison must run in parallel.
 
 - Node.js 20 or newer to run the MCP server (the server has no npm dependencies).
 - git available on PATH; the target workspace must be a git repository.
-- Supported operating systems: Windows and Linux. The server is plain Node.js; on Windows,
-  delegated workers run inside a kill-on-close Job Object. End-to-end verified on
-  Windows (Claude Code 2.1.226, Kimi Code 0.30.0) and validated on Linux in a Node 22 container.
-  macOS/BSD fail closed before Git or backend launch because this dependency-free server cannot
-  prove containment of a child that clears its environment and escapes its original session.
+- Production delegation and workspace inspection are supported on Windows, where delegated
+  workers and potentially extensible Git helpers run inside a kill-on-close Job Object.
+  End-to-end verified with Claude Code 2.1.226 and Kimi Code 0.30.0. Linux, macOS, and BSD fail
+  closed before backend configuration, workspace access, Git resolution, or executable probing:
+  this dependency-free server cannot prove lifecycle containment after an arbitrary local worker
+  asks a host service to launch a process outside its original process tree.
 - Each backend CLI must be installed, on PATH, and signed in with your own account before use:
 
 | Backend | CLI | Status | Headless form used |
@@ -123,9 +124,9 @@ you already obtained a valid ID from that backend outside this Plugin.
   Git-ref compare-and-swap in a private bare repository at
   `<git-common-dir>/cli-agent-bridge-lock-store.git`. Keeping coordination refs out of the target
   repository prevents `git push --mirror` from publishing host/process/token metadata.
-  On Linux, the private store publishes its persistent UUID through an exclusive ordinary-file
-  compatibility anchor and the same-value UUID blob behind a create-only Git-ref CAS, without
-  requiring hard-link support. The bridge keeps a common-directory handle open through release. Renaming the repository
+  The private store publishes its persistent UUID through an exclusive ordinary-file compatibility
+  anchor and the same-value UUID blob behind a create-only Git-ref CAS, without requiring hard-link
+  support. The bridge keeps a common-directory handle open through release. Renaming the repository
   therefore cannot create a second lock domain or strand the original holder on its obsolete
   pathname, while deleting and recreating a repository cannot inherit the old lock identity. A stale
   idle lock is reclaimed only when its same-host owner is positively
@@ -133,8 +134,8 @@ you already obtained a valid ID from that backend outside this Plugin.
   pin the queue. The host identity also includes the OS user, so another user cannot interpret a
   user-scoped quarantine marker as cleared. Malformed, foreign-user/host, starting, running, or
   uncertain records fail closed.
-  A crashed bridge cannot reconstruct descendants that escaped into another POSIX session from the
-  recorded worker PID alone, so inspect leftover processes before clearing its coordination ref.
+  A crashed bridge can interrupt the durable state transition that follows worker cleanup, so inspect
+  the recorded process identity before clearing its coordination ref.
 - Linked worktrees share refs and therefore intentionally share one repository lock. The
   `repositoryConcurrency` field remains as a fail-safe disclosure if an older bridge instance or
   an external writer updates bridge history during a snapshot, but current bridge instances do
@@ -151,18 +152,9 @@ you already obtained a valid ID from that backend outside this Plugin.
   For these reasons workspace_status is not marked
   read-only in its MCP annotations even though the snapshot itself does not edit worktree files.
 - Cancellation and timeout confirm that the delegated process tree has exited before releasing
-  the workspace mutex. A lightweight ancestry monitor records descendants that create a new POSIX
-  session/process group so cancellation still terminates them; tracked PIDs are matched against
-  their recorded start identity (process start time on POSIX, creation time on Windows) so a
-  reused PID is never signaled, and a POSIX process group is only signaled while its original
-  leader identity still matches. On Linux, descendants also inherit a per-run environment marker;
-  if the parent exits before ancestry polling, the close path uses a bounded observation grace and
-  marker scans recover children that become visible just after the leader exits, using stable
-  identities from `/proc`. If the kernel exposes tasks but not their `children` files, a verified
-  startup capability check switches to a full PID/PPID snapshot while preserving the same marker
-  and immutable-identity checks. Under extreme Linux process churn, if an identity-stable ancestry
-  sample cannot be completed, the bridge conservatively quarantines the workspace for the same
-  operator-verified manual recovery described below. Repository discovery and read-only snapshots
+  the workspace mutex. On the supported Windows production path, a kill-on-close Job Object is the
+  kernel lifecycle boundary; the bridge does not substitute PID ancestry polling or inherited
+  environment markers on unsupported platforms. Repository discovery and read-only snapshots
   resolve Git before entering the workspace and explicitly disable repository hooks, fsmonitor,
   pagers, external diff drivers, text conversion, and detached automatic maintenance.
   Worktree status and unstaged diff commands are additionally process-contained because Git may
@@ -190,8 +182,6 @@ you already obtained a valid ID from that backend outside this Plugin.
   recovery (including repositories shared deliberately by multiple users). New markers are
   atomically claimed directories, so publication does not depend on hard-link support and the
   reported path is renamed the same way during recovery.
-  On Linux, zombie-only tracked trees count as terminated; zombies cannot edit the workspace and
-  may otherwise persist when container PID 1 does not reap them.
 - Cancelling a workspace_status request interrupts its queued lock wait or Git snapshot and returns
   a cancelled tool result instead of performing a stale snapshot later.
 - timeoutMs is an overall deadline that includes workspace lock acquisition, preflight Git checks,
@@ -232,8 +222,8 @@ They cover the full MCP flow plus in-process and cross-process canonical worktre
 owner compare-and-swap, live-owner non-steal, quarantined-lease recovery after an explicit
 operator approval rename, interruptible lease state updates, shared quarantine markers, queued and
 discovery-phase cancellation (including list_backends probes), overall deadlines, cancel/timeout
-process-tree termination, escaped POSIX descendants and zombie-only Linux groups, PID-reuse
-identity checks before signaling, unusual Git pathnames (including a trailing-space worktree
+Windows Job Object termination, internal fail-closed process-tree state-machine fixtures,
+PID-reuse identity checks before signaling, unusual Git pathnames (including a trailing-space worktree
 root), JSON-RPC id typing, unborn HEAD and non-HEAD ref changes, checkout-only HEAD moves,
 single-count attribution for commits on the checked-out branch, fork-point diff baselines for
 new branches, non-commit refs, fetched-history exclusion, repository-wide serialization and
