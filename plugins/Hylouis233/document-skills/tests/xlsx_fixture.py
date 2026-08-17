@@ -58,13 +58,20 @@ unsafe_wb = openpyxl.Workbook()
 unsafe_wb.active["A1"] = formula_looking
 check("plain assignment is proven unsafe (negative control)", unsafe_wb.active["A1"].data_type == "f")
 
-CSV_FORMULA_PREFIXES = ("=", "+", "-", "@")
+CSV_FORMULA_OPERATORS = ("=", "+", "-", "@", "＝", "＋", "－", "＠")
+
+
+def begins_spreadsheet_formula(value):
+    index = 0
+    while index < len(value) and (ord(value[index]) <= 0x20 or value[index] == "\ufeff"):
+        index += 1
+    return value.startswith(CSV_FORMULA_OPERATORS, index)
 
 
 def spreadsheet_csv_field(value, *, mode="safe"):
     if mode not in {"safe", "raw"}:
         raise ValueError("mode must be 'safe' or 'raw'")
-    if mode == "safe" and isinstance(value, str) and value.startswith(CSV_FORMULA_PREFIXES):
+    if mode == "safe" and isinstance(value, str) and begins_spreadsheet_formula(value):
         return "'" + value
     return value
 
@@ -76,18 +83,27 @@ def delimiter_for(path):
     return delimiter
 
 
-formula_like_fields = ["=1+1", "+SUM(A1:A2)", "-2+3", "@cmd", "plain", "-7", -7]
+formula_like_fields = [
+    "\ufeff=1+1", "=1+1", "+SUM(A1:A2)", "-2+3", "@cmd",
+    "\t=1+1", "\r@cmd", "\n-2+3", "\x00\t +SUM(A1:A2)",
+    "＝1+1", "＋SUM(A1:A2)", "－2+3", "＠cmd", "-7",
+]
+benign_fields = ["plain", -7, "\tplain", "\rplain", "\nplain", "\ufeffplain", "\x00 plain"]
 with open("spreadsheet-safe.csv", "w", newline="", encoding="utf-8") as output:
-    csv.writer(output).writerow([spreadsheet_csv_field(value) for value in formula_like_fields])
-with open("spreadsheet-safe.csv", newline="", encoding="utf-8") as exported:
+    csv.writer(output).writerow([
+        spreadsheet_csv_field(value) for value in formula_like_fields + benign_fields
+    ])
+with open("spreadsheet-safe.csv", newline="", encoding="utf-8-sig") as exported:
     safe_fields = next(csv.reader(exported))
-check("spreadsheet-safe CSV neutralizes all four formula prefixes",
-      safe_fields[:4] == ["'=1+1", "'+SUM(A1:A2)", "'-2+3", "'@cmd"], safe_fields)
+check("spreadsheet-safe CSV neutralizes operator, control, BOM, and fullwidth prefixes",
+      safe_fields[:len(formula_like_fields)]
+      == ["'" + value for value in formula_like_fields], safe_fields)
 check("safe CSV preserves benign text and numeric values",
-      safe_fields[4:] == ["plain", "'-7", "-7"], safe_fields[4:])
+      safe_fields[len(formula_like_fields):]
+      == [str(value) for value in benign_fields], safe_fields)
 check("raw CSV mode preserves exact formula-like literal strings",
-      [spreadsheet_csv_field(value, mode="raw") for value in formula_like_fields[:4]]
-      == formula_like_fields[:4])
+      [spreadsheet_csv_field(value, mode="raw") for value in formula_like_fields]
+      == formula_like_fields)
 try:
     spreadsheet_csv_field("=1+1", mode="unknown")
     invalid_csv_mode_rejected = False
@@ -95,13 +111,18 @@ except ValueError:
     invalid_csv_mode_rejected = True
 check("CSV export rejects an ambiguous safety mode", invalid_csv_mode_rejected)
 
-tabular_rows = [["Region", "Units", "Note"], ["EU, West", 120, "contains\ttab"]]
+tabular_rows = [["Region", "Units", "Note"], ["EU, West", 120, "\t=1+1"]]
+safe_tabular_rows = [
+    [spreadsheet_csv_field(value) for value in row] for row in tabular_rows
+]
 with open("spreadsheet-safe.TSV", "w", newline="", encoding="utf-8") as output:
-    csv.writer(output, delimiter=delimiter_for("spreadsheet-safe.TSV")).writerows(tabular_rows)
+    csv.writer(output, delimiter=delimiter_for("spreadsheet-safe.TSV")).writerows(safe_tabular_rows)
 with open("spreadsheet-safe.TSV", newline="", encoding="utf-8") as exported:
     tsv_rows = list(csv.reader(exported, delimiter="\t"))
 check("TSV export selects a tab delimiter case-insensitively",
-      tsv_rows == [[str(value) for value in row] for row in tabular_rows], tsv_rows)
+      tsv_rows == [[str(value) for value in row] for row in safe_tabular_rows], tsv_rows)
+check("TSV safe mode neutralizes a control-prefixed formula after round-trip",
+      tsv_rows[1][2] == "'\t=1+1", tsv_rows)
 check("CSV export retains its comma delimiter", delimiter_for("output.csv") == ",")
 try:
     delimiter_for("output.txt")

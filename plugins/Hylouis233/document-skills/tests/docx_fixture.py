@@ -9,8 +9,9 @@ import copy
 import os
 import subprocess
 import sys
+import unicodedata
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
 
 import fitz
@@ -57,6 +58,11 @@ MAX_XML_PART = 20 * 1024 * 1024
 MAX_ENTRY = 100 * 1024 * 1024
 MAX_TOTAL_UNCOMPRESSED = 500 * 1024 * 1024
 MAX_COMPRESSION_RATIO = 200
+MAX_MEMBER_COMPONENT_BYTES = 255
+MAX_MEMBER_COMPONENT_UTF16_UNITS = 255
+MAX_MEMBER_PATH_BYTES = 1024
+MAX_MEMBER_PATH_UTF16_UNITS = 240
+MAX_MEMBER_COMPONENTS = 64
 
 
 def require(condition, message):
@@ -962,6 +968,76 @@ plain_doc.add_paragraph("second document")
 plain_doc.save("repack-without-media.docx")
 
 
+WINDOWS_DEVICE_NAMES = {
+    "con", "prn", "aux", "nul", "conin$", "conout$",
+    *(f"com{suffix}" for suffix in "123456789¹²³"),
+    *(f"lpt{suffix}" for suffix in "123456789¹²³"),
+}
+
+
+def extraction_key(name):
+    is_directory = name.endswith("/")
+    path = name[:-1] if is_directory else name
+    require(path and not name.startswith("/") and "\\" not in name,
+            f"non-canonical archive member path: {name}")
+    parts = path.split("/")
+    require(len(parts) <= MAX_MEMBER_COMPONENTS,
+            "archive member depth exceeds portable extraction limit")
+    require(
+        all(
+            part not in {"", ".", ".."}
+            and not any(character in ':<>|"?*' for character in part)
+            and not any(ord(character) < 32 for character in part)
+            and not part.endswith((".", " "))
+            and unicodedata.normalize("NFC", part) == part
+            and part.partition(".")[0].rstrip(" ").casefold() not in WINDOWS_DEVICE_NAMES
+            for part in parts
+        ),
+        f"non-canonical archive member path: {name}",
+    )
+    require(
+        all(
+            len(part.encode("utf-8")) <= MAX_MEMBER_COMPONENT_BYTES
+            and len(part.encode("utf-16-le")) // 2 <= MAX_MEMBER_COMPONENT_UTF16_UNITS
+            for part in parts
+        ),
+        "archive member component exceeds portable extraction limit",
+    )
+    require(len(path.encode("utf-8")) <= MAX_MEMBER_PATH_BYTES
+            and len(path.encode("utf-16-le")) // 2 <= MAX_MEMBER_PATH_UTF16_UNITS,
+            "archive member path exceeds portable extraction limit")
+    canonical = PurePosixPath(*parts).as_posix()
+    require(canonical == path, f"non-canonical archive member path: {name}")
+    key = tuple(unicodedata.normalize("NFC", part.casefold()) for part in parts)
+    return key, tuple(parts), is_directory
+
+
+def validate_extraction_paths(infos):
+    root = {"children": {}, "member": False, "file": False, "spelling": None}
+    for info in infos:
+        key, spellings, is_directory = extraction_key(info.filename)
+        node = root
+        for normalized, spelling in zip(key, spellings):
+            require(not node["file"],
+                    "archive file and directory paths collide after extraction")
+            child = node["children"].get(normalized)
+            if child is None:
+                child = {
+                    "children": {}, "member": False, "file": False,
+                    "spelling": spelling,
+                }
+                node["children"][normalized] = child
+            else:
+                require(child["spelling"] == spelling,
+                        "archive member path spelling collides after extraction")
+            node = child
+        require(not node["member"], "archive member paths collide after extraction")
+        require(is_directory or not node["children"],
+                "archive file and directory paths collide after extraction")
+        node["member"] = True
+        node["file"] = not is_directory
+
+
 def validate_docx_archive_bounds(archive):
     require(os.fstat(archive.fp.fileno()).st_size <= MAX_ARCHIVE_BYTES,
             "compressed DOCX file size above limit")
@@ -969,6 +1045,7 @@ def validate_docx_archive_bounds(archive):
     require(len(infos) <= MAX_MEMBERS, "archive member count above limit")
     names = {info.filename for info in infos}
     require(len(names) == len(infos), "duplicate archive member names are unsafe")
+    validate_extraction_paths(infos)
     require("[Content_Types].xml" in names and "word/document.xml" in names,
             "required DOCX package parts are missing")
     require(sum(info.file_size for info in infos) <= MAX_TOTAL_UNCOMPRESSED,
@@ -1022,6 +1099,147 @@ check("Tier 2 edit rejects an archive bomb before extracting any member",
       edit_bomb_rejected_before_extract)
 check("Tier 2 pre-extract bounds remain active under optimized Python",
       __debug__ or edit_bomb_rejected_before_extract)
+
+with zipfile.ZipFile("noncanonical-member.docx", "w", zipfile.ZIP_STORED) as archive:
+    archive.writestr("[Content_Types].xml", "<Types/>")
+    archive.writestr("word/document.xml", "<canonical/>")
+    archive.writestr("../word/document.xml", "<shadow/>")
+with TemporaryDirectory(prefix="docx-noncanonical-") as scratch:
+    noncanonical_root = Path(scratch)
+    try:
+        repack_tree("noncanonical-member.docx", "noncanonical-output.docx",
+                    noncanonical_root)
+        noncanonical_rejected = False
+    except ValueError as error:
+        noncanonical_rejected = (
+            str(error) == "non-canonical archive member path: ../word/document.xml"
+            and not any(noncanonical_root.iterdir())
+            and not Path("noncanonical-output.docx").exists()
+        )
+check("Tier 2 rejects traversal aliases before they can overwrite a validated part",
+      noncanonical_rejected)
+check("non-canonical member rejection remains active under optimized Python",
+      __debug__ or noncanonical_rejected)
+
+with zipfile.ZipFile("normalized-collision.docx", "w", zipfile.ZIP_STORED) as archive:
+    archive.writestr("[Content_Types].xml", "<Types/>")
+    archive.writestr("word/document.xml", "<document/>")
+    archive.writestr("custom", b"file")
+    archive.writestr("custom/", b"")
+with TemporaryDirectory(prefix="docx-collision-") as scratch:
+    collision_root = Path(scratch)
+    try:
+        repack_tree("normalized-collision.docx", "collision-output.docx", collision_root)
+        normalized_collision_rejected = False
+    except ValueError as error:
+        normalized_collision_rejected = (
+            str(error) == "archive member paths collide after extraction"
+            and not any(collision_root.iterdir())
+            and not Path("collision-output.docx").exists()
+        )
+check("Tier 2 rejects distinct names that normalize to one extraction path",
+      normalized_collision_rejected)
+
+with zipfile.ZipFile("prefix-collision.docx", "w", zipfile.ZIP_STORED) as archive:
+    archive.writestr("[Content_Types].xml", "<Types/>")
+    archive.writestr("word/document.xml", "<document/>")
+    archive.writestr("custom", b"file")
+    archive.writestr("custom/child.bin", b"child")
+with TemporaryDirectory(prefix="docx-prefix-collision-") as scratch:
+    prefix_collision_root = Path(scratch)
+    try:
+        repack_tree("prefix-collision.docx", "prefix-collision-output.docx",
+                    prefix_collision_root)
+        prefix_collision_rejected = False
+    except ValueError as error:
+        prefix_collision_rejected = (
+            str(error) == "archive file and directory paths collide after extraction"
+            and not any(prefix_collision_root.iterdir())
+            and not Path("prefix-collision-output.docx").exists()
+        )
+check("Tier 2 rejects a file path that is also an extracted directory prefix",
+      prefix_collision_rejected)
+
+with zipfile.ZipFile("case-collision.docx", "w", zipfile.ZIP_STORED) as archive:
+    archive.writestr("[Content_Types].xml", "<Types/>")
+    archive.writestr("word/document.xml", "<canonical/>")
+    archive.writestr("WORD/document.xml", "<shadow/>")
+with TemporaryDirectory(prefix="docx-case-collision-") as scratch:
+    case_collision_root = Path(scratch)
+    try:
+        repack_tree("case-collision.docx", "case-collision-output.docx",
+                    case_collision_root)
+        case_collision_rejected = False
+    except ValueError as error:
+        case_collision_rejected = (
+            str(error) == "archive member path spelling collides after extraction"
+            and not any(case_collision_root.iterdir())
+            and not Path("case-collision-output.docx").exists()
+        )
+check("Tier 2 rejects case aliases before Windows extraction can overwrite a part",
+      case_collision_rejected)
+
+with zipfile.ZipFile("prefix-spelling-collision.docx", "w", zipfile.ZIP_STORED) as archive:
+    archive.writestr("[Content_Types].xml", "<Types/>")
+    archive.writestr("word/document.xml", "<document/>")
+    archive.writestr("WORD/styles.xml", "<styles/>")
+with TemporaryDirectory(prefix="docx-prefix-spelling-") as scratch:
+    prefix_spelling_root = Path(scratch)
+    try:
+        repack_tree("prefix-spelling-collision.docx", "prefix-spelling-output.docx",
+                    prefix_spelling_root)
+        prefix_spelling_rejected = False
+    except ValueError as error:
+        prefix_spelling_rejected = (
+            str(error) == "archive member path spelling collides after extraction"
+            and not any(prefix_spelling_root.iterdir())
+            and not Path("prefix-spelling-output.docx").exists()
+        )
+check("Tier 2 rejects case aliases in a shared directory prefix",
+      prefix_spelling_rejected)
+
+with zipfile.ZipFile("overlong-member.docx", "w", zipfile.ZIP_STORED) as archive:
+    archive.writestr("[Content_Types].xml", "<Types/>")
+    archive.writestr("word/document.xml", "<document/>")
+    archive.writestr("word/" + "a" * 256, b"oversized component")
+with TemporaryDirectory(prefix="docx-overlong-member-") as scratch:
+    overlong_root = Path(scratch)
+    try:
+        repack_tree("overlong-member.docx", "overlong-output.docx", overlong_root)
+        overlong_member_rejected = False
+    except ValueError as error:
+        overlong_member_rejected = (
+            str(error) == "archive member component exceeds portable extraction limit"
+            and not any(overlong_root.iterdir())
+            and not Path("overlong-output.docx").exists()
+        )
+check("Tier 2 rejects an unportable component before partial Windows extraction",
+      overlong_member_rejected)
+
+portable_path_limits_rejected = []
+for unsafe_name in (
+    "/".join(["a"] * (MAX_MEMBER_COMPONENTS + 1)),
+    "/".join(["a" * 80] * 4),
+):
+    try:
+        extraction_key(unsafe_name)
+    except ValueError:
+        portable_path_limits_rejected.append(unsafe_name)
+check("portable extraction bounds total path length and component depth",
+      len(portable_path_limits_rejected) == 2)
+
+portable_name_rejections = []
+for unsafe_name in (
+    "/word/document.xml", "word\\document.xml", "word/con.xml", "word/COM¹.xml",
+    "word/LPT².txt", "word/CONIN$.xml", "word/CONOUT$.xml", "word/NUL .xml",
+    "word/trailing. ", "word/cafe\u0301.xml", "word/control\x01.xml",
+):
+    try:
+        extraction_key(unsafe_name)
+    except ValueError:
+        portable_name_rejections.append(unsafe_name)
+check("portable extraction rejects absolute, alternate, device, non-NFC, and control names",
+      len(portable_name_rejections) == 11, portable_name_rejections)
 
 with zipfile.ZipFile("malformed-for-repair.docx", "w", zipfile.ZIP_STORED) as archive:
     archive.writestr("[Content_Types].xml", "<Types/>")

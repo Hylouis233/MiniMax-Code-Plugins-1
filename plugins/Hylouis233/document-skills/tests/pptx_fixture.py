@@ -390,32 +390,158 @@ def picture_content(shape):
     }
 
 
-def cached_numeric_points(source):
+MAX_CHART_POINTS = 100_000
+MAX_CATEGORY_LEVELS = 16
+CATEGORY_SOURCE_NAMES = {"strRef", "numRef", "multiLvlStrRef", "strLit", "numLit"}
+
+
+def cache_point_count(cache):
+    point_counts = cache.findall(qn("c:ptCount"))
+    if len(point_counts) != 1:
+        return None
+    try:
+        point_count = int(point_counts[0].get("val"))
+    except (TypeError, ValueError):
+        return None
+    return point_count if 0 <= point_count <= MAX_CHART_POINTS else None
+
+
+def consume_point_budget(point_budget, count):
+    if count > MAX_CHART_POINTS:
+        return False
+    if point_budget is None:
+        return True
+    if count > point_budget["remaining"]:
+        return False
+    point_budget["remaining"] -= count
+    return True
+
+
+def cached_numeric_points(
+    source, *, fill_missing=False, include_count=False, point_budget=None
+):
     if source is None:
         return None
-    point_counts = source.xpath("./c:numRef/c:numCache/c:ptCount | ./c:numLit/c:ptCount")
-    if not point_counts:
+    caches = source.xpath("./c:numRef/c:numCache | ./c:numLit")
+    if len(caches) != 1 or (point_count := cache_point_count(caches[0])) is None:
         return None
-    points = source.xpath("./c:numRef/c:numCache/c:pt | ./c:numLit/c:pt")
-    return [
-        (int(point.get("idx")), float(value.text))
-        for point in points
-        if point.get("idx") is not None and (value := point.find(qn("c:v"))) is not None
+    cached = {}
+    for point in caches[0].findall(qn("c:pt")):
+        value = point.find(qn("c:v"))
+        try:
+            index = int(point.get("idx"))
+        except (TypeError, ValueError):
+            return None
+        if value is None or not 0 <= index < point_count or index in cached:
+            return None
+        try:
+            parsed = float(value.text) if value.text not in (None, "") else value.text
+        except (TypeError, ValueError):
+            parsed = value.text
+        cached[index] = parsed
+    if fill_missing:
+        if not consume_point_budget(point_budget, point_count):
+            return None
+        points = [(index, cached.get(index)) for index in range(point_count)]
+    else:
+        points = sorted(cached.items())
+    return {"point_count": point_count, "points": points} if include_count else points
+
+
+def cached_text_point_map(container, point_count):
+    values = {}
+    for point in container.findall(qn("c:pt")):
+        try:
+            index = int(point.get("idx"))
+        except (TypeError, ValueError):
+            return None
+        value = point.find(qn("c:v"))
+        if value is None or not 0 <= index < point_count or index in values:
+            return None
+        values[index] = value.text or ""
+    return values
+
+
+def category_source(series):
+    category = series._element.find(qn("c:cat"))
+    if category is None:
+        return None, None
+    sources = [
+        child for child in category
+        if isinstance(child.tag, str)
+        and etree.QName(child).localname in CATEGORY_SOURCE_NAMES
     ]
+    return (category, sources[0]) if len(sources) == 1 else (category, None)
 
 
-def cached_category_labels(plot):
-    category_nodes = plot._element.xpath("./c:ser[1]/c:cat")
-    if not category_nodes:
+def cached_category_labels(series, point_budget=None):
+    category, source = category_source(series)
+    if category is None:
         return []
-    cache_payload = category_nodes[0].xpath(
-        "./c:strRef/c:strCache/c:ptCount | ./c:numRef/c:numCache/c:ptCount | "
-        "./c:multiLvlStrRef/c:multiLvlStrCache/c:ptCount | "
-        "./c:strLit/c:ptCount | ./c:numLit/c:ptCount"
-    )
-    if not cache_payload:
+    if source is None:
         return None
-    return [[str(level) for level in label] for label in plot.categories.flattened_labels]
+    source_name = etree.QName(source).localname
+
+    if source_name == "multiLvlStrRef":
+        caches = source.findall(qn("c:multiLvlStrCache"))
+        if len(caches) != 1 or (count := cache_point_count(caches[0])) is None:
+            return None
+        level_nodes = caches[0].findall(qn("c:lvl"))
+        if len(level_nodes) > MAX_CATEGORY_LEVELS or (count and not level_nodes):
+            return None
+        levels = [cached_text_point_map(level, count) for level in level_nodes]
+        if any(points is None for points in levels):
+            return None
+        if not consume_point_budget(point_budget, count * max(len(level_nodes), 1)):
+            return None
+        expanded_levels = []
+        for level_index, points in enumerate(levels):
+            if level_index == 0:
+                expanded_levels.append([points.get(index, "") for index in range(count)])
+                continue
+            ordered = sorted(points.items())
+            if not ordered:
+                expanded_levels.append([""] * count)
+                continue
+            cursor = 0
+            expanded = []
+            for leaf_index in range(count):
+                while cursor + 1 < len(ordered) and ordered[cursor + 1][0] <= leaf_index:
+                    cursor += 1
+                expanded.append(ordered[cursor][1])
+            expanded_levels.append(expanded)
+        return [
+            [level[index] for level in reversed(expanded_levels)]
+            for index in range(count)
+        ]
+
+    cache_name = {"strRef": "c:strCache", "numRef": "c:numCache"}.get(source_name)
+    if cache_name is None:
+        cache = source
+    else:
+        caches = source.findall(qn(cache_name))
+        if len(caches) != 1:
+            return None
+        cache = caches[0]
+    if (count := cache_point_count(cache)) is None:
+        return None
+    values = cached_text_point_map(cache, count)
+    if values is None:
+        return None
+    if not consume_point_budget(point_budget, count):
+        return None
+    return [[values.get(index, "")] for index in range(count)]
+
+
+def category_content(series, point_budget=None):
+    labels = cached_category_labels(series, point_budget)
+    _, source = category_source(series)
+    formula = None if source is None else source.find(qn("c:f"))
+    return {
+        "categories": labels,
+        "category_formula": formula.text if formula is not None else None,
+        "category_cache_status": "unavailable" if labels is None else "available",
+    }
 
 
 def series_name_content(series):
@@ -442,37 +568,85 @@ def series_name_content(series):
     return {"name": value.text or ""}
 
 
-def series_content(series):
+def series_content(series, *, include_categories=False, point_budget=None):
+    if point_budget is None:
+        point_budget = {"remaining": MAX_CHART_POINTS}
     name_content = series_name_content(series)
+    content = {
+        **name_content,
+        **(category_content(series, point_budget) if include_categories else {}),
+    }
     x_source = getattr(series._element, "xVal", None)
     if x_source is None:
         value_source = getattr(series._element, "val", None)
-        if cached_numeric_points(value_source) is None:
-            return {**name_content, "values": None, "cache_status": "unavailable"}
-        return {**name_content, "values": list(series.values)}
-    x_points = cached_numeric_points(x_source)
-    y_points = cached_numeric_points(getattr(series._element, "yVal", None))
-    if x_points is None or y_points is None:
-        return {**name_content, "points": None, "cache_status": "unavailable"}
-    content = {**name_content, "x_points": x_points, "y_points": y_points}
+        value_cache = cached_numeric_points(
+            value_source, fill_missing=True, include_count=True,
+            point_budget=point_budget,
+        )
+        if value_cache is None:
+            return {**content, "values": None, "cache_status": "unavailable"}
+        return {**content, "values": [value for _, value in value_cache["points"]]}
+    x_cache = cached_numeric_points(x_source, include_count=True)
+    y_cache = cached_numeric_points(
+        getattr(series._element, "yVal", None), include_count=True
+    )
+    if x_cache is None or y_cache is None:
+        return {**content, "points": None, "cache_status": "unavailable"}
+    content.update({
+        "x_points": x_cache["points"], "x_point_count": x_cache["point_count"],
+        "y_points": y_cache["points"], "y_point_count": y_cache["point_count"],
+    })
     size_source = getattr(series._element, "bubbleSize", None)
     if size_source is not None:
-        bubble_points = cached_numeric_points(size_source)
-        if bubble_points is None:
-            return {**name_content, "points": None, "cache_status": "unavailable"}
-        content["bubble_points"] = bubble_points
+        bubble_cache = cached_numeric_points(size_source, include_count=True)
+        if bubble_cache is None:
+            return {**content, "points": None, "cache_status": "unavailable"}
+        content.update({
+            "bubble_points": bubble_cache["points"],
+            "bubble_point_count": bubble_cache["point_count"],
+        })
     return content
 
 
-def chart_axis_titles(chart):
-    titles = {}
-    for label, attribute in (("category", "category_axis"), ("value", "value_axis")):
-        try:
-            axis = getattr(chart, attribute)
-        except (AttributeError, ValueError):
-            continue
-        titles[label] = axis.axis_title.text_frame.text if axis.has_title else ""
-    return titles
+def chart_axis_text(axis):
+    title = axis.find(qn("c:title"))
+    if title is None:
+        return ""
+    rich = title.xpath("./c:tx/c:rich")
+    references = title.xpath("./c:tx/c:strRef")
+    if len(rich) + len(references) != 1:
+        return None
+    if rich:
+        return "\n".join(paragraph.text for paragraph in rich[0].findall(qn("a:p")))
+    caches = references[0].findall(qn("c:strCache"))
+    if (len(caches) != 1 or (count := cache_point_count(caches[0])) is None
+            or count != 1):
+        return None
+    values = cached_text_point_map(caches[0], count)
+    return None if values is None else "\n".join(values.get(index, "") for index in range(count))
+
+
+def chart_axes(chart):
+    axes = chart._element.xpath(
+        "./c:chart/c:plotArea/c:catAx | ./c:chart/c:plotArea/c:dateAx | "
+        "./c:chart/c:plotArea/c:valAx | ./c:chart/c:plotArea/c:serAx"
+    )
+    return [
+        {
+            "kind": etree.QName(axis).localname,
+            "id": axis.find(qn("c:axId")).get("val") if axis.find(qn("c:axId")) is not None else None,
+            "position": (
+                axis.find(qn("c:axPos")).get("val")
+                if axis.find(qn("c:axPos")) is not None else None
+            ),
+            "cross_axis_id": (
+                axis.find(qn("c:crossAx")).get("val")
+                if axis.find(qn("c:crossAx")) is not None else None
+            ),
+            "title": chart_axis_text(axis),
+        }
+        for axis in axes
+    ]
 
 
 DIAGRAM_NS = "http://schemas.openxmlformats.org/drawingml/2006/diagram"
@@ -499,8 +673,10 @@ def smartart_content(shape):
     return {"name": shape.name, "status": "ok", "text": labels}
 
 
-def extract_slide_content(slide):
+def extract_slide_content(slide, point_budget=None):
     shapes = list(iter_shapes(slide.shapes))
+    if point_budget is None:
+        point_budget = {"remaining": MAX_CHART_POINTS}
     text = [sh.text_frame.text for sh in shapes if sh.has_text_frame and sh.text_frame.text]
     tables = [
         table_cells(sh.table)
@@ -519,20 +695,19 @@ def extract_slide_content(slide):
         for plot in chart.plots:
             items = list(plot.series)
             has_xy_values = any(getattr(item._element, "xVal", None) is not None for item in items)
-            categories = [] if has_xy_values else cached_category_labels(plot)
-            series = [series_content(item) for item in items]
+            series = [
+                series_content(
+                    item, include_categories=not has_xy_values, point_budget=point_budget
+                )
+                for item in items
+            ]
             plots.append({
                 "kind": type(plot).__name__,
-                "categories": categories,
-                "category_cache_status": (
-                    "not-applicable" if has_xy_values else
-                    "unavailable" if categories is None else "available"
-                ),
                 "series": series,
             })
         charts.append({
             "title": chart_title,
-            "axis_titles": chart_axis_titles(chart),
+            "axes": chart_axes(chart),
             "plots": plots,
         })
     notes = slide.notes_slide.notes_text_frame.text if slide.has_notes_slide else ""
@@ -555,25 +730,132 @@ check("content inventory emits table cell text",
 check(
     "content inventory emits chart title, categories, series, and values",
     content["charts"][0]["title"] == "Units by region"
-    and content["charts"][0]["plots"][0]["categories"] == [["EU"], ["US"]]
-    and content["charts"][0]["plots"][0]["series"]
-    == [{"name": "Units", "values": [120.0, 80.0]}],
+    and content["charts"][0]["plots"][0]["series"][0]["categories"]
+    == [["EU"], ["US"]]
+    and content["charts"][0]["plots"][0]["series"][0]["category_cache_status"]
+    == "available"
+    and content["charts"][0]["plots"][0]["series"][0]["values"] == [120.0, 80.0],
     content["charts"],
 )
-check("content inventory emits category and value axis titles",
-      content["charts"][0]["axis_titles"]
-      == {"category": "Region", "value": "Units sold"}, content["charts"][0])
+check("content inventory emits raw category and value axis metadata",
+      {axis["title"] for axis in content["charts"][0]["axes"]}
+      == {"Region", "Units sold"}
+      and all(axis["id"] and axis["position"] and axis["cross_axis_id"]
+              for axis in content["charts"][0]["axes"]), content["charts"][0])
+
+secondary_axis_prs = Presentation("input.pptx")
+secondary_axis_chart = next(
+    shape.chart for shape in secondary_axis_prs.slides[0].shapes
+    if shape.has_chart and shape.chart.has_title
+    and shape.chart.chart_title.text_frame.text == "Units by region"
+)
+plot_area = secondary_axis_chart._element.xpath("./c:chart/c:plotArea")[0]
+primary_category_axis = plot_area.find(qn("c:catAx"))
+primary_value_axis = plot_area.find(qn("c:valAx"))
+primary_category_id = primary_category_axis.find(qn("c:axId")).get("val")
+primary_value_id = primary_value_axis.find(qn("c:axId")).get("val")
+secondary_category_id, secondary_value_id = "91000001", "91000002"
+
+secondary_plot = copy.deepcopy(plot_area.xpath("./c:barChart")[0])
+for axis_id in secondary_plot.findall(qn("c:axId")):
+    axis_id.set("val", (
+        secondary_category_id if axis_id.get("val") == primary_category_id
+        else secondary_value_id
+    ))
+first_axis_index = min(plot_area.index(primary_category_axis), plot_area.index(primary_value_axis))
+plot_area.insert(first_axis_index, secondary_plot)
+
+secondary_category_axis = copy.deepcopy(primary_category_axis)
+secondary_category_axis.find(qn("c:axId")).set("val", secondary_category_id)
+secondary_category_axis.find(qn("c:axPos")).set("val", "t")
+secondary_category_axis.find(qn("c:crossAx")).set("val", secondary_value_id)
+secondary_category_text = secondary_category_axis.xpath("./c:title//a:t")[0]
+secondary_category_text.text = "Secondary"
+secondary_category_run = secondary_category_text.getparent()
+secondary_category_break = OxmlElement("a:br")
+secondary_category_tail = OxmlElement("a:r")
+secondary_category_tail_text = OxmlElement("a:t")
+secondary_category_tail_text.text = "region"
+secondary_category_tail.append(secondary_category_tail_text)
+secondary_category_run.addnext(secondary_category_break)
+secondary_category_break.addnext(secondary_category_tail)
+
+secondary_value_axis = copy.deepcopy(primary_value_axis)
+secondary_value_axis.find(qn("c:axId")).set("val", secondary_value_id)
+secondary_value_axis.find(qn("c:axPos")).set("val", "r")
+secondary_value_axis.find(qn("c:crossAx")).set("val", secondary_category_id)
+secondary_title_tx = secondary_value_axis.find(qn("c:title")).find(qn("c:tx"))
+for child in list(secondary_title_tx):
+    secondary_title_tx.remove(child)
+secondary_title_ref = OxmlElement("c:strRef")
+secondary_title_formula = OxmlElement("c:f")
+secondary_title_formula.text = "Sheet1!$F$1"
+secondary_title_cache = OxmlElement("c:strCache")
+secondary_title_count = OxmlElement("c:ptCount")
+secondary_title_count.set("val", "1")
+secondary_title_point = OxmlElement("c:pt")
+secondary_title_point.set("idx", "0")
+secondary_title_value = OxmlElement("c:v")
+secondary_title_value.text = "Percent"
+secondary_title_point.append(secondary_title_value)
+secondary_title_cache.extend([secondary_title_count, secondary_title_point])
+secondary_title_ref.extend([secondary_title_formula, secondary_title_cache])
+secondary_title_tx.append(secondary_title_ref)
+empty_secondary_axis = copy.deepcopy(secondary_value_axis)
+empty_secondary_axis.xpath("./c:title/c:tx/c:strRef/c:strCache/c:pt/c:v")[0].text = None
+check("raw worksheet-backed axis title preserves an explicit empty cache value",
+      chart_axis_text(empty_secondary_axis) == "", chart_axis_text(empty_secondary_axis))
+multi_point_axis = copy.deepcopy(secondary_value_axis)
+multi_point_axis.xpath("./c:title/c:tx/c:strRef/c:strCache/c:ptCount")[0].set("val", "2")
+check("worksheet-backed axis title rejects a non-scalar cache before expansion",
+      chart_axis_text(multi_point_axis) is None)
+
+plot_area.extend([secondary_category_axis, secondary_value_axis])
+secondary_axis_prs.save("secondary-axes.pptx")
+secondary_axis_reopened = Presentation("secondary-axes.pptx")
+secondary_axis_content = extract_slide_content(
+    secondary_axis_reopened.slides[0]
+)["charts"][0]
+secondary_axes = {axis["title"]: axis for axis in secondary_axis_content["axes"]}
+secondary_axis_reopened_chart = next(
+    shape.chart for shape in secondary_axis_reopened.slides[0].shapes
+    if shape.has_chart and shape.chart.has_title
+    and shape.chart.chart_title.text_frame.text == "Units by region"
+)
+secondary_title_refs = secondary_axis_reopened_chart._element.xpath(
+    f'./c:chart/c:plotArea/c:valAx[c:axId[@val="{secondary_value_id}"]]'
+    '/c:title/c:tx/c:strRef'
+)
+check("combination-chart inventory includes all primary and secondary axes",
+      len(secondary_axis_content["plots"]) == 2
+      and set(secondary_axes) == {"Region", "Units sold", "Secondary\vregion", "Percent"}
+      and secondary_axes["Secondary\vregion"] == {
+          "kind": "catAx", "id": secondary_category_id, "position": "t",
+          "cross_axis_id": secondary_value_id, "title": "Secondary\vregion",
+      }
+      and secondary_axes["Percent"] == {
+          "kind": "valAx", "id": secondary_value_id, "position": "r",
+          "cross_axis_id": secondary_category_id, "title": "Percent",
+      }, secondary_axis_content)
+check("raw axis-title inventory preserves a worksheet-backed strRef",
+      len(secondary_title_refs) == 1
+      and secondary_title_refs[0].find(qn("c:f")).text == "Sheet1!$F$1",
+      secondary_title_refs)
 chart_by_title = {item["title"]: item for item in content["charts"]}
 check("content inventory emits XY x/y points",
       chart_by_title["XY trend"]["plots"][0]["series"][0]["x_points"]
       == [(0, 1.0), (1, 3.0)]
+      and chart_by_title["XY trend"]["plots"][0]["series"][0]["x_point_count"] == 2
       and chart_by_title["XY trend"]["plots"][0]["series"][0]["y_points"]
-      == [(0, 2.0), (1, 4.0)])
+      == [(0, 2.0), (1, 4.0)]
+      and chart_by_title["XY trend"]["plots"][0]["series"][0]["y_point_count"] == 2)
 check("content inventory emits bubble x/y/size points",
       chart_by_title["Bubble risk"]["plots"][0]["series"][0]["x_points"] == [(0, 3.0)]
       and chart_by_title["Bubble risk"]["plots"][0]["series"][0]["y_points"] == [(0, 4.0)]
       and chart_by_title["Bubble risk"]["plots"][0]["series"][0]["bubble_points"]
-      == [(0, 5.0)])
+      == [(0, 5.0)]
+      and chart_by_title["Bubble risk"]["plots"][0]["series"][0]["bubble_point_count"]
+      == 1)
 check("content inventory emits notes text", "regional split" in content["notes"], content["notes"])
 
 # Category/value series can retain an external workbook formula without a numCache.
@@ -588,6 +870,20 @@ category_slide.shapes.add_chart(
     Inches(0.5), Inches(0.5), Inches(6), Inches(4), category_data,
 )
 category_prs.save("category-cache-source.pptx")
+
+shared_deck_budget = {"remaining": 10}
+budget_source = Presentation("category-cache-source.pptx").slides[0]
+first_budgeted_slide = extract_slide_content(budget_source, shared_deck_budget)
+second_budgeted_slide = extract_slide_content(budget_source, shared_deck_budget)
+first_budgeted_items = first_budgeted_slide["charts"][0]["plots"][0]["series"]
+second_budgeted_items = second_budgeted_slide["charts"][0]["plots"][0]["series"]
+check("one shared logical-point budget bounds aggregate inventory across slides",
+      all(item["values"] is not None for item in first_budgeted_items)
+      and second_budgeted_items[0]["categories"] == [["A"], ["B"]]
+      and second_budgeted_items[0]["values"] is None
+      and second_budgeted_items[1]["categories"] is None
+      and shared_deck_budget["remaining"] == 0,
+      (first_budgeted_items, second_budgeted_items, shared_deck_budget))
 
 series_name_mutated = Presentation("category-cache-source.pptx")
 series_name_chart = next(
@@ -615,9 +911,10 @@ check("cacheless series title is unavailable without aborting value inventory",
 series_name_inventory = extract_slide_content(series_name_reopened.slides[0])
 series_name_inventory_items = series_name_inventory["charts"][0]["plots"][0]["series"]
 check("deck inventory continues through cached siblings after an unavailable series title",
-      series_name_inventory_items[0] == series_name_result
-      and series_name_inventory_items[1]
-      == {"name": "Cached series", "values": [3.0, 4.0]},
+      series_name_inventory_items[0]["name"] is None
+      and series_name_inventory_items[0]["values"] == [1.0, 2.0]
+      and series_name_inventory_items[1]["name"] == "Cached series"
+      and series_name_inventory_items[1]["values"] == [3.0, 4.0],
       series_name_inventory_items)
 
 
@@ -704,15 +1001,148 @@ category_inventory = extract_slide_content(category_reopened.slides[0])
 category_inventory_series = category_inventory["charts"][0]["plots"][0]["series"]
 check(
     "cacheless category series is unavailable without aborting inventory",
-    category_inventory_series[0]
-    == {"name": "Missing cache", "values": None, "cache_status": "unavailable"},
+    category_inventory_series[0]["name"] == "Missing cache"
+    and category_inventory_series[0]["values"] is None
+    and category_inventory_series[0]["cache_status"] == "unavailable",
     category_inventory_series,
 )
 check(
     "cached category series still reports its values after a cacheless sibling",
-    category_inventory_series[1] == {"name": "Cached series", "values": [3.0, 4.0]},
+    category_inventory_series[1]["name"] == "Cached series"
+    and category_inventory_series[1]["values"] == [3.0, 4.0],
     category_inventory_series,
 )
+
+marker_element = copy.deepcopy(category_series[1]._element)
+marker_values = marker_element.xpath("./c:val/c:numRef/c:numCache/c:pt")
+marker_values[0].find(qn("c:v")).text = "#N/A"
+marker_values[1].find(qn("c:v")).text = None
+marker_series = type("CachedMarkerSeries", (), {"_element": marker_element})()
+marker_result = series_content(marker_series, include_categories=True)
+check("category series preserves #N/A and blank cache markers without series.values",
+      marker_result["values"] == ["#N/A", None], marker_result)
+omitted_marker_element = copy.deepcopy(marker_element)
+omitted_marker_cache = omitted_marker_element.xpath("./c:val/c:numRef/c:numCache")[0]
+omitted_marker_cache.remove(omitted_marker_cache.findall(qn("c:pt"))[1])
+omitted_marker_series = type(
+    "SparseCategorySeries", (), {"_element": omitted_marker_element}
+)()
+omitted_marker_result = series_content(omitted_marker_series, include_categories=True)
+check("category series densifies an omitted sparse point as blank",
+      omitted_marker_result["values"] == ["#N/A", None], omitted_marker_result)
+
+divergent_prs = Presentation("category-cache-source.pptx")
+divergent_chart = next(
+    shape.chart for shape in divergent_prs.slides[0].shapes if shape.has_chart
+)
+divergent_series = list(divergent_chart.plots[0].series)
+second_category = divergent_series[1]._element.find(qn("c:cat"))
+second_category.find(qn("c:strRef")).find(qn("c:f")).text = "Sheet1!$D$2:$D$3"
+second_points = second_category.xpath("./c:strRef/c:strCache/c:pt")
+second_points[0].find(qn("c:v")).text = "North"
+second_points[1].find(qn("c:v")).text = "South"
+divergent_inventory = extract_slide_content(divergent_prs.slides[0])
+divergent_items = divergent_inventory["charts"][0]["plots"][0]["series"]
+check("each category series retains its own formula and cached labels",
+      divergent_items[0]["categories"] == [["A"], ["B"]]
+      and divergent_items[1]["categories"] == [["North"], ["South"]]
+      and divergent_items[0]["category_formula"] != divergent_items[1]["category_formula"],
+      divergent_items)
+commented_category_element = copy.deepcopy(divergent_series[0]._element)
+commented_category_element.find(qn("c:cat")).insert(0, etree.Comment("source follows"))
+commented_category_series = type(
+    "CommentedCategorySeries", (), {"_element": commented_category_element}
+)()
+check("category source selection ignores preserved XML comments",
+      category_content(commented_category_series)["categories"] == [["A"], ["B"]])
+malformed_category_element = copy.deepcopy(divergent_series[1]._element)
+malformed_category_cache = malformed_category_element.xpath(
+    "./c:cat/c:strRef/c:strCache"
+)[0]
+malformed_category_cache.append(copy.deepcopy(
+    malformed_category_cache.findall(qn("c:pt"))[0]
+))
+malformed_category_series = type(
+    "MalformedCategorySeries", (), {"_element": malformed_category_element}
+)()
+malformed_category_result = category_content(malformed_category_series)
+check("duplicate category cache indexes fail closed for only that series",
+      malformed_category_result["categories"] is None
+      and malformed_category_result["category_cache_status"] == "unavailable",
+      malformed_category_result)
+
+duplicate_count_element = copy.deepcopy(divergent_series[1]._element)
+duplicate_count_cache = duplicate_count_element.xpath("./c:cat/c:strRef/c:strCache")[0]
+duplicate_count_cache.insert(1, copy.deepcopy(duplicate_count_cache.find(qn("c:ptCount"))))
+duplicate_count_series = type(
+    "DuplicateCategoryCountSeries", (), {"_element": duplicate_count_element}
+)()
+duplicate_count_budget = {"remaining": 2}
+duplicate_count_result = category_content(duplicate_count_series, duplicate_count_budget)
+valid_after_malformed = category_content(divergent_series[0], duplicate_count_budget)
+check("duplicate category ptCount fails closed without starving a valid sibling",
+      duplicate_count_result["categories"] is None
+      and valid_after_malformed["categories"] == [["A"], ["B"]]
+      and duplicate_count_budget["remaining"] == 0,
+      (duplicate_count_result, valid_after_malformed, duplicate_count_budget))
+
+choice_conflict_element = copy.deepcopy(divergent_series[1]._element)
+choice_conflict_category = choice_conflict_element.find(qn("c:cat"))
+choice_conflict_category.append(parse_xml(
+    '<c:multiLvlStrRef xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">'
+    '<c:f>Sheet1!$E$2:$E$3</c:f><c:multiLvlStrCache><c:ptCount val="2"/>'
+    '<c:lvl><c:pt idx="0"><c:v>X</c:v></c:pt>'
+    '<c:pt idx="1"><c:v>Y</c:v></c:pt></c:lvl>'
+    '</c:multiLvlStrCache></c:multiLvlStrRef>'
+))
+choice_conflict_series = type(
+    "ChoiceConflictSeries", (), {"_element": choice_conflict_element}
+)()
+choice_conflict_result = category_content(choice_conflict_series)
+check("conflicting category source choices fail closed without mixing formula and labels",
+      choice_conflict_result["categories"] is None
+      and choice_conflict_result["category_formula"] is None
+      and choice_conflict_result["category_cache_status"] == "unavailable",
+      choice_conflict_result)
+
+huge_category_element = copy.deepcopy(divergent_series[1]._element)
+huge_category_element.xpath("./c:cat/c:strRef/c:strCache/c:ptCount")[0].set(
+    "val", "4294967295"
+)
+huge_category_series = type(
+    "HugeCategoryCountSeries", (), {"_element": huge_category_element}
+)()
+check("oversized logical category counts fail before allocation",
+      category_content(huge_category_series)["categories"] is None)
+
+aggregate_budget = {"remaining": 3}
+first_budgeted_categories = category_content(divergent_series[0], aggregate_budget)
+second_budgeted_categories = category_content(divergent_series[1], aggregate_budget)
+check("shared category budget bounds aggregate dense inventory",
+      first_budgeted_categories["category_cache_status"] == "available"
+      and second_budgeted_categories["category_cache_status"] == "unavailable"
+      and aggregate_budget["remaining"] == 1,
+      (first_budgeted_categories, second_budgeted_categories, aggregate_budget))
+
+multi_level_element = copy.deepcopy(divergent_series[0]._element)
+multi_level_category = multi_level_element.find(qn("c:cat"))
+multi_level_category.remove(next(iter(multi_level_category)))
+multi_level_category.append(parse_xml(
+    '<c:multiLvlStrRef xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">'
+    '<c:f>Sheet1!$A$2:$A$5</c:f><c:multiLvlStrCache><c:ptCount val="4"/>'
+    '<c:lvl><c:pt idx="0"><c:v>A</c:v></c:pt><c:pt idx="1"><c:v>B</c:v></c:pt>'
+    '<c:pt idx="2"><c:v>C</c:v></c:pt><c:pt idx="3"><c:v>D</c:v></c:pt></c:lvl>'
+    '<c:lvl><c:pt idx="0"><c:v>G1</c:v></c:pt>'
+    '<c:pt idx="2"><c:v>G2</c:v></c:pt></c:lvl>'
+    '</c:multiLvlStrCache></c:multiLvlStrRef>'
+))
+multi_level_series = type("MultiLevelSeries", (), {"_element": multi_level_element})()
+multi_level_result = category_content(multi_level_series)
+check("multi-level categories flatten parent-to-child with linear carry-forward",
+      multi_level_result["categories"]
+      == [["G1", "A"], ["G1", "B"], ["G2", "C"], ["G2", "D"]]
+      and multi_level_result["category_formula"] == "Sheet1!$A$2:$A$5",
+      multi_level_result)
 
 category_labels_mutated = Presentation("category-cache-source.pptx")
 category_labels_chart = next(
@@ -742,8 +1172,9 @@ check("cacheless categories retain their worksheet formula and embedded workbook
       and category_ref.find(qn("c:strCache")) is None
       and category_workbook_remains)
 check("missing category cache is reported without aborting later chart inventory",
-      category_plot_inventory["categories"] is None
-      and category_plot_inventory["category_cache_status"] == "unavailable"
+      category_plot_inventory["series"][0]["categories"] is None
+      and category_plot_inventory["series"][0]["category_cache_status"] == "unavailable"
+      and category_plot_inventory["series"][1]["categories"] == [["A"], ["B"]]
       and category_plot_inventory["series"][1]["values"] == [3.0, 4.0],
       category_plot_inventory)
 
@@ -900,6 +1331,39 @@ missing_count = copy.deepcopy(x_source)
 missing_count_cache = missing_count.find(qn("c:numRef") + "/" + qn("c:numCache"))
 missing_count_cache.remove(missing_count_cache.find(qn("c:ptCount")))
 check("numeric cache without ptCount reports unavailable", cached_numeric_points(missing_count) is None)
+marker_source = copy.deepcopy(x_source)
+marker_points = marker_source.xpath("./c:numRef/c:numCache/c:pt")
+marker_points[0].find(qn("c:v")).text = "#N/A"
+marker_points[1].find(qn("c:v")).text = None
+check("numeric cache preserves #N/A and explicit blank markers",
+      cached_numeric_points(marker_source) == [(0, "#N/A"), (1, None)],
+      cached_numeric_points(marker_source))
+sparse_source = copy.deepcopy(x_source)
+sparse_cache = sparse_source.xpath("./c:numRef/c:numCache")[0]
+sparse_cache.find(qn("c:ptCount")).set("val", "3")
+sparse_cache.remove(sparse_cache.findall(qn("c:pt"))[1])
+check("XY numeric cache retains only present sparse indexed points",
+      cached_numeric_points(sparse_source) == [(0, 1.0)],
+      cached_numeric_points(sparse_source))
+check("sparse XY cache reports ptCount without densifying trailing blanks",
+      cached_numeric_points(sparse_source, include_count=True)
+      == {"point_count": 3, "points": [(0, 1.0)]},
+      cached_numeric_points(sparse_source, include_count=True))
+check("category numeric cache can densify sparse positions as blanks",
+      cached_numeric_points(sparse_source, fill_missing=True)
+      == [(0, 1.0), (1, None), (2, None)],
+      cached_numeric_points(sparse_source, fill_missing=True))
+duplicate_source = copy.deepcopy(x_source)
+duplicate_cache = duplicate_source.xpath("./c:numRef/c:numCache")[0]
+duplicate_cache.append(copy.deepcopy(duplicate_cache.findall(qn("c:pt"))[0]))
+check("duplicate numeric cache indexes fail closed",
+      cached_numeric_points(duplicate_source) is None)
+huge_count_source = copy.deepcopy(x_source)
+huge_count_source.xpath("./c:numRef/c:numCache/c:ptCount")[0].set(
+    "val", "4294967295"
+)
+check("oversized logical numeric counts fail before allocation",
+      cached_numeric_points(huge_count_source, fill_missing=True) is None)
 actual_cache = x_source.xpath("./c:numRef/c:numCache")[0]
 x_source.xpath("./c:numRef")[0].remove(actual_cache)
 check("XY series with an unavailable cache is explicit",
@@ -1107,17 +1571,31 @@ def theme_faces_for_slide(slide):
     return cache_key, theme_cache[cache_key]
 
 
-EAST_ASIAN_SCRIPTS = {"Hans", "Hant", "Jpan", "Hang"}
+EAST_ASIAN_SCRIPTS = {"Hans", "Hant", "Jpan", "Hang", "Bopo"}
 COMPLEX_SCRIPTS = {"Arab", "Hebr", "Deva", "Beng", "Taml", "Thai"}
+HAN_RANGES = (
+    (0x2E80, 0x2E99), (0x2E9B, 0x2EF3), (0x2F00, 0x2FD5),
+    (0x3005, 0x3005), (0x3007, 0x3007), (0x3021, 0x3029), (0x3038, 0x303B),
+    (0x3400, 0x4DBF), (0x4E00, 0x9FFF),
+    (0xF900, 0xFA6D), (0xFA70, 0xFAD9),
+    (0x16FE2, 0x16FE3), (0x16FF0, 0x16FF6),
+    (0x20000, 0x2A6DF), (0x2A700, 0x2B81D), (0x2B820, 0x2CEAD),
+    (0x2CEB0, 0x2EBE0), (0x2EBF0, 0x2EE5D), (0x2F800, 0x2FA1D),
+    (0x30000, 0x3134A), (0x31350, 0x33479),
+)
 
 
 def character_tags(character):
     codepoint = ord(character)
-    if 0x3040 <= codepoint <= 0x30FF:
+    if 0x3040 <= codepoint <= 0x30FF or 0x31F0 <= codepoint <= 0x31FF:
         return ["Jpan"]
-    if 0x1100 <= codepoint <= 0x11FF or 0xAC00 <= codepoint <= 0xD7AF:
+    if (0x1100 <= codepoint <= 0x11FF or 0x3130 <= codepoint <= 0x318F
+            or 0xA960 <= codepoint <= 0xA97F or 0xAC00 <= codepoint <= 0xD7AF
+            or 0xD7B0 <= codepoint <= 0xD7FF):
         return ["Hang"]
-    if 0x2F00 <= codepoint <= 0x9FFF:
+    if 0x3100 <= codepoint <= 0x312F or 0x31A0 <= codepoint <= 0x31BF:
+        return ["Bopo"]
+    if any(start <= codepoint <= end for start, end in HAN_RANGES):
         return ["Hans", "Hant", "Jpan", "Hang"]
     for tag, start, end in (
         ("Cyrl", 0x0400, 0x052F), ("Hebr", 0x0590, 0x05FF),
@@ -1147,6 +1625,42 @@ def required_slots(text):
         if slot not in slots:
             slots.append(slot)
     return slots or ["latin"]
+
+
+han_examples = [
+    chr(codepoint)
+    for start, end in HAN_RANGES
+    for codepoint in {start, end}
+]
+han_gap_examples = [
+    chr(codepoint) for codepoint in (
+        0x2E9A, 0x2EF4, 0x2FD6, 0x3006, 0x3105, 0x3131, 0x4DC0,
+        0xFA6E, 0xFA6F, 0xFADA, 0x16FE1, 0x16FE4, 0x16FEF, 0x16FF7,
+        0x2A6E0, 0x2B81E, 0x2CEAE, 0x2EBE1, 0x2EE5E, 0x2FA1E,
+        0x3134B, 0x3347A, 0x33480,
+    )
+]
+han_tags = {"Hans", "Hant", "Jpan", "Hang"}
+supplementary_han_classified = all(
+    set(character_tags(character)) == han_tags
+    and required_slots(character) == ["eastAsia"]
+    for character in han_examples
+)
+han_gaps_stay_latin = all(
+    set(character_tags(character)) != han_tags
+    for character in han_gap_examples
+)
+check("compatibility and supplementary-plane Han use the east-Asian slot",
+      supplementary_han_classified)
+check("Unicode 17 Han gaps and neighboring scripts are not mislabeled as Han",
+      han_gaps_stay_latin)
+check("Bopomofo and compatibility Jamo keep distinct East-Asian script tags",
+      character_tags("ㄅ") == ["Bopo"] and required_slots("ㄅ") == ["eastAsia"]
+      and character_tags("ㄱ") == ["Hang"] and required_slots("ㄱ") == ["eastAsia"])
+check("Katakana phonetic extensions remain Japanese after narrowing Han ranges",
+      character_tags("ㇰ") == ["Jpan"] and required_slots("ㇰ") == ["eastAsia"])
+check("supplementary Han range checks remain active under optimized Python",
+      __debug__ or (supplementary_han_classified and han_gaps_stay_latin))
 
 
 def raw_font_slots(rpr):

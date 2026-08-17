@@ -47,33 +47,153 @@ def picture_content(shape):
         "bytes": len(image.blob),
     }
 
-def cached_numeric_points(source):
-    """Return indexed cached points, or None when the cache metadata is unavailable."""
+MAX_CHART_POINTS = 100_000
+MAX_CATEGORY_LEVELS = 16
+CATEGORY_SOURCE_NAMES = {"strRef", "numRef", "multiLvlStrRef", "strLit", "numLit"}
+
+def cache_point_count(cache):
+    point_counts = cache.findall(qn("c:ptCount"))
+    if len(point_counts) != 1:
+        return None
+    try:
+        point_count = int(point_counts[0].get("val"))
+    except (TypeError, ValueError):
+        return None
+    return point_count if 0 <= point_count <= MAX_CHART_POINTS else None
+
+def consume_point_budget(point_budget, count):
+    if count > MAX_CHART_POINTS:
+        return False
+    if point_budget is None:
+        return True
+    if count > point_budget["remaining"]:
+        return False
+    point_budget["remaining"] -= count
+    return True
+
+def cached_numeric_points(
+    source, *, fill_missing=False, include_count=False, point_budget=None
+):
+    """Return bounded indexed cached points, or None when metadata is unavailable."""
     if source is None:
         return None
-    point_counts = source.xpath("./c:numRef/c:numCache/c:ptCount | ./c:numLit/c:ptCount")
-    if not point_counts:
+    caches = source.xpath("./c:numRef/c:numCache | ./c:numLit")
+    if len(caches) != 1 or (point_count := cache_point_count(caches[0])) is None:
         return None
-    points = source.xpath("./c:numRef/c:numCache/c:pt | ./c:numLit/c:pt")
-    return [
-        (int(point.get("idx")), float(value.text))
-        for point in points
-        if point.get("idx") is not None and (value := point.find(qn("c:v"))) is not None
-    ]
+    cached = {}
+    for point in caches[0].findall(qn("c:pt")):
+        value = point.find(qn("c:v"))
+        try:
+            index = int(point.get("idx"))
+        except (TypeError, ValueError):
+            return None
+        if value is None or not 0 <= index < point_count or index in cached:
+            return None
+        try:
+            parsed = float(value.text) if value.text not in (None, "") else value.text
+        except (TypeError, ValueError):
+            parsed = value.text              # preserve #N/A and other error markers
+        cached[index] = parsed
+    if fill_missing:
+        if not consume_point_budget(point_budget, point_count):
+            return None
+        points = [(index, cached.get(index)) for index in range(point_count)]
+    else:
+        points = sorted(cached.items())
+    return {"point_count": point_count, "points": points} if include_count else points
 
-def cached_category_labels(plot):
-    """Return flattened labels, or None when a formula has no category cache."""
-    category_nodes = plot._element.xpath("./c:ser[1]/c:cat")
-    if not category_nodes:
+def cached_text_point_map(container, point_count):
+    values = {}
+    for point in container.findall(qn("c:pt")):
+        try:
+            index = int(point.get("idx"))
+        except (TypeError, ValueError):
+            return None
+        value = point.find(qn("c:v"))
+        if value is None or not 0 <= index < point_count or index in values:
+            return None
+        values[index] = value.text or ""
+    return values
+
+def category_source(series):
+    category = series._element.find(qn("c:cat"))
+    if category is None:
+        return None, None
+    sources = [
+        child for child in category
+        if isinstance(child.tag, str)
+        and etree.QName(child).localname in CATEGORY_SOURCE_NAMES
+    ]
+    return (category, sources[0]) if len(sources) == 1 else (category, None)
+
+def cached_category_labels(series, point_budget=None):
+    """Return this series' flattened labels, or None when its cache is unavailable."""
+    category, source = category_source(series)
+    if category is None:
         return []
-    cache_payload = category_nodes[0].xpath(
-        "./c:strRef/c:strCache/c:ptCount | ./c:numRef/c:numCache/c:ptCount | "
-        "./c:multiLvlStrRef/c:multiLvlStrCache/c:ptCount | "
-        "./c:strLit/c:ptCount | ./c:numLit/c:ptCount"
-    )
-    if not cache_payload:
+    if source is None:
         return None
-    return [[str(level) for level in label] for label in plot.categories.flattened_labels]
+    source_name = etree.QName(source).localname
+
+    if source_name == "multiLvlStrRef":
+        caches = source.findall(qn("c:multiLvlStrCache"))
+        if len(caches) != 1 or (count := cache_point_count(caches[0])) is None:
+            return None
+        level_nodes = caches[0].findall(qn("c:lvl"))
+        if len(level_nodes) > MAX_CATEGORY_LEVELS or (count and not level_nodes):
+            return None
+        levels = [cached_text_point_map(level, count) for level in level_nodes]
+        if any(points is None for points in levels):
+            return None
+        if not consume_point_budget(point_budget, count * max(len(level_nodes), 1)):
+            return None
+        expanded_levels = []
+        for level_index, points in enumerate(levels):
+            if level_index == 0:
+                expanded_levels.append([points.get(index, "") for index in range(count)])
+                continue
+            ordered = sorted(points.items())
+            if not ordered:
+                expanded_levels.append([""] * count)
+                continue
+            cursor = 0
+            expanded = []
+            for leaf_index in range(count):
+                while cursor + 1 < len(ordered) and ordered[cursor + 1][0] <= leaf_index:
+                    cursor += 1
+                expanded.append(ordered[cursor][1])
+            expanded_levels.append(expanded)
+        return [
+            [level[index] for level in reversed(expanded_levels)]
+            for index in range(count)
+        ]
+
+    cache_name = {"strRef": "c:strCache", "numRef": "c:numCache"}.get(source_name)
+    if cache_name is None:
+        cache = source
+    else:
+        caches = source.findall(qn(cache_name))
+        if len(caches) != 1:
+            return None
+        cache = caches[0]
+    if (count := cache_point_count(cache)) is None:
+        return None
+    values = cached_text_point_map(cache, count)
+    if values is None:
+        return None
+    if not consume_point_budget(point_budget, count):
+        return None
+    return [[values.get(index, "")] for index in range(count)]
+
+def category_content(series, point_budget=None):
+    labels = cached_category_labels(series, point_budget)
+    _, source = category_source(series)
+    formula = None if source is None else source.find(qn("c:f"))
+    return {
+        "categories": labels,
+        "category_formula": formula.text if formula is not None else None,
+        "category_cache_status": "unavailable" if labels is None else "available",
+    }
 
 def series_name_content(series):
     """Return a cached/literal title, or mark a worksheet-backed title unavailable."""
@@ -99,37 +219,84 @@ def series_name_content(series):
         return {"name": None, "name_cache_status": "unavailable"}
     return {"name": value.text or ""}
 
-def series_content(series):
+def series_content(series, *, include_categories=False, point_budget=None):
+    if point_budget is None:
+        point_budget = {"remaining": MAX_CHART_POINTS}
     name_content = series_name_content(series)
+    content = {
+        **name_content,
+        **(category_content(series, point_budget) if include_categories else {}),
+    }
     x_source = getattr(series._element, "xVal", None)
     if x_source is None:                    # category/value chart
         value_source = getattr(series._element, "val", None)
-        if cached_numeric_points(value_source) is None:
-            return {**name_content, "values": None, "cache_status": "unavailable"}
-        return {**name_content, "values": list(series.values)}
-    x_points = cached_numeric_points(x_source)
-    y_points = cached_numeric_points(getattr(series._element, "yVal", None))
-    if x_points is None or y_points is None:
-        return {**name_content, "points": None, "cache_status": "unavailable"}
-    content = {**name_content, "x_points": x_points, "y_points": y_points}
+        value_cache = cached_numeric_points(
+            value_source, fill_missing=True, include_count=True,
+            point_budget=point_budget,
+        )
+        if value_cache is None:
+            return {**content, "values": None, "cache_status": "unavailable"}
+        return {**content, "values": [value for _, value in value_cache["points"]]}
+    x_cache = cached_numeric_points(x_source, include_count=True)
+    y_cache = cached_numeric_points(
+        getattr(series._element, "yVal", None), include_count=True
+    )
+    if x_cache is None or y_cache is None:
+        return {**content, "points": None, "cache_status": "unavailable"}
+    content.update({
+        "x_points": x_cache["points"], "x_point_count": x_cache["point_count"],
+        "y_points": y_cache["points"], "y_point_count": y_cache["point_count"],
+    })
     size_source = getattr(series._element, "bubbleSize", None)
     if size_source is not None:
-        bubble_points = cached_numeric_points(size_source)
-        if bubble_points is None:
-            return {**name_content, "points": None, "cache_status": "unavailable"}
-        content["bubble_points"] = bubble_points
+        bubble_cache = cached_numeric_points(size_source, include_count=True)
+        if bubble_cache is None:
+            return {**content, "points": None, "cache_status": "unavailable"}
+        content.update({
+            "bubble_points": bubble_cache["points"],
+            "bubble_point_count": bubble_cache["point_count"],
+        })
     return content
 
-def chart_axis_titles(chart):
-    """Return titles for axes the chart actually exposes (pie charts have none)."""
-    titles = {}
-    for label, attribute in (("category", "category_axis"), ("value", "value_axis")):
-        try:
-            axis = getattr(chart, attribute)
-        except (AttributeError, ValueError):
-            continue
-        titles[label] = axis.axis_title.text_frame.text if axis.has_title else ""
-    return titles
+def chart_axis_text(axis):
+    title = axis.find(qn("c:title"))
+    if title is None:
+        return ""
+    rich = title.xpath("./c:tx/c:rich")
+    references = title.xpath("./c:tx/c:strRef")
+    if len(rich) + len(references) != 1:
+        return None
+    if rich:
+        return "\n".join(paragraph.text for paragraph in rich[0].findall(qn("a:p")))
+    caches = references[0].findall(qn("c:strCache"))
+    if (len(caches) != 1 or (count := cache_point_count(caches[0])) is None
+            or count != 1):
+        return None
+    values = cached_text_point_map(caches[0], count)
+    return None if values is None else "\n".join(values.get(index, "") for index in range(count))
+
+def chart_axes(chart):
+    """Return every category, date, value, and series axis in document order."""
+    axes = chart._element.xpath(
+        "./c:chart/c:plotArea/c:catAx | ./c:chart/c:plotArea/c:dateAx | "
+        "./c:chart/c:plotArea/c:valAx | ./c:chart/c:plotArea/c:serAx"
+    )
+    return [
+        {
+            "kind": etree.QName(axis).localname,
+            "id": axis.find(qn("c:axId")).get("val") if axis.find(qn("c:axId")) is not None else None,
+            "position": (
+                axis.find(qn("c:axPos")).get("val")
+                if axis.find(qn("c:axPos")) is not None else None
+            ),
+            "cross_axis_id": (
+                axis.find(qn("c:crossAx")).get("val")
+                if axis.find(qn("c:crossAx")) is not None else None
+            ),
+            "title": chart_axis_text(axis),
+        }
+        for axis in axes
+    ]
 
 def smartart_content(shape):
     """Extract SmartArt data-part labels, or report why the diagram is unreadable."""
@@ -153,6 +320,7 @@ def smartart_content(shape):
 
 prs = Presentation("input.pptx")
 print("slide size:", prs.slide_width, prs.slide_height)
+point_budget = {"remaining": MAX_CHART_POINTS}
 for i, slide in enumerate(prs.slides):
     layout = slide.slide_layout.name
     title = slide.shapes.title.text_frame.text if slide.shapes.title is not None else ""
@@ -176,20 +344,19 @@ for i, slide in enumerate(prs.slides):
         for plot in chart.plots:
             items = list(plot.series)
             has_xy_values = any(getattr(item._element, "xVal", None) is not None for item in items)
-            categories = [] if has_xy_values else cached_category_labels(plot)
-            series = [series_content(item) for item in items]
+            series = [
+                series_content(
+                    item, include_categories=not has_xy_values, point_budget=point_budget
+                )
+                for item in items
+            ]
             plots.append({
                 "kind": type(plot).__name__,
-                "categories": categories,
-                "category_cache_status": (
-                    "not-applicable" if has_xy_values else
-                    "unavailable" if categories is None else "available"
-                ),
                 "series": series,
             })
         charts.append({
             "title": chart_title,
-            "axis_titles": chart_axis_titles(chart),
+            "axes": chart_axes(chart),
             "plots": plots,
         })
     pictures = [
@@ -357,16 +524,30 @@ def theme_faces_for_slide(slide):
         }
     return cache_key, theme_cache[cache_key]
 
-EAST_ASIAN_SCRIPTS = {"Hans", "Hant", "Jpan", "Hang"}
+EAST_ASIAN_SCRIPTS = {"Hans", "Hant", "Jpan", "Hang", "Bopo"}
 COMPLEX_SCRIPTS = {"Arab", "Hebr", "Deva", "Beng", "Taml", "Thai"}
+HAN_RANGES = (
+    (0x2E80, 0x2E99), (0x2E9B, 0x2EF3), (0x2F00, 0x2FD5),
+    (0x3005, 0x3005), (0x3007, 0x3007), (0x3021, 0x3029), (0x3038, 0x303B),
+    (0x3400, 0x4DBF), (0x4E00, 0x9FFF),
+    (0xF900, 0xFA6D), (0xFA70, 0xFAD9),
+    (0x16FE2, 0x16FE3), (0x16FF0, 0x16FF6),
+    (0x20000, 0x2A6DF), (0x2A700, 0x2B81D), (0x2B820, 0x2CEAD),
+    (0x2CEB0, 0x2EBE0), (0x2EBF0, 0x2EE5D), (0x2F800, 0x2FA1D),
+    (0x30000, 0x3134A), (0x31350, 0x33479),
+)
 
 def character_tags(character):
     codepoint = ord(character)
-    if 0x3040 <= codepoint <= 0x30FF:
+    if 0x3040 <= codepoint <= 0x30FF or 0x31F0 <= codepoint <= 0x31FF:
         return ["Jpan"]
-    if 0x1100 <= codepoint <= 0x11FF or 0xAC00 <= codepoint <= 0xD7AF:
+    if (0x1100 <= codepoint <= 0x11FF or 0x3130 <= codepoint <= 0x318F
+            or 0xA960 <= codepoint <= 0xA97F or 0xAC00 <= codepoint <= 0xD7AF
+            or 0xD7B0 <= codepoint <= 0xD7FF):
         return ["Hang"]
-    if 0x2F00 <= codepoint <= 0x9FFF:
+    if 0x3100 <= codepoint <= 0x312F or 0x31A0 <= codepoint <= 0x31BF:
+        return ["Bopo"]
+    if any(start <= codepoint <= end for start, end in HAN_RANGES):
         return ["Hans", "Hant", "Jpan", "Hang"]  # locale disambiguates Han
     for tag, start, end in (
         ("Cyrl", 0x0400, 0x052F), ("Hebr", 0x0590, 0x05FF),
@@ -508,8 +689,9 @@ if unresolved_fonts:
 `<a:ea>`/`<a:cs>` faces. python-pptx also does not evaluate the full placeholder -> layout ->
 master inheritance chain; the output above remains a candidate list. Check matching layout/master
 placeholders when the exact face matters. Han text needs the deck locale to distinguish Hans,
-Hant, Japanese, and Korean mappings; add other script ranges when the task uses them rather than
-claiming the Latin fallback is definitive.
+Hant, Japanese, and Korean mappings. The ranges above follow Unicode 17 `Script=Han`, including
+BMP compatibility ideographs and supplementary-plane Extension J; add other script ranges when
+the task uses them rather than claiming the Latin fallback is definitive.
 Chart titles, legends, tick labels, data labels, and SmartArt nodes use additional DrawingML
 font cascades across chart/diagram parts. The guard above deliberately fails closed until those
 parts are audited directly or the deck is rendered and inspected with the production fonts.

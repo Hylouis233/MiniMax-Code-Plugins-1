@@ -37,12 +37,18 @@ with open("input.csv", newline="", encoding="utf-8-sig") as f:   # utf-8-sig str
 import csv
 from pathlib import Path
 
-FORMULA_PREFIXES = ("=", "+", "-", "@")
+FORMULA_OPERATORS = ("=", "+", "-", "@", "＝", "＋", "－", "＠")
+
+def begins_spreadsheet_formula(value):
+    index = 0
+    while index < len(value) and (ord(value[index]) <= 0x20 or value[index] == "\ufeff"):
+        index += 1
+    return value.startswith(FORMULA_OPERATORS, index)
 
 def spreadsheet_csv_field(value, *, mode="safe"):
     if mode not in {"safe", "raw"}:
         raise ValueError("mode must be 'safe' or 'raw'")
-    if mode == "safe" and isinstance(value, str) and value.startswith(FORMULA_PREFIXES):
+    if mode == "safe" and isinstance(value, str) and begins_spreadsheet_formula(value):
         return "'" + value
     return value
 
@@ -60,10 +66,12 @@ with output_path.open("w", newline="", encoding="utf-8") as f:
 ```
 
 Use `mode="safe"` (the default above) when the CSV will be opened in Excel, LibreOffice,
-Google Sheets, or another spreadsheet application. It neutralizes literal text beginning with
-`=`, `+`, `-`, or `@` by prefixing an apostrophe, so the application does not interpret the
-field as a formula. Numeric values, including negative numbers represented as numbers, are not
-changed. This protection deliberately changes those serialized string values.
+Google Sheets, or another spreadsheet application. It scans past leading C0 controls/spaces and
+BOMs, then prefixes the **complete original field** with an apostrophe when the next character is
+`=`, `+`, `-`, `@`, or the corresponding fullwidth operator. Importers can strip or ignore leading
+tab/CR/LF/BOM characters before formula detection, and CSV quoting does not neutralize them.
+Benign control-prefixed text is preserved. Numeric values, including negative numbers represented
+as numbers, are not changed. This protection deliberately changes formula-like serialized strings.
 
 Use `mode="raw"` only when the user explicitly requires byte-for-value interchange with a
 trusted machine consumer. Raw mode preserves the exact strings and provides **no spreadsheet
@@ -98,7 +106,7 @@ formula-injection protection**; do not present a raw export as safe to open in a
   from pathlib import Path
   from xml.etree import ElementTree as ET
 
-  FORMULA_PREFIXES = ("=", "+", "-", "@")
+  FORMULA_OPERATORS = ("=", "+", "-", "@", "＝", "＋", "－", "＠")
   MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
   DOC_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
   PKG_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
@@ -106,10 +114,16 @@ formula-injection protection**; do not present a raw export as safe to open in a
   FORMULA_TAG = f"{{{MAIN_NS}}}f"
   VALUE_TAG = f"{{{MAIN_NS}}}v"
 
+  def begins_spreadsheet_formula(value):
+      index = 0
+      while index < len(value) and (ord(value[index]) <= 0x20 or value[index] == "\ufeff"):
+          index += 1
+      return value.startswith(FORMULA_OPERATORS, index)
+
   def spreadsheet_csv_field(value, *, mode="safe"):
       if mode not in {"safe", "raw"}:
           raise ValueError("mode must be 'safe' or 'raw'")
-      if mode == "safe" and isinstance(value, str) and value.startswith(FORMULA_PREFIXES):
+      if mode == "safe" and isinstance(value, str) and begins_spreadsheet_formula(value):
           return "'" + value
       return value
 
