@@ -1,5 +1,10 @@
 # Edit an existing workbook
 
+Copy the bounded loaders from [package.md](package.md) into the script. The same preflight must
+run before the main editable load and before any raw ZIP/XML round-trip inventory. Define
+`load_with_round_trip_audit()` from the prerequisite block later on this page before executing
+the edit block; the workbook it returns is the one that must be edited and saved.
+
 ```python
 import openpyxl
 from datetime import date
@@ -7,7 +12,14 @@ from openpyxl.formula import Tokenizer
 from openpyxl.styles import Font
 from openpyxl.utils.cell import coordinate_to_tuple, range_boundaries
 
-wb = openpyxl.load_workbook("input.xlsx")   # NOT data_only: that would drop all formulas
+approved_feature_loss = False  # set True only after showing the inventory to the user
+wb, dropped_parts, stripped_extensions = load_with_round_trip_audit("input.xlsx")
+if (dropped_parts or stripped_extensions) and not approved_feature_loss:
+    wb.close()
+    raise RuntimeError(
+        f"openpyxl would drop parts={dropped_parts!r}, extensions={stripped_extensions!r}; "
+        "report this exact inventory and obtain confirmation before editing"
+    )
 ws = wb["Data"]
 
 def formula_text(value):
@@ -38,16 +50,14 @@ def drawing_anchor_rows(drawing):
         rows.append(marker.row + 1)
     return tuple(rows)
 
-def sparse_formula_cells(sheet):
-    """Walk instantiated formula cells only; worksheet bounds can span the full grid."""
+def sparse_cells(sheet):
+    """Walk instantiated cells only; worksheet bounds can span the full grid."""
     if not hasattr(sheet, "_cells"):
         raise RuntimeError("structural edits require a normal writable Worksheet")
-    return (
-        cell for cell in sorted(
-            sheet._cells.values(), key=lambda cell: (cell.row, cell.column)
-        )
-        if cell.data_type == "f"
-    )
+    return sorted(sheet._cells.values(), key=lambda cell: (cell.row, cell.column))
+
+def sparse_formula_cells(sheet):
+    return (cell for cell in sparse_cells(sheet) if cell.data_type == "f")
 
 def structural_references(workbook):
     """Inventory formulas/ranges that insert_rows/delete_rows will not rewrite."""
@@ -59,6 +69,17 @@ def structural_references(workbook):
         for cell in sparse_formula_cells(sheet):
             refs.append(("cell formula", f"{owner}!{cell.coordinate}",
                          formula_text(cell.value)))
+        for cell in sparse_cells(sheet):
+            hyperlink = cell.hyperlink
+            if hyperlink is None:
+                continue
+            location = getattr(hyperlink, "location", None)
+            target = getattr(hyperlink, "target", None)
+            refs.append((
+                "cell hyperlink",
+                f"{owner}!{cell.coordinate}",
+                (getattr(hyperlink, "ref", None), location, target),
+            ))
         for table in sheet.tables.values():
             refs.append(("table", owner + "!" + table.name, table.ref))
         for merged_range in sheet.merged_cells.ranges:
@@ -116,7 +137,7 @@ def formula_may_intersect_rows(owner_sheet, formula, shifted_sheet, start_row):
     tokens = Tokenizer(formula).items
     # These functions can manufacture references from strings or numeric
     # offsets that the RANGE-token audit below cannot see or rewrite safely.
-    unmodeled_reference_functions = {"indirect", "offset", "address"}
+    unmodeled_reference_functions = {"indirect", "offset", "address", "hyperlink"}
     if any(
         token.type == "FUNC" and token.subtype == "OPEN"
         and token.value.rstrip("(").rsplit(":", 1)[-1]
@@ -271,25 +292,34 @@ wb.save("input-edited.xlsx")
               stripped.extend((name, uri, children) for _ in range(count))
       return sorted(stripped, key=repr)
 
-  def round_trip_changes(path, **load_options):
-      before_names, before_extensions = archive_inventory(path)
-      wb = openpyxl.load_workbook(path, **load_options)  # same options as the real edit
-      with TemporaryFile() as output:
-          wb.save(output)
-          output.seek(0)
-          after_names, after_extensions = archive_inventory(output)
-      wb.close()
+  def load_with_round_trip_audit_from_source(source, **load_options):
+      """Dry-run one workbook, then return a fresh edit copy from the same source."""
+      require(not load_options.get("read_only"),
+              "round-trip audit requires a normal writable Workbook")
+      source.seek(0)
+      before_names, before_extensions = archive_inventory(source)
+      source.seek(0)
+      audit_workbook = openpyxl.load_workbook(source, **load_options)
+      try:
+          with TemporaryFile() as output:
+              audit_workbook.save(output)
+              output.seek(0)
+              after_names, after_extensions = archive_inventory(output)
+      finally:
+          audit_workbook.close()
       dropped = sorted(before_names - after_names)
       stripped_extensions = stripped_extension_records(
           before_extensions, after_extensions, before_names & after_names
       )
-      return dropped, stripped_extensions
+      # Saving can consume image streams and other resources. Reload a fresh editable
+      # workbook from the same already validated identity instead of returning the dry-run copy.
+      source.seek(0)
+      editable_workbook = openpyxl.load_workbook(source, **load_options)
+      return editable_workbook, dropped, stripped_extensions
 
-  dropped, stripped = round_trip_changes("input.xlsx")
-  if dropped or stripped:
-      print("WARNING: saving with openpyxl will drop:", dropped)
-      print("WARNING: saving with openpyxl will strip (worksheet, URI, content):", stripped)
-      # report to the user and get confirmation before the first save
+  def load_with_round_trip_audit(path, **load_options):
+      with validated_xlsx_source(path) as source:
+          return load_with_round_trip_audit_from_source(source, **load_options)
   ```
 
   (openpyxl re-serializes every sheet it touches, so byte-identity of sheets is not a
@@ -302,7 +332,11 @@ wb.save("input-edited.xlsx")
 - `insert_rows`/`delete_rows` move cells but do **not** rewrite range references for you.
   Before structural edits, inventory cell formulas plus workbook defined names, tables,
   merged ranges, print areas/titles, autofilters, data validations, conditional formatting, and
-  chart-series formulas as above.
+  chart-series formulas and cell hyperlinks as above. Every hyperlink rewrite plan must update
+  the anchor `ref` when its cell moves; an internal link must also update a destination stored in
+  `location` or a `target` beginning with `#` when that destination moves. Treat formula-based
+  `HYPERLINK()` references as dynamic and require a manual rewrite plan because their destination
+  is a string token, not an ordinary range token.
   Refuse the insertion until every dependency that can intersect the shifted region has an
   explicit rewrite; after the edit, rerun both inventories and verify the expected references.
 - Styling: import `Font` and assign the style to each cell. A range such as `ws["A1:F1"]`
@@ -312,7 +346,7 @@ wb.save("input-edited.xlsx")
 - Freeze panes and autofilter improve usability cheaply:
   `ws.freeze_panes = "A2"; ws.auto_filter.ref = ws.dimensions`.
 - Merged cells: avoid creating new merges; writing into a non-anchor merged cell raises.
-- `.xlsm`: `load_workbook(path, keep_vba=True)` and save with the same suffix, or macros are
+- `.xlsm`: `load_validated_workbook(path, keep_vba=True)` and save with the same suffix, or macros are
   stripped.
 - Do not delete sheets unless asked; hide instead (`ws.sheet_state = "hidden"`) when the goal
   is a cleaner tab bar.

@@ -161,6 +161,8 @@ def iter_text_targets(path, shape):
     if shape.has_table:
         for row_index, row in enumerate(shape.table.rows):
             for column_index, cell in enumerate(row.cells):
+                if cell.is_spanned:  # covered merge slots can retain stale, non-rendered text
+                    continue
                 yield f"{path}/table[{row_index},{column_index}]", cell.text_frame
 
 candidates = []
@@ -202,9 +204,10 @@ prs.save("input-edited.pptx")
    template, masters, notes, and animations. Edit in place, save to a new path.
 2. Address shapes by slide index + shape name or matched text, and **require exactly one match**
    with an explicit exception (never a Python `assert`, which `python -O` removes).
-   The locator must search both shape text frames and every table cell, retaining a stable
-   `/table[row,column]` suffix. If copy repeats inside one table, set `target_location` as well as
-   the slide/shape selectors rather than choosing one.
+   The locator must search both shape text frames and every editable table cell, skipping grid
+   slots covered by a merge and retaining a stable `/table[row,column]` suffix. If copy repeats
+   inside one table, set `target_location` as well as the slide/shape selectors rather than
+   choosing one.
 3. For formatted text, change `run.text` only when the target is wholly inside one run. Assigning
    `paragraph.text` or `text_frame.text` rebuilds runs and can discard run formatting and links.
    If the target spans runs, stop and make an explicitly reviewed run/XML edit.

@@ -537,6 +537,9 @@ MAX_IMAGE_SOURCE_PIXELS = 25_000_000
 MAX_TOTAL_IMAGE_SOURCE_PIXELS = 50_000_000
 MAX_IMAGE_RENDER_PIXELS = 4_000_000
 MAX_TOTAL_IMAGE_RENDER_PIXELS = 20_000_000
+MAX_DRAWING_PATHS = 1_000
+MAX_DRAWING_RENDER_PIXELS = 4_000_000
+MAX_TOTAL_DRAWING_RENDER_PIXELS = 20_000_000
 
 
 def viewable_images(page):
@@ -576,6 +579,73 @@ def viewable_images(page):
         if any(pixmap.samples[pixmap.n - 1::pixmap.n]):
             visible.append(placement)
     return placements, visible, False
+
+
+def drawing_bounds(drawing):
+    """Include stroke width around the path geometry returned by PyMuPDF."""
+    try:
+        rectangle = fitz.Rect(drawing.get("rect"))
+    except (TypeError, ValueError):
+        raise ValueError("drawing has no finite bounding rectangle") from None
+    if not all(math.isfinite(value) for value in rectangle) or rectangle.is_infinite:
+        raise ValueError("drawing has no finite bounding rectangle")
+    rectangle.normalize()
+    path_type = drawing.get("type")
+    has_stroke = (
+        "s" in path_type if isinstance(path_type, str)
+        else drawing.get("color") is not None
+    )
+    if has_stroke:
+        width = drawing.get("width", 0)
+        if isinstance(width, bool):
+            raise ValueError("drawing has an invalid stroke width")
+        try:
+            width = float(width or 0)
+        except (TypeError, ValueError):
+            raise ValueError("drawing has an invalid stroke width") from None
+        if not math.isfinite(width) or width < 0:
+            raise ValueError("drawing has an invalid stroke width")
+        # PDF hairlines (width 0) still paint one device pixel at render time.
+        padding = max(width / 2, 0.5 if width == 0 else 0)
+        rectangle = fitz.Rect(
+            rectangle.x0 - padding, rectangle.y0 - padding,
+            rectangle.x1 + padding, rectangle.y1 + padding,
+        )
+    return rectangle
+
+
+def viewable_drawings(page):
+    """Render bounded path clips; unknown visibility keeps the page nonblank."""
+    try:
+        drawings = page.get_drawings()
+    except (RuntimeError, ValueError):
+        return [], [], True
+    if len(drawings) > MAX_DRAWING_PATHS:
+        return drawings, [], True
+    visible = []
+    total_render_pixels = 0
+    for drawing in drawings:
+        try:
+            bounds = drawing_bounds(drawing)
+        except ValueError:
+            return drawings, visible, True
+        clip = visible_clip(page, bounds)
+        if clip is None:
+            continue
+        render_pixels = math.ceil(clip.width) * math.ceil(clip.height)
+        total_render_pixels += render_pixels
+        if (render_pixels > MAX_DRAWING_RENDER_PIXELS
+                or total_render_pixels > MAX_TOTAL_DRAWING_RENDER_PIXELS):
+            return drawings, visible, True
+        try:
+            pixmap = page.get_pixmap(clip=clip, alpha=True, annots=False)
+        except (RuntimeError, ValueError):
+            return drawings, visible, True
+        if not pixmap.alpha:
+            return drawings, visible, True
+        if any(pixmap.samples[pixmap.n - 1::pixmap.n]):
+            visible.append(drawing)
+    return drawings, visible, False
 
 
 def rendered_interactives(page, items):
@@ -662,10 +732,13 @@ check("interactive render failures keep blank-page classification fail closed",
 widgets, annotations, links, interaction_visibility_unknown = viewable_interactives(
     widget_page
 )
+_, visible_widget_drawings, widget_drawing_visibility_unknown = viewable_drawings(
+    widget_page
+)
 blank = (
     not widget_page.get_text().strip()
     and not widget_page.get_images()
-    and not widget_page.get_drawings()
+    and not visible_widget_drawings and not widget_drawing_visibility_unknown
     and not widgets and not annotations and not links and not interaction_visibility_unknown
 )
 check("widget-only form page exposes a widget", len(widgets) == 1, len(widgets))
@@ -1179,17 +1252,112 @@ form_only_annotations = list(form_only_page.annots() or ())
 
 def inspected_page_is_blank(page):
     _, visible_images, image_visibility_unknown = viewable_images(page)
+    _, visible_drawings, drawing_visibility_unknown = viewable_drawings(page)
     return not (
         page.get_text().strip() or visible_images
-        or page.get_drawings() or list(page.widgets() or ())
+        or visible_drawings or list(page.widgets() or ())
         or list(page.annots() or ()) or page.get_links()
-        or image_visibility_unknown
+        or image_visibility_unknown or drawing_visibility_unknown
     )
 
 
 form_only_is_blank = inspected_page_is_blank(form_only_page)
 check("form-only page exposes a widget", len(form_only_widgets) == 1)
 check("form-only page is not classified as blank", not form_only_is_blank)
+
+# PyMuPDF inventories invoked paths even when page geometry, clipping, or opacity
+# prevents them from contributing a rendered pixel.
+drawing_visibility_canvas = canvas.Canvas(
+    "drawing-visibility.pdf", pagesize=(200, 200), pageCompression=0,
+)
+drawing_visibility_canvas.setLineWidth(2)
+drawing_visibility_canvas.rect(40, 40, 80, 60, stroke=1, fill=0)
+drawing_visibility_canvas.showPage()
+drawing_visibility_canvas.setLineWidth(2)
+drawing_visibility_canvas.rect(250, 40, 80, 60, stroke=1, fill=0)
+drawing_visibility_canvas.showPage()
+clipping_path = drawing_visibility_canvas.beginPath()
+clipping_path.rect(0, 0, 10, 10)
+drawing_visibility_canvas.saveState()
+drawing_visibility_canvas.clipPath(clipping_path, stroke=0, fill=0)
+drawing_visibility_canvas.setLineWidth(2)
+drawing_visibility_canvas.rect(40, 40, 80, 60, stroke=1, fill=0)
+drawing_visibility_canvas.restoreState()
+drawing_visibility_canvas.showPage()
+drawing_visibility_canvas.saveState()
+drawing_visibility_canvas.setStrokeAlpha(0)
+drawing_visibility_canvas.setLineWidth(2)
+drawing_visibility_canvas.rect(40, 40, 80, 60, stroke=1, fill=0)
+drawing_visibility_canvas.restoreState()
+drawing_visibility_canvas.showPage()
+no_paint_path = drawing_visibility_canvas.beginPath()
+no_paint_path.rect(40, 40, 80, 60)
+drawing_visibility_canvas.drawPath(no_paint_path, stroke=0, fill=0)
+drawing_visibility_canvas.showPage()
+drawing_visibility_canvas.save()
+
+drawing_visibility_doc = fitz.open("drawing-visibility.pdf")
+drawing_visibility_results = []
+for drawing_page in drawing_visibility_doc:
+    drawing_paths, visible_drawing_paths, drawing_visibility_unknown = viewable_drawings(
+        drawing_page
+    )
+    drawing_visibility_results.append((
+        len(drawing_paths), len(visible_drawing_paths), drawing_visibility_unknown,
+        inspected_page_is_blank(drawing_page),
+    ))
+check("drawing visibility uses rendered paint rather than raw path presence",
+      drawing_visibility_results == [
+          (1, 1, False, False),  # ordinary visible stroke
+          (1, 0, False, True),   # fully off-page stroke
+          (1, 0, False, True),   # stroke fully excluded by the active clip
+          (1, 0, False, True),   # zero-opacity stroke still has a path record
+          (0, 0, False, True),   # a path ended with PDF's no-paint operator
+      ], drawing_visibility_results)
+
+
+class FailingDrawingRenderPage:
+    rect = fitz.Rect(0, 0, 200, 200)
+    rotation_matrix = fitz.Identity
+
+    def get_drawings(self):
+        return [{"type": "f", "rect": fitz.Rect(20, 20, 80, 80)}]
+
+    def get_pixmap(self, **kwargs):
+        raise RuntimeError("fixture drawing renderer failure")
+
+
+failed_drawing_paths, failed_visible_drawings, failed_drawing_unknown = viewable_drawings(
+    FailingDrawingRenderPage()
+)
+failed_drawing_blank = not (failed_visible_drawings or failed_drawing_unknown)
+check("drawing render failures keep blank-page classification fail closed",
+      len(failed_drawing_paths) == 1 and not failed_visible_drawings
+      and failed_drawing_unknown and not failed_drawing_blank,
+      (failed_drawing_paths, failed_visible_drawings,
+       failed_drawing_unknown, failed_drawing_blank))
+
+drawing_budget_results = {}
+for budget_name in (
+    "MAX_DRAWING_PATHS", "MAX_DRAWING_RENDER_PIXELS",
+    "MAX_TOTAL_DRAWING_RENDER_PIXELS",
+):
+    original_budget = globals()[budget_name]
+    globals()[budget_name] = 0
+    try:
+        budget_paths, budget_visible, budget_unknown = viewable_drawings(
+            drawing_visibility_doc[0]
+        )
+        budget_page_is_blank = inspected_page_is_blank(drawing_visibility_doc[0])
+    finally:
+        globals()[budget_name] = original_budget
+    drawing_budget_results[budget_name] = (
+        len(budget_paths), len(budget_visible), budget_unknown, budget_page_is_blank,
+    )
+check("every drawing count/render budget fails closed as visibility unknown",
+      all(result == (1, 0, True, False)
+          for result in drawing_budget_results.values()),
+      drawing_budget_results)
 
 # Identical media/crop geometry remains consistent when one page has /Rotate 90.
 mixed_rotation_writer = PdfWriter()
@@ -1734,19 +1902,6 @@ rotated_graphics_writer.append(R2("overflow-graphics-rotated-source.pdf"))
 rotated_graphics_writer.pages[0].rotate(90)
 with open("overflow-graphics-rotated.pdf", "wb") as f:
     rotated_graphics_writer.write(f)
-
-
-def drawing_bounds(drawing):
-    rect = fitz.Rect(drawing["rect"])
-    stroke_pad = (
-        float(drawing.get("width") or 0) / 2
-        if "s" in drawing.get("type", "") else 0
-    )
-    return fitz.Rect(
-        rect.x0 - stroke_pad, rect.y0 - stroke_pad,
-        rect.x1 + stroke_pad, rect.y1 + stroke_pad,
-    )
-
 
 def overflow_pages(path, password=None):
     doc = fitz.open(path)

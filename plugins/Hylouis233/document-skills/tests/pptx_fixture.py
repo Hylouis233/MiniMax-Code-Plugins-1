@@ -2319,7 +2319,74 @@ def iter_text_targets(path, shape):
     if shape.has_table:
         for row_index, row in enumerate(shape.table.rows):
             for column_index, cell in enumerate(row.cells):
+                if cell.is_spanned:
+                    continue
                 yield f"{path}/table[{row_index},{column_index}]", cell.text_frame
+
+
+merged_edit_old, merged_edit_new = "Merged edit target", "Edited merged target"
+merged_edit_prs = Presentation()
+merged_edit_slide = merged_edit_prs.slides.add_slide(merged_edit_prs.slide_layouts[6])
+merged_edit_table = merged_edit_slide.shapes.add_table(
+    2, 2, Inches(1), Inches(1), Inches(4), Inches(2)
+).table
+merged_edit_table.cell(0, 0).text = merged_edit_old
+merged_edit_table.cell(0, 0).merge(merged_edit_table.cell(1, 1))
+# Covered cells can retain stale text in a valid OPC package even though it is not rendered.
+for merged_edit_coordinate in ((0, 1), (1, 0), (1, 1)):
+    merged_edit_table.cell(*merged_edit_coordinate).text = merged_edit_old
+merged_edit_prs.save("merged-edit-source.pptx")
+
+merged_edit_reopened = Presentation("merged-edit-source.pptx")
+merged_edit_shape = next(
+    shape for shape in merged_edit_reopened.slides[0].shapes if shape.has_table
+)
+merged_edit_candidates = [
+    (location, text_frame)
+    for location, text_frame in iter_text_targets(merged_edit_shape.name, merged_edit_shape)
+    if merged_edit_old in text_frame.text
+]
+check(
+    "merged-table locator ignores stale text in covered merge slots",
+    len(merged_edit_candidates) == 1
+    and merged_edit_candidates[0][0].endswith("/table[0,0]"),
+    [location for location, _ in merged_edit_candidates],
+)
+merged_edit_frame = merged_edit_candidates[0][1]
+merged_edit_hits = [
+    run
+    for paragraph in merged_edit_frame.paragraphs
+    for run in paragraph.runs
+    if merged_edit_old in run.text
+]
+require(len(merged_edit_hits) == 1, "expected one run in the merged-cell edit target")
+merged_edit_hits[0].text = merged_edit_hits[0].text.replace(
+    merged_edit_old, merged_edit_new, 1
+)
+merged_edit_reopened.save("merged-edit-result.pptx")
+
+merged_edit_result = Presentation("merged-edit-result.pptx")
+merged_edit_result_table = next(
+    shape.table for shape in merged_edit_result.slides[0].shapes if shape.has_table
+)
+merged_edit_origin = merged_edit_result_table.cell(0, 0)
+merged_edit_covered = [
+    merged_edit_result_table.cell(*coordinate)
+    for coordinate in ((0, 1), (1, 0), (1, 1))
+]
+check(
+    "merged-cell run edit persists without changing the merge topology",
+    merged_edit_origin.text == merged_edit_new
+    and merged_edit_origin.is_merge_origin
+    and not merged_edit_origin.is_spanned
+    and merged_edit_origin.span_width == 2
+    and merged_edit_origin.span_height == 2
+    and all(cell.is_spanned for cell in merged_edit_covered),
+    {
+        "origin": merged_edit_origin.text,
+        "covered": [(cell.text, cell.is_spanned) for cell in merged_edit_covered],
+    },
+)
 
 
 def iter_postcheck_text_frames(shapes, path=""):

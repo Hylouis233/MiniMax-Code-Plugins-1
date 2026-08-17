@@ -12,12 +12,17 @@ contracts below.
 ## Step 0 - Check the toolchain
 
 ```bash
-python -c "import openpyxl; print(openpyxl.__version__)"
+python -c "import defusedxml, openpyxl; print(openpyxl.__version__, defusedxml.__version__)"
 ```
 
 - `.csv`/`.tsv` -> standard library `csv` module is fine and often better (streaming).
 - `.xlsx`/`.xlsm`/`.xltx` -> openpyxl.
+- Safe package preflight requires `defusedxml==0.7.1`; do not fall back to the standard XML
+  parser for untrusted OOXML parts.
 - Macro preservation: openpyxl keeps VBA in `.xlsm` only with `keep_vba=True` on load and save.
+- Before **any** `openpyxl.load_workbook()` of an existing package, copy and use the bounded
+  same-handle loader in [references/package.md](references/package.md). `read_only=True` does
+  not bound shared strings, styles, or other package parts parsed during initialization.
 
 ## Step 1 - Classify the task
 
@@ -28,6 +33,7 @@ python -c "import openpyxl; print(openpyxl.__version__)"
 | Build a new workbook (data + formulas + chart) | [references/create.md](references/create.md) |
 | CSV/TSV in or out, messy data cleanup | [references/csv.md](references/csv.md) |
 | Conditional formatting, structured tables, pivot-style aggregation | [references/formatting.md](references/formatting.md) |
+| Safely open an existing OOXML package | [references/package.md](references/package.md) |
 
 ## Step 2 - Contracts that always apply
 
@@ -46,14 +52,16 @@ python -c "import openpyxl; print(openpyxl.__version__)"
    `wb.calculation.calcMode`. You still cannot read results back without opening the file in
    a real spreadsheet app; verify formula strings and ranges structurally instead (see
    postcheck).
-5. **Dimensions**: `ws.max_row`/`ws.max_column` reflect used range - trust them over guesses;
-   but scan for trailing blank-but-formatted rows when a file "looks" bigger than its data.
+5. **Dimensions**: treat `<dimension>`, `ws.max_row`, and `ws.max_column` as untrusted hints.
+   Discover logical cells with the sparse worksheet-XML scan in the read route; never expand an
+   unknown rectangular range merely to find its bounds.
 6. Save to a new path first; overwrite only on explicit request.
 
 ## Step 3 - Postcheck (mandatory)
 
-Save this as `postcheck.py`, then pass the output path followed by every sheet the task should
-produce, for example `python postcheck.py output.xlsx Sales Summary`:
+Save this as `postcheck.py`, copy `load_validated_workbook()` and its dependencies from
+[references/package.md](references/package.md), then pass the output path followed by every
+sheet the task should produce, for example `python postcheck.py output.xlsx Sales Summary`:
 
 ```python
 import openpyxl
@@ -70,7 +78,7 @@ expected_number_formats = {
 expected_formulas = {
     # "Sales": {"D2": "=C2*1.08"},
 }
-wb = openpyxl.load_workbook(output_path)
+wb = load_validated_workbook(output_path)
 
 def require(condition, message):
     if not condition:

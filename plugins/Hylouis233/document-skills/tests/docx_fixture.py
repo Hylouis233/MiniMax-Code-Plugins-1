@@ -156,8 +156,61 @@ check(
 )
 
 # ---- read.md includes block/inline content controls and controlled tables -------
-def iter_part_blocks(root, parent):
+MC_NAMESPACE = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+MC_ALTERNATE_CONTENT = f"{{{MC_NAMESPACE}}}AlternateContent"
+MC_CHOICE = f"{{{MC_NAMESPACE}}}Choice"
+MC_FALLBACK = f"{{{MC_NAMESPACE}}}Fallback"
+SUPPORTED_MC_NAMESPACE_URIS = {
+    MC_NAMESPACE,
+    qn("w:p").split("}", 1)[0][1:],
+    qn("r:id").split("}", 1)[0][1:],
+}
+
+
+def alternate_content_branch(element):
+    fallback = None
+    for child in element.iterchildren():
+        if child.tag == MC_CHOICE:
+            required_prefixes = (child.get("Requires") or "").split()
+            if required_prefixes and all(
+                child.nsmap.get(prefix) in SUPPORTED_MC_NAMESPACE_URIS
+                for prefix in required_prefixes
+            ):
+                return child
+        elif child.tag == MC_FALLBACK and fallback is None:
+            fallback = child
+    return fallback
+
+
+def unresolved_alternate_content(element):
+    return {
+        "kind": "AlternateContent",
+        "requires": [
+            (child.get("Requires") or "").split()
+            for child in element.iterchildren()
+            if child.tag == MC_CHOICE
+        ],
+        "reason": "no supported Choice and no Fallback",
+    }
+
+
+def iter_effective_children(root):
     for child in root.iterchildren():
+        if child.tag != MC_ALTERNATE_CONTENT:
+            yield "element", child
+            continue
+        branch = alternate_content_branch(child)
+        if branch is None:
+            yield "unreadable", unresolved_alternate_content(child)
+        else:
+            yield from iter_effective_children(branch)
+
+
+def iter_part_blocks(root, parent):
+    for child_kind, child in iter_effective_children(root):
+        if child_kind == "unreadable":
+            yield child_kind, child
+            continue
         if child.tag == qn("w:p"):
             yield "paragraph", Paragraph(child, parent)
         elif child.tag == qn("w:tbl"):
@@ -177,14 +230,23 @@ def iter_part_blocks(root, parent):
             yield from iter_part_blocks(child, parent)
 
 
-def iter_paragraph_runs(paragraph):
+def iter_paragraph_items(paragraph):
     def walk(element):
-        for child in element.iterchildren():
+        for child_kind, child in iter_effective_children(element):
+            if child_kind == "unreadable":
+                yield child_kind, child
+                continue
             if child.tag == qn("w:r"):
-                yield Run(child, paragraph)
+                yield "run", Run(child, paragraph)
             elif child.tag != qn("w:p"):
                 yield from walk(child)
     yield from walk(paragraph._p)
+
+
+def iter_paragraph_runs(paragraph):
+    for kind, item in iter_paragraph_items(paragraph):
+        if kind == "run":
+            yield item
 
 
 def legacy_symbol_record(symbol):
@@ -195,38 +257,102 @@ def legacy_symbol_record(symbol):
 
 def run_text(run):
     pieces = []
-    for child in run._r.xpath(
-        "w:br | w:cr | w:noBreakHyphen | w:ptab | w:t | w:tab | w:sym"
-    ):
-        pieces.append(legacy_symbol_record(child) if child.tag == qn("w:sym") else str(child))
+    text_tags = {
+        qn("w:br"), qn("w:cr"), qn("w:noBreakHyphen"), qn("w:ptab"),
+        qn("w:t"), qn("w:tab"), qn("w:sym"),
+    }
+    for child_kind, child in iter_effective_children(run._r):
+        if child_kind == "unreadable":
+            pieces.append(f"[unreadable {child['kind']}: {child['reason']}]")
+        elif child.tag in text_tags:
+            pieces.append(legacy_symbol_record(child) if child.tag == qn("w:sym") else str(child))
     return "".join(pieces)
 
 
 def paragraph_text(paragraph):
-    return "".join(run_text(run) for run in iter_paragraph_runs(paragraph))
+    pieces = []
+    for kind, item in iter_paragraph_items(paragraph):
+        pieces.append(
+            run_text(item) if kind == "run"
+            else f"[unreadable {item['kind']}: {item['reason']}]"
+        )
+    return "".join(pieces)
+
+
+def cell_paragraph_text(paragraph):
+    pieces = []
+    for kind, item in iter_paragraph_items(paragraph):
+        if kind == "unreadable":
+            pieces.append(f"[unreadable {item['kind']}: {item['reason']}]")
+            continue
+        for child_kind, child in iter_effective_children(item._r):
+            if child_kind == "unreadable":
+                pieces.append(f"[unreadable {child['kind']}: {child['reason']}]")
+            elif child.tag == qn("w:t"):
+                pieces.append(child.text or "")
+            elif child.tag in (qn("w:tab"), qn("w:ptab")):
+                pieces.append("<tab>")
+            elif child.tag in (qn("w:br"), qn("w:cr")):
+                pieces.append("<br>")
+            elif child.tag == qn("w:noBreakHyphen"):
+                pieces.append("-")
+            elif child.tag == qn("w:sym"):
+                pieces.append(legacy_symbol_record(child))
+    return "".join(pieces)
+
+
+def tc_text(tc, parent):
+    paragraphs = []
+    for kind, block in iter_part_blocks(tc, parent):
+        if kind == "paragraph":
+            paragraphs.append(cell_paragraph_text(block))
+    return " / ".join(paragraphs)
+
+
+def iter_content_control_children(root, target_tag):
+    for child_kind, child in iter_effective_children(root):
+        if child_kind == "unreadable":
+            raise ValueError(
+                f"unresolved AlternateContent while locating {target_tag}: {child}"
+            )
+        if child.tag == target_tag:
+            yield child
+        elif child.tag == qn("w:sdt"):
+            for content in child.findall(qn("w:sdtContent")):
+                yield from iter_content_control_children(content, target_tag)
 
 
 def table_content(table):
     rows = []
-    for row in table.rows:
+    for row_element in iter_content_control_children(table._tbl, qn("w:tr")):
         rendered_cells = []
-        row_properties = row._tr.find(qn("w:trPr"))
+        row_properties = row_element.find(qn("w:trPr"))
         grid_before_node = None if row_properties is None else row_properties.find(qn("w:gridBefore"))
         grid_after_node = None if row_properties is None else row_properties.find(qn("w:gridAfter"))
         grid_before = 0 if grid_before_node is None else int(grid_before_node.get(qn("w:val"), "0"))
         grid_after = 0 if grid_after_node is None else int(grid_after_node.get(qn("w:val"), "0"))
         column = grid_before
-        for cell in row.cells:
-            items = []
-            for kind, block in iter_part_blocks(cell._tc, cell):
-                if kind == "paragraph":
-                    items.append(paragraph_text(block))
-                elif kind == "table":
-                    items.append(table_content(block))
-                else:
-                    items.append(block)
-            rendered_cells.append({"column": column, "items": items})
-            column += 1
+        for cell_element in iter_content_control_children(row_element, qn("w:tc")):
+            cell_properties = cell_element.find(qn("w:tcPr"))
+            grid_span = None if cell_properties is None else cell_properties.find(qn("w:gridSpan"))
+            colspan = 1 if grid_span is None else int(grid_span.get(qn("w:val"), "1"))
+            vertical = None if cell_properties is None else cell_properties.find(qn("w:vMerge"))
+            vertical_merge = None if vertical is None else vertical.get(qn("w:val"), "continue")
+            nested_tables = []
+            unreadable = []
+            for kind, block in iter_part_blocks(cell_element, table):
+                if kind == "table":
+                    nested_tables.append(table_content(block))
+                elif kind == "unreadable":
+                    unreadable.append(block)
+            rendered_cells.append({
+                "column": column, "colspan": colspan,
+                "vMerge": vertical_merge,
+                "text": tc_text(cell_element, table),
+                "tables": nested_tables,
+                "unreadable": unreadable,
+            })
+            column += colspan
         rows.append({
             "grid_before": grid_before, "cells": rendered_cells, "grid_after": grid_after,
         })
@@ -256,7 +382,6 @@ grid_after.set(qn("w:val"), "2")
 row_properties.append(grid_after)
 nested_table = controlled_table.cell(0, 0).add_table(rows=1, cols=1)
 nested_table.cell(0, 0).text = "nested한"
-wrap_in_sdt(controlled_table._tbl)
 inline_paragraph = sdt_doc.add_paragraph("before-")
 inline_run = inline_paragraph.add_run("inline한")
 inline_paragraph.add_run("-after")
@@ -281,6 +406,11 @@ cell_alt_chunk.set(qn("r:id"), chunk_relationship)
 controlled_table.cell(0, 0)._tc.insert(
     len(controlled_table.cell(0, 0)._tc) - 1, cell_alt_chunk
 )
+controlled_row_element = controlled_table.rows[0]._tr
+controlled_cell_element = controlled_row_element.tc_lst[0]
+wrap_in_sdt(controlled_cell_element)
+wrap_in_sdt(controlled_row_element)
+wrap_in_sdt(controlled_table._tbl)
 sdt_doc.save("content-control.docx")
 sdt_reopened = Document("content-control.docx")
 check("doc.paragraphs omits block content-control text (negative control)",
@@ -305,9 +435,17 @@ check("paragraph extraction preserves the legacy symbol's position, font, and ch
       f"-legacy-{legacy_symbol_marker}-visible" in paragraph_text(legacy_paragraph),
       paragraph_text(legacy_paragraph))
 walked_tables = [block for kind, block in walked_blocks if kind == "table"]
+check("Table.rows omits a row wrapped by row-level sdtContent (negative control)",
+      len(walked_tables) == 1 and len(walked_tables[0].rows) == 0)
+physical_rows = list(iter_content_control_children(walked_tables[0]._tbl, qn("w:tr")))
+check("tr.tc_lst omits a cell wrapped by cell-level sdtContent (negative control)",
+      len(physical_rows) == 1 and len(physical_rows[0].tc_lst) == 0)
 rendered_tables = [table_content(table) for table in walked_tables]
 check("content-control traversal emits a wrapped table",
       len(walked_tables) == 1 and "table한" in str(rendered_tables), rendered_tables)
+check("table traversal emits the sdt-wrapped physical row and cell",
+      len(rendered_tables[0]) == 1 and len(rendered_tables[0][0]["cells"]) == 1,
+      rendered_tables)
 all_emitted = walked_text + [str(table) for table in rendered_tables]
 check("table text is emitted exactly once, not again as prose",
       sum(item.count("table한") for item in all_emitted) == 1, all_emitted)
@@ -327,14 +465,111 @@ expected_alt_chunk = {
 }
 check("altChunk content is reported instead of silently omitted",
       unreadable_parts == [expected_alt_chunk], unreadable_parts)
-cell_unreadable = [
-    item for item in rendered_tables[0][0]["cells"][0]["items"]
-    if isinstance(item, dict) and item.get("kind") == "altChunk"
-]
+cell_unreadable = rendered_tables[0][0]["cells"][0]["unreadable"]
 check("altChunk content inside a table cell is also reported",
       cell_unreadable == [expected_alt_chunk], rendered_tables)
 check("altChunk payload is not misrepresented as extracted paragraph text",
       all("IMPORTED ALTCHUNK TEXT" not in text for text in walked_text), walked_text)
+
+
+# ---- read.md chooses exactly one mc:AlternateContent branch ---------------------
+W14_NAMESPACE = "http://schemas.microsoft.com/office/word/2010/wordml"
+W_NAMESPACE = qn("w:p").split("}", 1)[0][1:]
+
+
+def wml_run(text):
+    run = OxmlElement("w:r")
+    text_element = OxmlElement("w:t")
+    text_element.text = text
+    run.append(text_element)
+    return run
+
+
+def wml_paragraph(text):
+    paragraph = OxmlElement("w:p")
+    paragraph.append(wml_run(text))
+    return paragraph
+
+
+def wml_table(text):
+    source = Document()
+    table = source.add_table(rows=1, cols=1)
+    table.cell(0, 0).text = text
+    return copy.deepcopy(table._tbl)
+
+
+def alternate_content(requires, choice_elements, fallback_elements=None):
+    element = etree.Element(
+        MC_ALTERNATE_CONTENT,
+        nsmap={"mc": MC_NAMESPACE, "w14": W14_NAMESPACE, "w": W_NAMESPACE},
+    )
+    choice = etree.SubElement(element, MC_CHOICE)
+    choice.set("Requires", requires)
+    for child in choice_elements:
+        choice.append(child)
+    if fallback_elements is not None:
+        fallback = etree.SubElement(element, MC_FALLBACK)
+        for child in fallback_elements:
+            fallback.append(child)
+    return element
+
+
+mc_doc = Document()
+mc_doc.element.body.insert(
+    len(mc_doc.element.body) - 1,
+    alternate_content(
+        "w14",
+        [wml_paragraph("UNSUPPORTED-CHOICE-BLOCK"), wml_table("UNSUPPORTED-CHOICE-TABLE")],
+        [wml_paragraph("FALLBACK-BLOCK"), wml_table("FALLBACK-TABLE")],
+    ),
+)
+mc_doc.element.body.insert(
+    len(mc_doc.element.body) - 1,
+    alternate_content(
+        "w",
+        [wml_paragraph("SUPPORTED-CHOICE-BLOCK")],
+        [wml_paragraph("UNSELECTED-FALLBACK-BLOCK")],
+    ),
+)
+mc_doc.element.body.insert(
+    len(mc_doc.element.body) - 1,
+    alternate_content("w14", [wml_paragraph("UNRESOLVED-HIDDEN-BLOCK")]),
+)
+mc_inline = mc_doc.add_paragraph("INLINE-BEFORE-")
+mc_inline._p.append(
+    alternate_content(
+        "w14", [wml_run("UNSUPPORTED-CHOICE-INLINE")], [wml_run("FALLBACK-INLINE")]
+    )
+)
+mc_inline.add_run("-INLINE-AFTER")
+mc_doc.save("alternate-content.docx")
+mc_reopened = Document("alternate-content.docx")
+mc_blocks = list(iter_part_blocks(mc_reopened.element.body, mc_reopened))
+mc_paragraph_texts = [paragraph_text(block) for kind, block in mc_blocks if kind == "paragraph"]
+mc_tables = [table_content(block) for kind, block in mc_blocks if kind == "table"]
+mc_unreadable = [block for kind, block in mc_blocks if kind == "unreadable"]
+mc_emitted = mc_paragraph_texts + [str(table) for table in mc_tables]
+check("unsupported AlternateContent Choice selects only its Fallback paragraph and table",
+      any("FALLBACK-BLOCK" in text for text in mc_emitted)
+      and any("FALLBACK-TABLE" in text for text in mc_emitted)
+      and all("UNSUPPORTED-CHOICE" not in text for text in mc_emitted),
+      mc_emitted)
+check("supported AlternateContent Choice wins over its Fallback",
+      any("SUPPORTED-CHOICE-BLOCK" in text for text in mc_emitted)
+      and all("UNSELECTED-FALLBACK-BLOCK" not in text for text in mc_emitted),
+      mc_emitted)
+check("inline AlternateContent contributes exactly one selected run",
+      "INLINE-BEFORE-FALLBACK-INLINE-INLINE-AFTER" in mc_paragraph_texts
+      and all("UNSUPPORTED-CHOICE-INLINE" not in text for text in mc_paragraph_texts),
+      mc_paragraph_texts)
+check("AlternateContent without a usable branch is explicitly unreadable",
+      mc_unreadable == [{
+          "kind": "AlternateContent",
+          "requires": [["w14"]],
+          "reason": "no supported Choice and no Fallback",
+      }], mc_unreadable)
+check("unresolved AlternateContent payload is not misrepresented as extracted text",
+      all("UNRESOLVED-HIDDEN-BLOCK" not in text for text in mc_emitted), mc_emitted)
 
 # Per-run glyph validation must not let a different referenced font hide a missing glyph.
 fixture_cmaps = {"CJK Face": {ord("漢")}, "Latin Face": {ord("A")}}
@@ -387,6 +622,7 @@ def font_slot(character):
         or 0xFE30 <= codepoint <= 0xFE6F
         or 0xFF00 <= codepoint <= 0xFFEF
         or 0x20000 <= codepoint <= 0x3134F
+        or 0x31350 <= codepoint <= 0x33479
     )
     return "eastAsia" if uses_east_asian_slot else ("ascii" if codepoint < 128 else "hAnsi")
 
@@ -396,6 +632,12 @@ check("Hangul syllables use the east-Asian font slot", font_slot("한") == "east
 check("Hangul Jamo use the east-Asian font slot", font_slot("ᄒ") == "eastAsia")
 check("Yi syllables use the east-Asian font slot", font_slot("ꀀ") == "eastAsia")
 check("CJK compatibility forms use the east-Asian font slot", font_slot("︰") == "eastAsia")
+check("Unicode 17 Han Extension H start uses the east-Asian font slot",
+      font_slot(chr(0x31350)) == "eastAsia")
+check("Unicode 17 Han Extension J end uses the east-Asian font slot",
+      font_slot(chr(0x33479)) == "eastAsia")
+check("codepoint after the Unicode 17 Han ranges stays in hAnsi",
+      font_slot(chr(0x3347A)) == "hAnsi")
 check("ASCII text keeps the ascii font slot", font_slot("A") == "ascii")
 
 # Header/footer parts have no `.document`; effective styles close over the document.
@@ -910,6 +1152,7 @@ def font_slot(character):
         or 0x3130 <= codepoint <= 0x318F or 0xA960 <= codepoint <= 0xA97F
         or 0xAC00 <= codepoint <= 0xD7FF or 0xF900 <= codepoint <= 0xFAFF
         or 0x20000 <= codepoint <= 0x3134F
+        or 0x31350 <= codepoint <= 0x33479
     ) else ("ascii" if codepoint < 128 else "hAnsi")
 
 check("Hangul syllables use the East Asian slot", font_slot("한") == "eastAsia")
@@ -918,6 +1161,10 @@ check("compatibility jamo use the East Asian slot", font_slot("ㄱ") == "eastAsi
 check("Hangul extended-A uses the East Asian slot", font_slot(chr(0xA960)) == "eastAsia")
 check("Hangul extended-B uses the East Asian slot", font_slot(chr(0xD7B0)) == "eastAsia")
 check("U+2E80 CJK radical uses the East Asian slot", font_slot(chr(0x2E80)) == "eastAsia")
+check("Unicode 17 supplementary Han endpoints use the East Asian slot",
+      font_slot(chr(0x31350)) == font_slot(chr(0x33479)) == "eastAsia")
+check("the codepoint after Unicode 17 Han remains hAnsi",
+      font_slot(chr(0x3347A)) == "hAnsi")
 check("Latin stays in the ascii slot", font_slot("A") == "ascii")
 check("non-CJK fullwidth-range-adjacent Latin-1 stays hAnsi", font_slot("é") == "hAnsi")
 

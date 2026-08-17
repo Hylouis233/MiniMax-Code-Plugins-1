@@ -7,10 +7,11 @@
 #   python docx_fixture.py  (deps: python-docx, pymupdf, soffice on PATH)
 import base64
 import csv
+import os
 import sys
 import zipfile
 from pathlib import Path
-from tempfile import TemporaryFile
+from tempfile import TemporaryFile, mkstemp
 
 import openpyxl
 
@@ -21,6 +22,15 @@ def check(name, cond, extra=""):
     print(("PASS " if cond else "FAIL ") + name + ((" :: " + str(extra)) if not cond and extra else ""))
     if not cond:
         failures.append(name)
+
+
+# Execute the canonical package.md snippet itself so fixtures cannot drift from the Skill.
+package_reference = (
+    Path(__file__).resolve().parents[1] / "skills" / "xlsx" / "references" / "package.md"
+)
+package_markdown = package_reference.read_text(encoding="utf-8")
+package_code = package_markdown.split("```python", 1)[1].split("```", 1)[0]
+exec(compile(package_code, str(package_reference), "exec"), globals())
 
 
 # ---- csv.md snippet: sniffed dialect actually reaches the reader ---------------
@@ -146,6 +156,284 @@ wb.save("plain.xlsx")
 with zipfile.ZipFile("plain.xlsx") as zin:
     payload = {name: zin.read(name) for name in zin.namelist()}
 
+# ---- package.md: preflight runs before openpyxl and bounds every package part -----
+try:
+    with open_validated_workbook("plain.xlsx") as validated_plain:
+        ordinary_package_loaded = validated_plain.sheetnames == ["Data", "Keep"]
+except Exception as error:
+    ordinary_package_loaded = False
+    ordinary_package_error = error
+check("bounded XLSX loader accepts an ordinary package", ordinary_package_loaded,
+      locals().get("ordinary_package_error"))
+
+compressed_payload = dict(payload)
+compressed_payload["xl/styles.xml"] = (
+    b'<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+    + b"A" * (1024 * 1024)
+    + b"</styleSheet>"
+)
+with zipfile.ZipFile("compressed-xlsx-bomb.xlsx", "w", zipfile.ZIP_DEFLATED) as archive:
+    for name, data in compressed_payload.items():
+        archive.writestr(name, data)
+real_load_workbook = openpyxl.load_workbook
+preflight_load_calls = []
+openpyxl.load_workbook = lambda *args, **kwargs: preflight_load_calls.append(args) or None
+try:
+    with open_validated_workbook("compressed-xlsx-bomb.xlsx"):
+        compressed_bomb_rejected = False
+except ValueError as error:
+    compressed_bomb_rejected = "suspicious compression ratio: xl/styles.xml" in str(error)
+finally:
+    openpyxl.load_workbook = real_load_workbook
+check("XLSX compression bomb is rejected before openpyxl runs",
+      compressed_bomb_rejected and preflight_load_calls == [],
+      (compressed_bomb_rejected, preflight_load_calls))
+check("XLSX preflight gates remain active under optimized Python",
+      __debug__ or compressed_bomb_rejected)
+
+original_member_limit = MAX_MEMBERS
+try:
+    with zipfile.ZipFile("plain.xlsx") as archive:
+        MAX_MEMBERS = len(archive.infolist()) - 1
+    with validated_xlsx_source("plain.xlsx"):
+        member_limit_rejected = False
+except ValueError as error:
+    member_limit_rejected = str(error) == "archive member count above limit"
+finally:
+    MAX_MEMBERS = original_member_limit
+check("XLSX member-count limit rejects a real package before parsing", member_limit_rejected)
+
+metadata_names = [
+    name for name in payload
+    if name.endswith((".xml", ".rels")) and not name.startswith("xl/worksheets/")
+]
+metadata_test_limit = max(len(payload[name]) for name in metadata_names) + 128
+oversized_metadata = dict(payload)
+oversized_metadata["xl/styles.xml"] = (
+    b'<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><!--'
+    + b"x" * metadata_test_limit
+    + b"--></styleSheet>"
+)
+with zipfile.ZipFile("oversized-metadata.xlsx", "w", zipfile.ZIP_STORED) as archive:
+    for name, data in oversized_metadata.items():
+        archive.writestr(name, data)
+original_xml_limit = MAX_XML_PART
+try:
+    MAX_XML_PART = metadata_test_limit
+    with validated_xlsx_source("oversized-metadata.xlsx"):
+        oversized_metadata_rejected = False
+except ValueError as error:
+    oversized_metadata_rejected = str(error) == "oversized XML part: xl/styles.xml"
+finally:
+    MAX_XML_PART = original_xml_limit
+check("metadata XML part limit is enforced before openpyxl", oversized_metadata_rejected)
+
+large_worksheet_payload = dict(payload)
+sheet_name = "xl/worksheets/sheet1.xml"
+large_worksheet_payload[sheet_name] = large_worksheet_payload[sheet_name].replace(
+    b"</worksheet>", b"<!--" + b"w" * (metadata_test_limit + 256) + b"--></worksheet>"
+)
+with zipfile.ZipFile("large-streamed-worksheet.xlsx", "w", zipfile.ZIP_STORED) as archive:
+    for name, data in large_worksheet_payload.items():
+        archive.writestr(name, data)
+original_xml_limit = MAX_XML_PART
+original_worksheet_limit = MAX_WORKSHEET_XML
+try:
+    MAX_XML_PART = metadata_test_limit
+    MAX_WORKSHEET_XML = len(large_worksheet_payload[sheet_name]) + 128
+    with validated_xlsx_source("large-streamed-worksheet.xlsx"):
+        streamed_worksheet_passed = True
+except Exception as error:
+    streamed_worksheet_passed = False
+    streamed_worksheet_error = error
+finally:
+    MAX_XML_PART = original_xml_limit
+    MAX_WORKSHEET_XML = original_worksheet_limit
+check("large worksheet XML uses the bounded streaming limit, not metadata limit",
+      streamed_worksheet_passed, locals().get("streamed_worksheet_error"))
+
+unsafe_xml_payload = dict(payload)
+unsafe_xml_payload["xl/unsafe.xml"] = (
+    '<?xml version="1.0" encoding="UTF-16"?>'
+    '<!DOCTYPE unsafe [<!ENTITY x "expanded">]><unsafe>&x;</unsafe>'
+).encode("utf-16")
+with zipfile.ZipFile("unsafe-utf16-xml.xlsx", "w", zipfile.ZIP_STORED) as archive:
+    for name, data in unsafe_xml_payload.items():
+        archive.writestr(name, data)
+try:
+    with validated_xlsx_source("unsafe-utf16-xml.xlsx"):
+        utf16_dtd_rejected = False
+except ValueError as error:
+    utf16_dtd_rejected = "unsafe or malformed XML part: xl/unsafe.xml" in str(error)
+check("defused XML parsing rejects UTF-16 DTD/entity parts", utf16_dtd_rejected)
+
+semantic_range_payloads = {
+    "merge-range-bomb.xlsx": (
+        b'<mergeCells count="1"><mergeCell ref="A1:XFD1048576"/></mergeCells>'
+    ),
+    "hyperlink-range-bomb.xlsx": (
+        b'<hyperlinks><hyperlink ref="A1:XFD1048576" location="Data!A1"/>'
+        b'</hyperlinks>'
+    ),
+}
+for malicious_path, range_markup in semantic_range_payloads.items():
+    malicious_payload = dict(payload)
+    malicious_payload[sheet_name] = malicious_payload[sheet_name].replace(
+        b"</worksheet>", range_markup + b"</worksheet>"
+    )
+    with zipfile.ZipFile(malicious_path, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name, data in malicious_payload.items():
+            archive.writestr(name, data)
+
+from openpyxl.comments import Comment
+
+comment_wb = openpyxl.Workbook()
+comment_wb.active["A1"].comment = Comment("bounded note", "fixture")
+comment_wb.save("comment-base.xlsx")
+comment_wb.close()
+with zipfile.ZipFile("comment-base.xlsx") as archive:
+    comment_payload = {name: archive.read(name) for name in archive.namelist()}
+comment_part = next(
+    name for name in comment_payload
+    if name.casefold().startswith("xl/comments/") and name.casefold().endswith(".xml")
+)
+comment_payload[comment_part] = comment_payload[comment_part].replace(
+    b'ref="A1"', b'ref="A1:XFD1048576"', 1
+)
+with zipfile.ZipFile("comment-range-bomb.xlsx", "w", zipfile.ZIP_DEFLATED) as archive:
+    for name, data in comment_payload.items():
+        archive.writestr(name, data)
+
+semantic_expected_errors = {
+    **{path: "worksheet cell materialization budget exceeded"
+       for path in semantic_range_payloads},
+    "comment-range-bomb.xlsx": "comment reference must identify one cell",
+}
+
+real_load_workbook = openpyxl.load_workbook
+semantic_preflight_load_calls = []
+semantic_range_results = {}
+openpyxl.load_workbook = (
+    lambda *args, **kwargs: semantic_preflight_load_calls.append(args) or None
+)
+try:
+    for malicious_path, expected_error in semantic_expected_errors.items():
+        try:
+            with open_validated_workbook(malicious_path):
+                semantic_range_results[malicious_path] = False
+        except ValueError as error:
+            semantic_range_results[malicious_path] = (
+                expected_error in str(error)
+            )
+
+    original_materialized_cell_limit = MAX_WORKSHEET_MATERIALIZED_CELLS
+    try:
+        MAX_WORKSHEET_MATERIALIZED_CELLS = 1
+        with open_validated_workbook("plain.xlsx"):
+            explicit_cell_limit_rejected = False
+    except ValueError as error:
+        explicit_cell_limit_rejected = (
+            str(error) == "worksheet cell materialization budget exceeded"
+        )
+    finally:
+        MAX_WORKSHEET_MATERIALIZED_CELLS = original_materialized_cell_limit
+finally:
+    openpyxl.load_workbook = real_load_workbook
+
+check(
+    "merge, hyperlink, and comment ranges are bounded before openpyxl runs",
+    all(semantic_range_results.values()) and semantic_preflight_load_calls == [],
+    (semantic_range_results, semantic_preflight_load_calls),
+)
+check(
+    "explicit worksheet cells share the pre-load materialization budget",
+    explicit_cell_limit_rejected and semantic_preflight_load_calls == [],
+    (explicit_cell_limit_rejected, semantic_preflight_load_calls),
+)
+with open_validated_workbook("comment-base.xlsx") as validated_comment_wb:
+    valid_comment_loaded = (
+        validated_comment_wb.active["A1"].comment is not None
+        and validated_comment_wb.active["A1"].comment.text == "bounded note"
+    )
+check("a valid single-cell comment survives bounded loading", valid_comment_loaded)
+
+range_list_payloads = {
+    "range-list-budget.xlsx": b'<conditionalFormatting sqref="A1 B1 C1"/>',
+    "range-list-whole-sheet.xlsx": (
+        b'<conditionalFormatting sqref="A1:XFD1048576"/>'
+    ),
+}
+for range_list_path, range_list_markup in range_list_payloads.items():
+    range_list_payload = dict(payload)
+    range_list_payload[sheet_name] = range_list_payload[sheet_name].replace(
+        b"</worksheet>", range_list_markup + b"</worksheet>"
+    )
+    with zipfile.ZipFile(range_list_path, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name, data in range_list_payload.items():
+            archive.writestr(name, data)
+
+original_range_token_limit = MAX_WORKSHEET_RANGE_TOKENS
+original_range_list_char_limit = MAX_WORKSHEET_RANGE_LIST_CHARS
+real_load_workbook = openpyxl.load_workbook
+range_list_load_calls = []
+openpyxl.load_workbook = lambda *args, **kwargs: range_list_load_calls.append(args) or None
+try:
+    MAX_WORKSHEET_RANGE_TOKENS = 2
+    try:
+        with open_validated_workbook("range-list-budget.xlsx"):
+            range_token_budget_rejected = False
+    except ValueError as error:
+        range_token_budget_rejected = str(error) == "worksheet range-token budget exceeded"
+    MAX_WORKSHEET_RANGE_TOKENS = 1
+    try:
+        with validated_xlsx_source("range-list-whole-sheet.xlsx"):
+            whole_sheet_range_accepted = True
+    except Exception as error:
+        whole_sheet_range_accepted = False
+        whole_sheet_range_error = error
+    MAX_WORKSHEET_RANGE_LIST_CHARS = 8
+    try:
+        with validated_xlsx_source("range-list-whole-sheet.xlsx"):
+            long_range_list_rejected = False
+    except ValueError as error:
+        long_range_list_rejected = "worksheet range list is too long" in str(error)
+finally:
+    MAX_WORKSHEET_RANGE_TOKENS = original_range_token_limit
+    MAX_WORKSHEET_RANGE_LIST_CHARS = original_range_list_char_limit
+    openpyxl.load_workbook = real_load_workbook
+
+check(
+    "worksheet range-list token growth is bounded before openpyxl runs",
+    range_token_budget_rejected and range_list_load_calls == [],
+    (range_token_budget_rejected, range_list_load_calls),
+)
+check(
+    "one whole-sheet sqref costs one range token rather than its cell area",
+    whole_sheet_range_accepted,
+    locals().get("whole_sheet_range_error"),
+)
+check("worksheet sqref character growth is bounded", long_range_list_rejected)
+
+Path("snapshot-source.xlsx").write_bytes(Path("plain.xlsx").read_bytes())
+replacement_wb = openpyxl.Workbook()
+replacement_wb.active["A1"] = "UNVALIDATED"
+replacement_wb.save("snapshot-replacement.xlsx")
+replacement_wb.close()
+with validated_xlsx_source("snapshot-source.xlsx") as snapshot_source:
+    Path("snapshot-source.xlsx").write_bytes(
+        Path("snapshot-replacement.xlsx").read_bytes()
+    )
+    snapshot_wb = openpyxl.load_workbook(snapshot_source, read_only=True, data_only=True)
+    try:
+        snapshot_value = snapshot_wb.active["A1"].value
+    finally:
+        snapshot_wb.close()
+check(
+    "validated source is a private snapshot isolated from later path changes",
+    snapshot_value == "Region",
+    snapshot_value,
+)
+
 # simulate an unsupported extension part (what a slicer/queries part looks like in the zip)
 payload["xl/slicers/slicer1.xml"] = b"<slicer xmlns='stub'/>"
 payload["xl/media/large.bin"] = b"x14:" * 32_768  # binary payload must never be marker-scanned
@@ -172,7 +460,7 @@ payload["xl/worksheets/sheet1.xml"] = payload["xl/worksheets/sheet1.xml"].replac
 payload["xl/worksheets/sheet2.xml"] = payload["xl/worksheets/sheet2.xml"].replace(
     b"</worksheet>", EXT_LIST_DROP + b"</worksheet>")
 
-with zipfile.ZipFile("extended.xlsx", "w", zipfile.ZIP_DEFLATED) as zout:
+with zipfile.ZipFile("extended.xlsx", "w", zipfile.ZIP_STORED) as zout:
     for name, data in payload.items():
         zout.writestr(name, data)
 
@@ -180,7 +468,7 @@ partial_payload = dict(payload)
 partial_payload["xl/worksheets/sheet1.xml"] = partial_payload[
     "xl/worksheets/sheet1.xml"
 ].replace(EXT_LIST_BOTH, EXT_LIST_KEEP)
-with zipfile.ZipFile("partial-extension.xlsx", "w", zipfile.ZIP_DEFLATED) as zout:
+with zipfile.ZipFile("partial-extension.xlsx", "w", zipfile.ZIP_STORED) as zout:
     for name, data in partial_payload.items():
         zout.writestr(name, data)
 
@@ -246,28 +534,86 @@ def stripped_extension_records(before, after, common_names):
     return sorted(stripped, key=repr)
 
 
-def round_trip_changes(path, **load_options):
-    before_names, before_extensions = archive_inventory(path)
-    wb = openpyxl.load_workbook(path, **load_options)  # same options as the real edit
-    with TemporaryFile() as output:
-        wb.save(output)
-        output.seek(0)
-        after_names, after_extensions = archive_inventory(output)
-    wb.close()
+def load_with_round_trip_audit_from_source(source, **load_options):
+    require(not load_options.get("read_only"),
+            "round-trip audit requires a normal writable Workbook")
+    source.seek(0)
+    before_names, before_extensions = archive_inventory(source)
+    source.seek(0)
+    audit_workbook = openpyxl.load_workbook(source, **load_options)
+    try:
+        with TemporaryFile() as output:
+            audit_workbook.save(output)
+            output.seek(0)
+            after_names, after_extensions = archive_inventory(output)
+    finally:
+        audit_workbook.close()
     dropped = sorted(before_names - after_names)
     stripped_extensions = stripped_extension_records(
         before_extensions, after_extensions, before_names & after_names
     )
-    return dropped, stripped_extensions
+    source.seek(0)
+    editable_workbook = openpyxl.load_workbook(source, **load_options)
+    return editable_workbook, dropped, stripped_extensions
 
 
-dropped, stripped = round_trip_changes("extended.xlsx")
+def load_with_round_trip_audit(path, **load_options):
+    with validated_xlsx_source(path) as source:
+        return load_with_round_trip_audit_from_source(source, **load_options)
+
+
+audited_extended, dropped, stripped = load_with_round_trip_audit("extended.xlsx")
+audited_extended.close()
 check("injected slicer-like part is detected as dropped", "xl/slicers/slicer1.xml" in dropped, dropped)
 check("each stripped worksheet extension record is reported with worksheet and URI",
       sum(item[0] == "xl/worksheets/sheet1.xml" and item[1] == EXT_URI
           for item in stripped) == 2,
       stripped)
-check("clean workbook reports nothing", round_trip_changes("plain.xlsx") == ([], []))
+audited_plain, clean_dropped, clean_stripped = load_with_round_trip_audit("plain.xlsx")
+check("clean workbook reports nothing", (clean_dropped, clean_stripped) == ([], []))
+check("round-trip audit returns the actual editable workbook identity",
+      audited_plain["Data"]["A2"].value == "EU")
+audited_plain.close()
+
+from openpyxl.drawing.image import Image as AuditImage
+Path("audit-image.png").write_bytes(base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZlRYAAAAASUVORK5CYII="
+))
+image_input_wb = openpyxl.Workbook()
+image_input_wb.active.title = "Data"
+image_input_wb.active["A1"] = "before"
+image_input_wb.active.add_image(AuditImage("audit-image.png"), "C3")
+image_input_wb.save("image-roundtrip.xlsx")
+image_editable, image_dropped, image_stripped = load_with_round_trip_audit(
+    "image-roundtrip.xlsx"
+)
+image_editable["Data"]["A1"] = "after"
+image_editable.save("image-roundtrip-edited.xlsx")
+image_editable.close()
+image_reopened = openpyxl.load_workbook("image-roundtrip-edited.xlsx")
+check("round-trip audit returns a fresh workbook whose image streams can be saved again",
+      image_dropped == [] and image_stripped == []
+      and image_reopened["Data"]["A1"].value == "after"
+      and len(image_reopened["Data"]._images) == 1,
+      (image_dropped, image_stripped, len(image_reopened["Data"]._images)))
+image_reopened.close()
+
+real_archive_inventory = archive_inventory
+preflight_inventory_calls = []
+def tracking_archive_inventory(source):
+    preflight_inventory_calls.append(source)
+    return real_archive_inventory(source)
+archive_inventory = tracking_archive_inventory
+try:
+    load_with_round_trip_audit("compressed-xlsx-bomb.xlsx")
+    audit_bomb_rejected = False
+except ValueError as error:
+    audit_bomb_rejected = "suspicious compression ratio: xl/styles.xml" in str(error)
+finally:
+    archive_inventory = real_archive_inventory
+check("round-trip audit rejects a package bomb before raw inventory",
+      audit_bomb_rejected and preflight_inventory_calls == [],
+      (audit_bomb_rejected, preflight_inventory_calls))
 inventory_names, inventory_extensions = archive_inventory("extended.xlsx")
 check("binary archive parts are named but never marker-scanned",
       "xl/media/large.bin" in inventory_names
@@ -362,9 +708,11 @@ from openpyxl.chart import BarChart, Reference
 from openpyxl.drawing.image import Image
 from openpyxl.formula import Tokenizer
 from openpyxl.formatting.rule import CellIsRule, ColorScaleRule, DataBarRule, FormulaRule
+from openpyxl.utils import get_column_letter
 from openpyxl.utils.cell import coordinate_to_tuple, range_boundaries
 from openpyxl.workbook.defined_name import DefinedName
 from openpyxl.worksheet.datavalidation import DataValidation
+from openpyxl.worksheet.hyperlink import Hyperlink
 from openpyxl.worksheet.table import Table
 
 
@@ -425,15 +773,14 @@ def drawing_anchor_rows(drawing):
     return tuple(rows)
 
 
-def sparse_formula_cells(sheet):
+def sparse_cells(sheet):
     if not hasattr(sheet, "_cells"):
         raise RuntimeError("structural edits require a normal writable Worksheet")
-    return (
-        cell for cell in sorted(
-            sheet._cells.values(), key=lambda cell: (cell.row, cell.column)
-        )
-        if cell.data_type == "f"
-    )
+    return sorted(sheet._cells.values(), key=lambda cell: (cell.row, cell.column))
+
+
+def sparse_formula_cells(sheet):
+    return (cell for cell in sparse_cells(sheet) if cell.data_type == "f")
 
 
 def structural_references(workbook):
@@ -445,6 +792,17 @@ def structural_references(workbook):
         for cell in sparse_formula_cells(sheet):
             refs.append(("cell formula", f"{owner}!{cell.coordinate}",
                          formula_text(cell.value)))
+        for cell in sparse_cells(sheet):
+            hyperlink = cell.hyperlink
+            if hyperlink is None:
+                continue
+            location = getattr(hyperlink, "location", None)
+            target = getattr(hyperlink, "target", None)
+            refs.append((
+                "cell hyperlink",
+                f"{owner}!{cell.coordinate}",
+                (getattr(hyperlink, "ref", None), location, target),
+            ))
         for table in sheet.tables.values():
             refs.append(("table", owner + "!" + table.name, table.ref))
         for merged_range in sheet.merged_cells.ranges:
@@ -478,6 +836,11 @@ def structural_references(workbook):
     return refs
 
 
+def non_cell_references(workbook):
+    return [reference for reference in structural_references(workbook)
+            if reference[0] != "cell formula"]
+
+
 def cell_formula_references(workbook):
     refs = []
     for sheet in workbook.worksheets:
@@ -496,7 +859,7 @@ def formula_may_intersect_rows(owner_sheet, formula, shifted_sheet, start_row):
     if not isinstance(formula, str) or not formula.startswith("="):
         return True
     tokens = Tokenizer(formula).items
-    unmodeled_reference_functions = {"indirect", "offset", "address"}
+    unmodeled_reference_functions = {"indirect", "offset", "address", "hyperlink"}
     if any(
         token.type == "FUNC" and token.subtype == "OPEN"
         and token.value.rstrip("(").rsplit(":", 1)[-1]
@@ -587,6 +950,59 @@ check(
     formula_references,
 )
 
+hyperlink_wb = openpyxl.Workbook()
+hyperlink_ws = hyperlink_wb.active
+hyperlink_ws.title = "Data"
+hyperlink_ws["A10"] = "destination"
+hyperlink_ws["B2"] = "location link"
+hyperlink_ws["B2"].hyperlink = Hyperlink(ref="B2", location="'Data'!A10")
+hyperlink_ws["B3"] = "hash target link"
+hyperlink_ws["B3"].hyperlink = Hyperlink(ref="B3", target="#'Data'!A10")
+hyperlink_ws["B4"] = "external link"
+hyperlink_ws["B4"].hyperlink = "https://example.com/"
+hyperlink_references = non_cell_references(hyperlink_wb)
+check(
+    "structural inventory records every hyperlink anchor and destination form",
+    ("cell hyperlink", "Data!B2", ("B2", "'Data'!A10", None))
+    in hyperlink_references
+    and ("cell hyperlink", "Data!B3", ("B3", None, "#'Data'!A10"))
+    in hyperlink_references
+    and ("cell hyperlink", "Data!B4", ("B4", None, "https://example.com/"))
+    in hyperlink_references,
+    hyperlink_references,
+)
+check("cell hyperlinks block structural edits before insert_rows runs",
+      bool(hyperlink_references) and hyperlink_ws["A10"].value == "destination")
+
+# Negative controls prove why both destination and anchor metadata need a rewrite plan.
+destination_stale_wb = openpyxl.Workbook()
+destination_stale_ws = destination_stale_wb.active
+destination_stale_ws.title = "Data"
+destination_stale_ws["A10"] = "destination"
+destination_stale_ws["B2"] = "jump"
+destination_stale_ws["B2"].hyperlink = Hyperlink(ref="B2", location="'Data'!A10")
+destination_stale_ws.insert_rows(5)
+check("insert_rows leaves an internal hyperlink destination stale (negative control)",
+      destination_stale_ws["A11"].value == "destination"
+      and destination_stale_ws["B2"].hyperlink.location == "'Data'!A10")
+
+anchor_stale_wb = openpyxl.Workbook()
+anchor_stale_ws = anchor_stale_wb.active
+anchor_stale_ws.title = "Data"
+anchor_stale_ws["B8"] = "moving link"
+anchor_stale_ws["B8"].hyperlink = Hyperlink(ref="B8", target="https://example.com/")
+anchor_stale_ws.insert_rows(5)
+check("insert_rows leaves an external hyperlink anchor ref stale (negative control)",
+      anchor_stale_ws["B9"].value == "moving link"
+      and anchor_stale_ws["B9"].hyperlink.ref == "B8")
+anchor_stale_wb.save("stale-hyperlink-anchor.xlsx")
+anchor_stale_reopened = openpyxl.load_workbook("stale-hyperlink-anchor.xlsx")
+check("stale hyperlink ref detaches from moved text after save/reopen (negative control)",
+      anchor_stale_reopened["Data"]["B8"].hyperlink is not None
+      and anchor_stale_reopened["Data"]["B9"].value == "moving link"
+      and anchor_stale_reopened["Data"]["B9"].hyperlink is None)
+anchor_stale_reopened.close()
+
 sparse_scan_wb = openpyxl.Workbook()
 sparse_scan_ws = sparse_scan_wb.active
 sparse_scan_ws.title = "Sparse"
@@ -622,6 +1038,10 @@ check("INDIRECT string references require a manual structural rewrite plan",
       formula_may_intersect_rows("Data", '=SUM(INDIRECT("A5:A6"))', "Data", 5))
 check("OFFSET numeric row references require a manual structural rewrite plan",
       formula_may_intersect_rows("Data", "=SUM(OFFSET(A1,4,0,2,1))", "Data", 5))
+check("HYPERLINK string destinations require a manual structural rewrite plan",
+      formula_may_intersect_rows(
+          "Data", '=HYPERLINK("#\'Data\'!A10","jump")', "Data", 5
+      ))
 check("implicit-intersection INDIRECT references require a manual rewrite plan",
       formula_may_intersect_rows("Data", '=@INDIRECT("A5:A6")', "Data", 5))
 check("OFFSET used by the range operator requires a manual rewrite plan",
@@ -743,6 +1163,129 @@ PKG_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 CELL_TAG = f"{{{MAIN_NS}}}c"
 FORMULA_TAG = f"{{{MAIN_NS}}}f"
 VALUE_TAG = f"{{{MAIN_NS}}}v"
+INLINE_STRING_TAG = f"{{{MAIN_NS}}}is"
+MAX_EXPLICIT_CELLS = 1_000_000
+MAX_PROFILE_RECTANGLE_CELLS = 100_000
+
+
+def worksheet_part(archive, sheet_name):
+    workbook = ET.fromstring(archive.read("xl/workbook.xml"))
+    sheet = next(
+        item for item in workbook.iter(f"{{{MAIN_NS}}}sheet")
+        if item.attrib["name"] == sheet_name
+    )
+    relationship_id = sheet.attrib[f"{{{DOC_REL_NS}}}id"]
+    relationships = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+    target = next(
+        item.attrib["Target"] for item in relationships.iter(f"{{{PKG_REL_NS}}}Relationship")
+        if item.attrib["Id"] == relationship_id
+    )
+    part = target.lstrip("/") if target.startswith("/") else posixpath.normpath(
+        posixpath.join("xl", target)
+    )
+    require(part in archive.namelist(), f"worksheet part is missing: {part}")
+    return part
+
+
+def worksheet_xml_profile(archive, part):
+    min_row = min_column = max_row = max_column = None
+    explicit_cell_count = 0
+    formula_count = missing_formula_count = 0
+    missing_formula_samples = []
+    coordinate = cell_type = value_text = formula_display = None
+    has_formula = value_seen = inline_string_seen = False
+    with archive.open(part) as source:
+        for event, element in ET.iterparse(source, events=("start", "end")):
+            if event == "start" and element.tag == CELL_TAG:
+                coordinate = element.attrib.get("r")
+                require(coordinate is not None, f"cell without a coordinate in {part}")
+                cell_type = element.attrib.get("t")
+                has_formula = value_seen = inline_string_seen = False
+                value_text = formula_display = None
+            elif event == "end" and coordinate is not None:
+                if element.tag == FORMULA_TAG:
+                    has_formula = True
+                    if element.text is not None:
+                        formula_display = "=" + element.text
+                    else:
+                        details = ", ".join(
+                            f"{key}={value!r}" for key, value in sorted(element.attrib.items())
+                        )
+                        formula_display = f"<f {details}>"
+                elif element.tag == VALUE_TAG:
+                    value_seen = True
+                    value_text = element.text
+                elif element.tag == INLINE_STRING_TAG and cell_type == "inlineStr":
+                    inline_string_seen = True
+                elif element.tag == CELL_TAG:
+                    explicit_cell_count += 1
+                    require(explicit_cell_count <= MAX_EXPLICIT_CELLS,
+                            f"too many explicit worksheet cells in {part}")
+                    row_index, column_index = coordinate_to_tuple(coordinate)
+                    require(1 <= row_index <= 1_048_576 and 1 <= column_index <= 16_384,
+                            f"cell coordinate outside XLSX limits: {coordinate}")
+                    scalar_value = value_seen and (
+                        value_text not in (None, "") or cell_type == "str"
+                    )
+                    populated = has_formula or scalar_value or inline_string_seen
+                    if populated:
+                        min_row = row_index if min_row is None else min(min_row, row_index)
+                        min_column = (column_index if min_column is None
+                                      else min(min_column, column_index))
+                        max_row = row_index if max_row is None else max(max_row, row_index)
+                        max_column = (column_index if max_column is None
+                                      else max(max_column, column_index))
+                    valid_cache = value_seen and (
+                        value_text not in (None, "") or cell_type == "str"
+                    )
+                    if has_formula:
+                        formula_count += 1
+                        if not valid_cache:
+                            missing_formula_count += 1
+                            if len(missing_formula_samples) < 10:
+                                missing_formula_samples.append((coordinate, formula_display))
+                    coordinate = None
+                element.clear()
+            elif event == "end":
+                element.clear()
+    if max_row is None:
+        bounds, extent, first_populated_row = None, "A1:A1", None
+    else:
+        bounds = (min_row, min_column, max_row, max_column)
+        extent = (f"{get_column_letter(min_column)}{min_row}:"
+                  f"{get_column_letter(max_column)}{max_row}")
+        first_populated_row = min_row
+    return {
+        "part": part,
+        "bounds": bounds,
+        "extent": extent,
+        "first_populated_row": first_populated_row,
+        "formula_count": formula_count,
+        "missing_formula_count": missing_formula_count,
+        "missing_formula_samples": missing_formula_samples,
+        "explicit_cell_count": explicit_cell_count,
+    }
+
+
+def bounded_sample_rows(worksheet, profile, *, max_cells=MAX_PROFILE_RECTANGLE_CELLS):
+    if profile["bounds"] is None:
+        return iter(())
+    min_row, min_column, max_row, max_column = profile["bounds"]
+    sample_max_row = min(max_row, min_row + 5)
+    sample_cells = (sample_max_row - min_row + 1) * (max_column - min_column + 1)
+    require(sample_cells <= max_cells,
+            f"sample rectangle is too large: {worksheet.title} ({sample_cells} cells)")
+    return worksheet.iter_rows(
+        min_row=min_row, min_col=min_column,
+        max_row=sample_max_row, max_col=max_column,
+        values_only=True,
+    )
+
+
+def worksheet_declared_dimension(worksheet):
+    if worksheet.max_row is None or worksheet.max_column is None:
+        return None
+    return worksheet.calculate_dimension()
 
 wb_h = openpyxl.Workbook()
 wb_h.active.title = "First"
@@ -774,43 +1317,45 @@ for name in [item for item in multi_members if item.startswith("xl/worksheets/")
 with zipfile.ZipFile("multi.xlsx", "w", zipfile.ZIP_DEFLATED) as archive:
     for name, data in multi_members.items():
         archive.writestr(name, data)
-formula_wb = openpyxl.load_workbook("multi.xlsx", read_only=True, data_only=False)
-value_wb = openpyxl.load_workbook("multi.xlsx", read_only=True, data_only=True)
-profiled = list(value_wb.sheetnames)
-uncached = {(sn, fc.coordinate, formula_text(fc.value))
-            for sn in profiled
-            for frow, vrow in zip(formula_wb[sn].iter_rows(), value_wb[sn].iter_rows())
-            for fc, vc in zip(frow, vrow)
-            if fc.data_type == "f" and vc.value is None}
+with validated_xlsx_source("multi.xlsx") as multi_source:
+    formula_wb = openpyxl.load_workbook(multi_source, read_only=True, data_only=False)
+    multi_source.seek(0)
+    value_wb = openpyxl.load_workbook(multi_source, read_only=True, data_only=True)
+    try:
+        multi_source.seek(0)
+        with zipfile.ZipFile(multi_source) as archive:
+            profiled = list(value_wb.sheetnames)
+            multi_profiles = {
+                sheet_name: worksheet_xml_profile(
+                    archive, worksheet_part(archive, sheet_name)
+                )
+                for sheet_name in profiled
+            }
+        uncached = {
+            (sheet_name, coordinate, formula)
+            for sheet_name, profile in multi_profiles.items()
+            for coordinate, formula in profile["missing_formula_samples"]
+        }
+        paired_same_source = (
+            next(formula_wb["First"].iter_rows(min_row=1, max_row=1))[0].value == "=1+1"
+            and next(value_wb["First"].iter_rows(min_row=1, max_row=1))[0].value is None
+        )
+    finally:
+        formula_wb.close()
+        value_wb.close()
 check("multi-sheet profile iterates every sheet", profiled == ["First", "Second"], profiled)
+check("formula/value read-only streams share one validated source identity",
+      paired_same_source)
 check("uncached formulas found on both sheets", {item[0] for item in uncached} == {"First", "Second"}, uncached)
 check("array-formula objects are detected by data_type", ("First", "A2", "=ROW(A2:A3)") in uncached, uncached)
 data_table_entry = next(item for item in uncached if item[:2] == ("Second", "B1"))
 check("data-table formulas have stable diagnostic text",
-      data_table_entry[2].startswith("DataTableFormula(ref='B1:B2', r1='C1'")
-      and "0x" not in data_table_entry[2], data_table_entry)
-formula_wb.close()
-value_wb.close()
+      data_table_entry[2].startswith("<f ")
+      and "ref='B1:B2'" in data_table_entry[2]
+      and "r1='C1'" in data_table_entry[2], data_table_entry)
 
 # csv.md: value export uses the cached-value workbook and reports every missing cache.
-def worksheet_part(archive, sheet_name):
-    workbook = ET.fromstring(archive.read("xl/workbook.xml"))
-    sheet = next(
-        item for item in workbook.iter(f"{{{MAIN_NS}}}sheet")
-        if item.attrib["name"] == sheet_name
-    )
-    relationship_id = sheet.attrib[f"{{{DOC_REL_NS}}}id"]
-    relationships = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
-    target = next(
-        item.attrib["Target"] for item in relationships.iter(f"{{{PKG_REL_NS}}}Relationship")
-        if item.attrib["Id"] == relationship_id
-    )
-    if target.startswith("/"):
-        return target.lstrip("/")
-    return posixpath.normpath(posixpath.join("xl", target))
-
-
-def cached_formula_coordinates(archive, part):
+def cached_formula_coordinates(archive, part, wanted_coordinates=None):
     cached = set()
     coordinate = None
     cell_type = None
@@ -833,7 +1378,9 @@ def cached_formula_coordinates(archive, part):
                     valid_cache = value_seen and (
                         value_text not in (None, "") or cell_type == "str"
                     )
-                    if has_formula and valid_cache:
+                    if (has_formula and valid_cache
+                            and (wanted_coordinates is None
+                                 or coordinate in wanted_coordinates)):
                         cached.add(coordinate)
                     coordinate = None
                 element.clear()
@@ -842,36 +1389,24 @@ def cached_formula_coordinates(archive, part):
     return cached
 
 
-with zipfile.ZipFile("multi.xlsx") as archive:
-    multi_part = worksheet_part(archive, "First")
-    cached_formula_cells = cached_formula_coordinates(archive, multi_part)
-formula_wb = openpyxl.load_workbook("multi.xlsx", read_only=True, data_only=False)
-value_wb = openpyxl.load_workbook("multi.xlsx", read_only=True, data_only=True)
-formula_ws, value_ws = formula_wb["First"], value_wb["First"]
-formula_ws.reset_dimensions()
-value_ws.reset_dimensions()
-missing_caches = []
-export_mode = "safe"
-with open("formula-values.csv", "w", newline="", encoding="utf-8") as output:
-    writer = csv.writer(output)
-    for formula_row, value_row in zip(formula_ws.iter_rows(), value_ws.iter_rows()):
-        for formula_cell, value_cell in zip(formula_row, value_row):
-            if (formula_cell.data_type == "f" and value_cell.value is None
-                    and formula_cell.coordinate not in cached_formula_cells):
-                missing_caches.append(formula_cell.coordinate)
-        writer.writerow([
-            spreadsheet_csv_field(cell.value, mode=export_mode) for cell in value_row
-        ])
-with open("formula-values.csv", newline="", encoding="utf-8") as exported:
-    exported_values = [value for row in csv.reader(exported) for value in row]
-check("XLSX-to-CSV reports formulas with no cached value", set(missing_caches) >= {"A1", "A2"}, missing_caches)
-check("XLSX-to-CSV does not leak formula strings into value output",
-      not any(value.startswith("=") for value in exported_values), exported_values)
-check("XLSX-to-CSV safe mode neutralizes cached literal text for spreadsheet consumers",
-      {"'=literal", "'+literal", "'-literal", "'@literal"} <= set(exported_values),
-      exported_values)
-formula_wb.close()
-value_wb.close()
+with validated_xlsx_source("multi.xlsx") as multi_csv_source:
+    multi_csv_value_wb = openpyxl.load_workbook(
+        multi_csv_source, read_only=True, data_only=True
+    )
+    try:
+        multi_csv_source.seek(0)
+        with zipfile.ZipFile(multi_csv_source) as archive:
+            multi_csv_profile = worksheet_xml_profile(
+                archive, worksheet_part(archive, "First")
+            )
+        missing_caches = [
+            coordinate
+            for coordinate, _ in multi_csv_profile["missing_formula_samples"]
+        ]
+    finally:
+        multi_csv_value_wb.close()
+check("XLSX-to-CSV reports formulas with no cached value before creating output",
+      set(missing_caches) >= {"A1", "A2"}, missing_caches)
 
 
 def write_formula_cache_fixture(path, cache_kind):
@@ -914,32 +1449,63 @@ def write_formula_cache_fixture(path, cache_kind):
             archive.writestr(name, data)
 
 
-def export_formula_values(source_path, output_path):
+MAX_CSV_EXPORT_CELLS = 5_000_000
+
+
+def export_formula_values(source_path, output_path, *, max_cells=MAX_CSV_EXPORT_CELLS):
     sheet_name = "Data"
-    with zipfile.ZipFile(source_path) as archive:
-        part = worksheet_part(archive, sheet_name)
-        cached_cells = cached_formula_coordinates(archive, part)
-    formula_book = openpyxl.load_workbook(source_path, read_only=True, data_only=False)
-    value_book = openpyxl.load_workbook(source_path, read_only=True, data_only=True)
-    formula_sheet, value_sheet = formula_book[sheet_name], value_book[sheet_name]
-    formula_sheet.reset_dimensions()
-    value_sheet.reset_dimensions()
-    missing = []
     destination = Path(output_path)
-    temporary = destination.with_suffix(destination.suffix + ".tmp")
-    with temporary.open("w", newline="", encoding="utf-8") as output:
-        writer = csv.writer(output)
-        for formula_row, value_row in zip(formula_sheet.iter_rows(), value_sheet.iter_rows()):
-            for formula_cell, value_cell in zip(formula_row, value_row):
-                if (formula_cell.data_type == "f" and value_cell.value is None
-                        and formula_cell.coordinate not in cached_cells):
-                    missing.append(formula_cell.coordinate)
-            writer.writerow([spreadsheet_csv_field(cell.value) for cell in value_row])
-    formula_book.close()
-    value_book.close()
-    if missing:
-        temporary.unlink(missing_ok=True)
-        raise RuntimeError(f"formula cells have no cached value: {missing}")
+    temporary = None
+    try:
+        descriptor, temporary_name = mkstemp(
+            dir=destination.parent, prefix=f".{destination.name}.", suffix=".tmp"
+        )
+        temporary = Path(temporary_name)
+        os.close(descriptor)
+        with validated_xlsx_source(source_path) as package_source:
+            value_book = openpyxl.load_workbook(
+                package_source, read_only=True, data_only=True
+            )
+            try:
+                package_source.seek(0)
+                with zipfile.ZipFile(package_source) as archive:
+                    profile = worksheet_xml_profile(
+                        archive, worksheet_part(archive, sheet_name)
+                    )
+                if profile["missing_formula_count"]:
+                    raise RuntimeError(
+                        "formula cells have no cached value: "
+                        f"{profile['missing_formula_samples']}"
+                    )
+                value_sheet = value_book[sheet_name]
+                value_sheet.reset_dimensions()
+                if profile["bounds"] is None:
+                    rows = iter(())
+                else:
+                    min_row, min_column, max_row, max_column = profile["bounds"]
+                    export_cells = (
+                        (max_row - min_row + 1) * (max_column - min_column + 1)
+                    )
+                    require(export_cells <= max_cells,
+                            f"CSV export rectangle is too large: {export_cells} cells")
+                    rows = value_sheet.iter_rows(
+                        min_row=min_row, min_col=min_column,
+                        max_row=max_row, max_col=max_column,
+                        values_only=True,
+                    )
+                with temporary.open("w", newline="", encoding="utf-8") as output:
+                    writer = csv.writer(output)
+                    for value_row in rows:
+                        writer.writerow([
+                            spreadsheet_csv_field(value) for value in value_row
+                        ])
+            finally:
+                value_book.close()
+    except Exception:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        raise
+    require(temporary is not None, "CSV temporary output was not created")
     temporary.replace(destination)
 
 
@@ -964,23 +1530,12 @@ check("XML cache inventory rejects bare empty <v/> and an absent cache",
 
 
 def profile_missing_formula_caches(source_path):
-    with zipfile.ZipFile(source_path) as archive:
-        cached_cells = cached_formula_coordinates(archive, worksheet_part(archive, "Data"))
-    formula_book = openpyxl.load_workbook(source_path, read_only=True, data_only=False)
-    value_book = openpyxl.load_workbook(source_path, read_only=True, data_only=True)
-    formula_sheet, value_sheet = formula_book["Data"], value_book["Data"]
-    formula_sheet.reset_dimensions()
-    value_sheet.reset_dimensions()
-    missing = [
-        formula_cell.coordinate
-        for formula_row, value_row in zip(formula_sheet.iter_rows(), value_sheet.iter_rows())
-        for formula_cell, value_cell in zip(formula_row, value_row)
-        if (formula_cell.data_type == "f" and value_cell.value is None
-            and formula_cell.coordinate not in cached_cells)
-    ]
-    formula_book.close()
-    value_book.close()
-    return missing
+    with validated_xlsx_source(source_path) as package_source:
+        with zipfile.ZipFile(package_source) as archive:
+            profile = worksheet_xml_profile(
+                archive, worksheet_part(archive, "Data")
+            )
+    return [coordinate for coordinate, _ in profile["missing_formula_samples"]]
 
 
 check("workbook profiling accepts nonempty and typed blank formula caches",
@@ -1027,30 +1582,70 @@ def write_region_key_fixture(path, cache_kind):
             archive.writestr(name, data)
 
 
-def aggregation_regions(source_path):
-    formula_book = openpyxl.load_workbook(source_path, data_only=False)
-    source_sheet = formula_book["Data"]
-    with zipfile.ZipFile(source_path) as archive:
-        cached_cells = cached_formula_coordinates(archive, worksheet_part(archive, "Data"))
-    value_book = openpyxl.load_workbook(source_path, read_only=True, data_only=True)
-    value_sheet = value_book["Data"]
-    value_sheet.reset_dimensions()
-    regions = []
-    missing = []
-    for source_row, value_row in zip(
-        source_sheet.iter_rows(min_row=2, min_col=1, max_col=1),
-        value_sheet.iter_rows(min_row=2, min_col=1, max_col=1),
-    ):
-        source_cell, value_cell = source_row[0], value_row[0]
-        region = value_cell.value if source_cell.data_type == "f" else source_cell.value
-        if (source_cell.data_type == "f" and region is None
-                and source_cell.coordinate not in cached_cells):
-            missing.append(source_cell.coordinate)
-            continue
-        if region is not None and region != "":
-            regions.append(region)
-    value_book.close()
-    formula_book.close()
+def aggregation_regions(source_path, *, max_row_span=100_000,
+                        approved_feature_loss=False):
+    with validated_xlsx_source(source_path) as package_source:
+        formula_book, dropped_parts, stripped_extensions = (
+            load_with_round_trip_audit_from_source(package_source, data_only=False)
+        )
+        if (dropped_parts or stripped_extensions) and not approved_feature_loss:
+            formula_book.close()
+            raise RuntimeError(
+                f"openpyxl would drop parts={dropped_parts!r}, "
+                f"extensions={stripped_extensions!r}"
+            )
+        value_book = None
+        try:
+            source_sheet = formula_book["Data"]
+            source_cells = sorted(
+                (cell for cell in source_sheet._cells.values()
+                 if cell.row >= 2 and cell.column == 1 and cell.value is not None),
+                key=lambda cell: cell.row,
+            )
+            if source_cells:
+                min_source_row, max_source_row = source_cells[0].row, source_cells[-1].row
+                row_span = max_source_row - min_source_row + 1
+                require(row_span <= max_row_span,
+                        f"aggregation row span is too large: {row_span}")
+            wanted_formula_coordinates = {
+                cell.coordinate for cell in source_cells if cell.data_type == "f"
+            }
+            package_source.seek(0)
+            with zipfile.ZipFile(package_source) as archive:
+                cached_cells = cached_formula_coordinates(
+                    archive, worksheet_part(archive, "Data"), wanted_formula_coordinates
+                )
+            package_source.seek(0)
+            value_book = openpyxl.load_workbook(
+                package_source, read_only=True, data_only=True
+            )
+            value_sheet = value_book["Data"]
+            value_sheet.reset_dimensions()
+            regions = []
+            missing = []
+            if source_cells:
+                source_by_row = {cell.row: cell for cell in source_cells}
+                value_rows = value_sheet.iter_rows(
+                    min_row=min_source_row, max_row=max_source_row,
+                    min_col=1, max_col=1,
+                )
+                for row_index, value_row in enumerate(value_rows, start=min_source_row):
+                    source_cell = source_by_row.get(row_index)
+                    if source_cell is None:
+                        continue
+                    value_cell = value_row[0]
+                    region = (value_cell.value if source_cell.data_type == "f"
+                              else source_cell.value)
+                    if (source_cell.data_type == "f" and region is None
+                            and source_cell.coordinate not in cached_cells):
+                        missing.append(source_cell.coordinate)
+                        continue
+                    if region is not None and region != "":
+                        regions.append(region)
+        finally:
+            if value_book is not None:
+                value_book.close()
+            formula_book.close()
     if missing:
         raise RuntimeError(f"aggregation keys have no cached value: {missing}")
     return regions
@@ -1075,6 +1670,20 @@ except RuntimeError as error:
 check("aggregation fails closed when a formula key has no cached value",
       missing_region_cache_rejected)
 
+feature_loss_payload = {
+    name: data for name, data in payload.items() if name != "xl/media/large.bin"
+}
+with zipfile.ZipFile("aggregation-feature-loss.xlsx", "w", zipfile.ZIP_STORED) as archive:
+    for name, data in feature_loss_payload.items():
+        archive.writestr(name, data)
+try:
+    aggregation_regions("aggregation-feature-loss.xlsx")
+    aggregation_feature_loss_rejected = False
+except RuntimeError as error:
+    aggregation_feature_loss_rejected = "openpyxl would drop parts=" in str(error)
+check("aggregation feature-loss audit gates the exact workbook later edited",
+      aggregation_feature_loss_rejected)
+
 export_formula_values("cached-value.xlsx", "cached-value.csv")
 with open("cached-value.csv", newline="", encoding="utf-8") as exported:
     cached_value_rows = list(csv.reader(exported))
@@ -1086,6 +1695,7 @@ with open("cached-empty.csv", newline="", encoding="utf-8") as exported:
 check("cached empty-string formula result exports as a displayed blank",
       cached_empty_rows == [[""]], cached_empty_rows)
 Path("missing-cache.csv").write_text("sentinel\n", encoding="utf-8")
+Path("missing-cache.csv.tmp").write_text("unrelated temporary\n", encoding="utf-8")
 try:
     export_formula_values("missing-cache.xlsx", "missing-cache.csv")
     missing_cache_rejected = False
@@ -1094,8 +1704,11 @@ except RuntimeError as error:
 check("formula with no XML cache element is rejected", missing_cache_rejected)
 check("failed cache audit preserves the prior destination and removes its temporary file",
       Path("missing-cache.csv").read_text(encoding="utf-8") == "sentinel\n"
-      and not Path("missing-cache.csv.tmp").exists())
+      and Path("missing-cache.csv.tmp").read_text(encoding="utf-8")
+      == "unrelated temporary\n"
+      and list(Path(".").glob(".missing-cache.csv.*.tmp")) == [])
 Path("bare-empty-cache.csv").write_text("sentinel\n", encoding="utf-8")
+Path("bare-empty-cache.csv.tmp").write_text("unrelated temporary\n", encoding="utf-8")
 try:
     export_formula_values("bare-empty-cache.xlsx", "bare-empty-cache.csv")
     bare_empty_rejected = False
@@ -1105,7 +1718,79 @@ check("untyped bare empty <v/> from an uncalculated formula is rejected",
       bare_empty_rejected)
 check("bare-empty rejection preserves destination and removes temporary output",
       Path("bare-empty-cache.csv").read_text(encoding="utf-8") == "sentinel\n"
-      and not Path("bare-empty-cache.csv.tmp").exists())
+      and Path("bare-empty-cache.csv.tmp").read_text(encoding="utf-8")
+      == "unrelated temporary\n"
+      and list(Path(".").glob(".bare-empty-cache.csv.*.tmp")) == [])
+
+csv_sparse_wb = openpyxl.Workbook()
+csv_sparse_ws = csv_sparse_wb.active
+csv_sparse_ws.title = "Data"
+csv_sparse_ws["A1"], csv_sparse_ws["A2"] = "Region", "EU"
+csv_sparse_ws["XFD1048576"].number_format = "0.00"
+csv_sparse_wb.save("csv-style-extreme.xlsx")
+export_formula_values("csv-style-extreme.xlsx", "csv-style-extreme.csv")
+with open("csv-style-extreme.csv", newline="", encoding="utf-8") as exported:
+    csv_sparse_rows = list(csv.reader(exported))
+check("CSV export ignores a style-only extreme cell without rectangular expansion",
+      csv_sparse_rows == [["Region"], ["EU"]], csv_sparse_rows)
+
+csv_far_wb = openpyxl.Workbook()
+csv_far_ws = csv_far_wb.active
+csv_far_ws.title = "Data"
+csv_far_ws["A1"], csv_far_ws["XFD1048576"] = "near", "far"
+csv_far_wb.save("csv-far-values.xlsx")
+Path("csv-far-values.csv").write_text("sentinel\n", encoding="utf-8")
+Path("csv-far-values.csv.tmp").write_text("unrelated temporary\n", encoding="utf-8")
+try:
+    export_formula_values("csv-far-values.xlsx", "csv-far-values.csv", max_cells=1_000)
+    csv_rectangle_rejected = False
+except ValueError as error:
+    csv_rectangle_rejected = "CSV export rectangle is too large" in str(error)
+check("CSV export rejects a far-apart logical rectangle before iteration",
+      csv_rectangle_rejected
+      and Path("csv-far-values.csv").read_text(encoding="utf-8") == "sentinel\n"
+      and Path("csv-far-values.csv.tmp").read_text(encoding="utf-8")
+      == "unrelated temporary\n"
+      and list(Path(".").glob(".csv-far-values.csv.*.tmp")) == [])
+
+aggregation_sparse_wb = openpyxl.Workbook()
+aggregation_sparse_ws = aggregation_sparse_wb.active
+aggregation_sparse_ws.title = "Data"
+aggregation_sparse_ws["A1"], aggregation_sparse_ws["A2"] = "Region", "EU"
+aggregation_sparse_ws["XFD1048576"].number_format = "0.00"
+aggregation_sparse_wb.save("aggregation-style-extreme.xlsx")
+check("aggregation ignores an extreme style-only cell without iterating a million rows",
+      aggregation_regions("aggregation-style-extreme.xlsx") == ["EU"])
+
+aggregation_far_wb = openpyxl.Workbook()
+aggregation_far_ws = aggregation_far_wb.active
+aggregation_far_ws.title = "Data"
+aggregation_far_ws["A1"], aggregation_far_ws["A2"] = "Region", "near"
+aggregation_far_ws["A1048576"] = "far"
+aggregation_far_wb.save("aggregation-far-values.xlsx")
+try:
+    aggregation_regions("aggregation-far-values.xlsx", max_row_span=1_000)
+    aggregation_span_rejected = False
+except ValueError as error:
+    aggregation_span_rejected = "aggregation row span is too large" in str(error)
+check("aggregation rejects far-apart keys before iter_rows", aggregation_span_rejected)
+
+real_worksheet_xml_profile = worksheet_xml_profile
+bomb_profile_calls = []
+def tracking_worksheet_xml_profile(*args, **kwargs):
+    bomb_profile_calls.append(args)
+    return real_worksheet_xml_profile(*args, **kwargs)
+worksheet_xml_profile = tracking_worksheet_xml_profile
+try:
+    export_formula_values("compressed-xlsx-bomb.xlsx", "bomb-export.csv")
+    csv_bomb_rejected = False
+except ValueError as error:
+    csv_bomb_rejected = "suspicious compression ratio: xl/styles.xml" in str(error)
+finally:
+    worksheet_xml_profile = real_worksheet_xml_profile
+check("CSV route rejects a package bomb before raw worksheet inventory",
+      csv_bomb_rejected and bomb_profile_calls == [],
+      (csv_bomb_rejected, bomb_profile_calls))
 
 # SKILL.md contract: fullCalcOnLoad makes viewers recalculate even in manual calc mode.
 calc_wb = openpyxl.Workbook()
@@ -1284,55 +1969,100 @@ with dim_zip.ZipFile("dimension.xlsx", "w") as archive:
     for name, data in members.items():
         archive.writestr(name, data)
 
-from openpyxl.utils import get_column_letter
+with validated_xlsx_source("dimension.xlsx") as dimension_source:
+    dim_value = openpyxl.load_workbook(
+        dimension_source, read_only=True, data_only=True
+    )
+    try:
+        dim_ws_ro = dim_value.active
+        check("plausible but truncated dimension limits streaming (negative control)",
+              dim_ws_ro.calculate_dimension() == "A1:B2" and dim_ws_ro.max_row == 2,
+              (dim_ws_ro.calculate_dimension(), dim_ws_ro.max_row))
+        original_dimension_iter_rows = dim_ws_ro.iter_rows
+        dim_ws_ro.iter_rows = lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("XML discovery must not expand a worksheet rectangle")
+        )
+        dimension_source.seek(0)
+        with zipfile.ZipFile(dimension_source) as archive:
+            dimension_profile = worksheet_xml_profile(
+                archive, worksheet_part(archive, dim_ws_ro.title)
+            )
+        dim_ws_ro.iter_rows = original_dimension_iter_rows
+        dim_ws_ro.reset_dimensions()
+        dimension_rows = list(bounded_sample_rows(dim_ws_ro, dimension_profile))
+    finally:
+        dim_value.close()
+check("sparse XML profile ignores truncated dimension and retains uncached formulas",
+      dimension_profile["extent"] == "A1:C4"
+      and dimension_profile["first_populated_row"] == 1
+      and dimension_profile["formula_count"] == 1
+      and dimension_profile["missing_formula_samples"][0][0] == "C4",
+      dimension_profile)
+check("bounded sampling uses the XML extent after resetting producer metadata",
+      len(dimension_rows) == 4
+      and dimension_rows[2][:2] == (3, 4),
+      dimension_rows)
 
+missing_dimension_wb = openpyxl.Workbook()
+missing_dimension_ws = missing_dimension_wb.active
+missing_dimension_ws.append(["Region", "Units"])
+missing_dimension_ws.append(["EU", 120])
+missing_dimension_ws.append(["US", 80])
+missing_dimension_wb.save("missing-dimension.xlsx")
+with zipfile.ZipFile("missing-dimension.xlsx") as archive:
+    missing_dimension_members = {
+        name: archive.read(name) for name in archive.namelist()
+    }
+missing_dimension_xml = missing_dimension_members["xl/worksheets/sheet1.xml"]
+missing_dimension_tag = b'<dimension ref="A1:B3"/>'
+check("missing-dimension fixture starts with the expected producer metadata",
+      missing_dimension_tag in missing_dimension_xml)
+missing_dimension_members["xl/worksheets/sheet1.xml"] = (
+    missing_dimension_xml.replace(missing_dimension_tag, b"")
+)
+with zipfile.ZipFile("missing-dimension.xlsx", "w") as archive:
+    for name, data in missing_dimension_members.items():
+        archive.writestr(name, data)
 
-def discover_dimension(worksheet):
-    worksheet.reset_dimensions()
-    min_row = min_column = max_row = max_column = None
-    for row in worksheet.iter_rows():
-        for cell in row:
-            if getattr(cell, "value", None) is None and getattr(cell, "data_type", None) != "f":
-                continue
-            row_index = getattr(cell, "row", None)
-            column_index = getattr(cell, "column", None)
-            if row_index is None or column_index is None:
-                continue
-            min_row = row_index if min_row is None else min(min_row, row_index)
-            min_column = column_index if min_column is None else min(min_column, column_index)
-            max_row = row_index if max_row is None else max(max_row, row_index)
-            max_column = column_index if max_column is None else max(max_column, column_index)
-    if max_row is None:
-        return "A1:A1", None
-    extent = (f"{get_column_letter(min_column)}{min_row}:"
-              f"{get_column_letter(max_column)}{max_row}")
-    return extent, min_row
+with validated_xlsx_source("missing-dimension.xlsx") as missing_dimension_source:
+    missing_dimension_value_wb = openpyxl.load_workbook(
+        missing_dimension_source, read_only=True, data_only=True
+    )
+    try:
+        missing_dimension_value_ws = missing_dimension_value_wb.active
+        forced_dimension_scans = []
+        original_forced_dimension_scan = missing_dimension_value_ws._calculate_dimension
 
+        def reject_forced_dimension_scan():
+            forced_dimension_scans.append(True)
+            raise RuntimeError("read route must not force a worksheet dimension scan")
 
-dim_value = openpyxl.load_workbook("dimension.xlsx", read_only=True, data_only=True)
-dim_formula = openpyxl.load_workbook("dimension.xlsx", read_only=True, data_only=False)
-dim_ws_ro = dim_value.active
-check("plausible but truncated dimension limits streaming (negative control)",
-      dim_ws_ro.calculate_dimension() == "A1:B2" and dim_ws_ro.max_row == 2,
-      (dim_ws_ro.calculate_dimension(), dim_ws_ro.max_row))
-streamed_before_reset = [row for row in dim_ws_ro.iter_rows(values_only=True)]
-discovered_value_dimension, discovered_value_first_row = discover_dimension(dim_ws_ro)
-discovered_formula_dimension, discovered_formula_first_row = discover_dimension(dim_formula.active)
-streamed_after_reset = [row for row in dim_ws_ro.iter_rows(values_only=True)]
-dim_value.close()
-dim_formula.close()
-check("formula-preserving dimension scan retains uncached formulas in the logical range",
-      discovered_formula_dimension == "A1:C4"
-      and discovered_formula_first_row == 1
-      and discovered_value_dimension == "A1:B3"
-      and discovered_value_first_row == 1,
-      ((discovered_value_dimension, discovered_value_first_row),
-       (discovered_formula_dimension, discovered_formula_first_row)))
-check("reset_dimensions restores the real extent",
-      len(streamed_before_reset) == 2
-      and len(streamed_after_reset) == 4
-      and streamed_after_reset[2][:2] == (3, 4),
-      (len(streamed_before_reset), streamed_after_reset[-1]))
+        missing_dimension_value_ws._calculate_dimension = reject_forced_dimension_scan
+        missing_dimension_source.seek(0)
+        with zipfile.ZipFile(missing_dimension_source) as archive:
+            missing_dimension_profile = worksheet_xml_profile(
+                archive, worksheet_part(archive, missing_dimension_value_ws.title)
+            )
+        missing_dimension_declared = worksheet_declared_dimension(
+            missing_dimension_value_ws
+        )
+        missing_dimension_value_ws.reset_dimensions()
+        missing_dimension_rows = list(bounded_sample_rows(
+            missing_dimension_value_ws, missing_dimension_profile
+        ))
+        missing_dimension_value_ws._calculate_dimension = original_forced_dimension_scan
+    finally:
+        missing_dimension_value_wb.close()
+check("missing dimension remains unsized before raw XML routing",
+      missing_dimension_declared is None
+      and missing_dimension_profile["extent"] == "A1:B3",
+      (missing_dimension_declared, missing_dimension_profile))
+check("missing dimension route samples from XML bounds without a forced scan",
+      forced_dimension_scans == []
+      and missing_dimension_rows == [
+          ("Region", "Units"), ("EU", 120), ("US", 80)
+      ],
+      (forced_dimension_scans, missing_dimension_rows))
 
 csv_formula_wb = openpyxl.load_workbook("dimension.xlsx", read_only=True, data_only=False)
 csv_value_wb = openpyxl.load_workbook("dimension.xlsx", read_only=True, data_only=True)
@@ -1359,36 +2089,75 @@ offset_ws["A7"], offset_ws["B7"] = "Region", "Units"
 offset_ws["A8"], offset_ws["B8"] = "EU", 120
 offset_ws["A2"].number_format = "0.00"  # styled but empty: not part of the data range
 offset_ws["C8"] = "=SUM(B8)"            # uncached formula: remains part of the range
+offset_ws["XFD1048576"].number_format = "0.00"  # extreme style-only physical cell
 offset_wb.save("leading-blank-rows.xlsx")
-offset_formula_wb = openpyxl.load_workbook(
-    "leading-blank-rows.xlsx", read_only=True, data_only=False,
-)
-offset_value_wb = openpyxl.load_workbook(
-    "leading-blank-rows.xlsx", read_only=True, data_only=True,
-)
-offset_formula_extent, offset_formula_first = discover_dimension(offset_formula_wb.active)
-offset_value_wb.active.reset_dimensions()
-offset_rows = offset_value_wb.active.iter_rows(
-    min_row=offset_formula_first, values_only=True,
-)
-offset_header = next(offset_rows, None)
-offset_sample = next(offset_rows, None)
+with validated_xlsx_source("leading-blank-rows.xlsx") as offset_source:
+    offset_value_wb = openpyxl.load_workbook(
+        offset_source, read_only=True, data_only=True,
+    )
+    try:
+        offset_value_ws = offset_value_wb.active
+        original_offset_iter_rows = offset_value_ws.iter_rows
+        offset_value_ws.iter_rows = lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("XML profile must not call iter_rows")
+        )
+        offset_source.seek(0)
+        with zipfile.ZipFile(offset_source) as archive:
+            offset_profile = worksheet_xml_profile(
+                archive, worksheet_part(archive, offset_value_ws.title)
+            )
+        offset_value_ws.iter_rows = original_offset_iter_rows
+        offset_value_ws.reset_dimensions()
+        offset_rows = bounded_sample_rows(offset_value_ws, offset_profile)
+        offset_header = next(offset_rows, None)
+        offset_sample = next(offset_rows, None)
+    finally:
+        offset_value_wb.close()
 check("styled empty cells do not move the formula-preserving logical range",
-      (offset_formula_extent, offset_formula_first) == ("A7:C8", 7),
-      (offset_formula_extent, offset_formula_first))
+      (offset_profile["extent"], offset_profile["first_populated_row"])
+      == ("A7:C8", 7), offset_profile)
 check("header sampling skips six leading blank rows",
       offset_header[:2] == ("Region", "Units")
       and offset_sample[:2] == ("EU", 120),
       (offset_header, offset_sample))
-offset_formula_wb.close()
-offset_value_wb.close()
+
+far_wb = openpyxl.Workbook()
+far_ws = far_wb.active
+far_ws["A1"] = "near"
+far_ws["XFD1048576"] = "far"
+far_wb.save("far-logical-cells.xlsx")
+with validated_xlsx_source("far-logical-cells.xlsx") as far_source:
+    far_value_wb = openpyxl.load_workbook(far_source, read_only=True, data_only=True)
+    try:
+        far_source.seek(0)
+        with zipfile.ZipFile(far_source) as archive:
+            far_profile = worksheet_xml_profile(
+                archive, worksheet_part(archive, far_value_wb.active.title)
+            )
+        far_iter_calls = []
+        far_value_wb.active.iter_rows = (
+            lambda *args, **kwargs: far_iter_calls.append((args, kwargs)) or iter(())
+        )
+        try:
+            bounded_sample_rows(far_value_wb.active, far_profile, max_cells=1_000)
+            far_budget_rejected = False
+        except ValueError as error:
+            far_budget_rejected = "sample rectangle is too large" in str(error)
+    finally:
+        far_value_wb.close()
+check("real far-apart values hit the rectangle budget before iter_rows",
+      far_budget_rejected and far_iter_calls == [], (far_profile, far_iter_calls))
 
 empty_dimension_wb = openpyxl.Workbook()
 empty_dimension_wb.save("empty-dimension.xlsx")
-empty_dimension_ro = openpyxl.load_workbook("empty-dimension.xlsx", read_only=True)
+with validated_xlsx_source("empty-dimension.xlsx") as empty_source:
+    with zipfile.ZipFile(empty_source) as archive:
+        empty_profile = worksheet_xml_profile(
+            archive, worksheet_part(archive, "Sheet")
+        )
 check("dimension scan handles an actually empty worksheet",
-      discover_dimension(empty_dimension_ro.active) == ("A1:A1", None))
-empty_dimension_ro.close()
+      empty_profile["extent"] == "A1:A1"
+      and empty_profile["first_populated_row"] is None)
 
 
 print("\n" + ("ALL XLSX FIXTURES PASSED" if not failures else f"{len(failures)} FAILURES: {failures}"))

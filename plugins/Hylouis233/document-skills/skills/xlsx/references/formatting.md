@@ -87,7 +87,10 @@ one you took:
 1. **Formula sheet (live, recalculates)** - the default. A `SUMIFS`/`COUNTIFS`/`AVERAGEIFS`
    grid keyed on a unique-values column reproduces most pivot outputs and stays a formula
    per contract rule 1. Build every sheet reference from the real source sheet's name -
-   hard-coding `Data!` breaks on any workbook whose sheet is named differently:
+   hard-coding `Data!` breaks on any workbook whose sheet is named differently. Copy
+   `validated_xlsx_source()` from [package.md](package.md) and
+   `load_with_round_trip_audit_from_source()` plus its inventory dependencies from
+   [edit.md](edit.md) before running this route:
 
    ```python
    import openpyxl
@@ -98,51 +101,51 @@ one you took:
    MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
    DOC_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
    PKG_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+   MAX_AGGREGATION_ROW_SPAN = 100_000
 
-   def cached_formula_coordinates_for_sheet(path, sheet_name):
+   def cached_formula_coordinates_for_sheet(archive, sheet_name, wanted_coordinates):
        """Distinguish a typed cached blank from a formula with no cached result."""
-       with zipfile.ZipFile(path) as archive:
-           workbook = ET.fromstring(archive.read("xl/workbook.xml"))
-           sheet = next(
-               item for item in workbook.iter(f"{{{MAIN_NS}}}sheet")
-               if item.attrib["name"] == sheet_name
-           )
-           relationship_id = sheet.attrib[f"{{{DOC_REL_NS}}}id"]
-           relationships = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
-           target = next(
-               item.attrib["Target"]
-               for item in relationships.iter(f"{{{PKG_REL_NS}}}Relationship")
-               if item.attrib["Id"] == relationship_id
-           )
-           part = target.lstrip("/") if target.startswith("/") else posixpath.normpath(
-               posixpath.join("xl", target)
-           )
-           cached = set()
-           coordinate = cell_type = value_text = None
-           has_formula = value_seen = False
-           with archive.open(part) as source:
-               for event, element in ET.iterparse(source, events=("start", "end")):
-                   if event == "start" and element.tag == f"{{{MAIN_NS}}}c":
-                       coordinate = element.attrib["r"]
-                       cell_type = element.attrib.get("t")
-                       has_formula = value_seen = False
-                       value_text = None
-                   elif event == "end" and coordinate is not None:
-                       if element.tag == f"{{{MAIN_NS}}}f":
-                           has_formula = True
-                       elif element.tag == f"{{{MAIN_NS}}}v":
-                           value_seen = True
-                           value_text = element.text
-                       elif element.tag == f"{{{MAIN_NS}}}c":
-                           valid_cache = value_seen and (
-                               value_text not in (None, "") or cell_type == "str"
-                           )
-                           if has_formula and valid_cache:
-                               cached.add(coordinate)
-                           coordinate = None
-                       element.clear()
-                   elif event == "end":
-                       element.clear()
+       workbook = ET.fromstring(archive.read("xl/workbook.xml"))
+       sheet = next(
+           item for item in workbook.iter(f"{{{MAIN_NS}}}sheet")
+           if item.attrib["name"] == sheet_name
+       )
+       relationship_id = sheet.attrib[f"{{{DOC_REL_NS}}}id"]
+       relationships = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+       target = next(
+           item.attrib["Target"]
+           for item in relationships.iter(f"{{{PKG_REL_NS}}}Relationship")
+           if item.attrib["Id"] == relationship_id
+       )
+       part = target.lstrip("/") if target.startswith("/") else posixpath.normpath(
+           posixpath.join("xl", target)
+       )
+       cached = set()
+       coordinate = cell_type = value_text = None
+       has_formula = value_seen = False
+       with archive.open(part) as source:
+           for event, element in ET.iterparse(source, events=("start", "end")):
+               if event == "start" and element.tag == f"{{{MAIN_NS}}}c":
+                   coordinate = element.attrib["r"]
+                   cell_type = element.attrib.get("t")
+                   has_formula = value_seen = False
+                   value_text = None
+               elif event == "end" and coordinate is not None:
+                   if element.tag == f"{{{MAIN_NS}}}f":
+                       has_formula = True
+                   elif element.tag == f"{{{MAIN_NS}}}v":
+                       value_seen = True
+                       value_text = element.text
+                   elif element.tag == f"{{{MAIN_NS}}}c":
+                       valid_cache = value_seen and (
+                           value_text not in (None, "") or cell_type == "str"
+                       )
+                       if has_formula and valid_cache and coordinate in wanted_coordinates:
+                           cached.add(coordinate)
+                       coordinate = None
+                   element.clear()
+               elif event == "end":
+                   element.clear()
        return cached
 
    def sheet_ref(sheet):
@@ -151,31 +154,76 @@ one you took:
        escaped = sheet.title.replace("'", "''")
        return f"'{escaped}'!"
 
-   src = sheet_ref(ws)                              # e.g. "'Sales'!" or "'Raw Data'!"
-   source_path = "input.xlsx"  # the same original path used to load formula-preserving `wb`
-   cached_region_formulas = cached_formula_coordinates_for_sheet(source_path, ws.title)
-   value_wb = openpyxl.load_workbook(source_path, read_only=True, data_only=True)
-   value_ws = value_wb[ws.title]
-   value_ws.reset_dimensions()
-   regions = []
-   seen_region_keys = set()
-   missing_region_caches = []
-   source_rows = ws.iter_rows(min_row=2, min_col=1, max_col=1)
-   value_rows = value_ws.iter_rows(min_row=2, min_col=1, max_col=1)
-   for source_row, value_row in zip(source_rows, value_rows):
-       source_cell, value_cell = source_row[0], value_row[0]
-       region = value_cell.value if source_cell.data_type == "f" else source_cell.value
-       if (source_cell.data_type == "f" and region is None
-               and source_cell.coordinate not in cached_region_formulas):
-           missing_region_caches.append(source_cell.coordinate)
-           continue
-       if region is None or region == "":             # keep valid falsey values: 0 and False
-           continue
-       key = (type(region), region)                    # do not collapse False and numeric 0
-       if key not in seen_region_keys:
-           seen_region_keys.add(key)
-           regions.append(region)                     # stable source order; no mixed-type sort
-   value_wb.close()
+   source_path = "input.xlsx"
+   source_sheet_name = "Data"  # select this from the user's request / initial inventory
+   approved_feature_loss = False  # set True only after showing the exact audit to the user
+   with validated_xlsx_source(source_path) as package_source:
+       wb, dropped_parts, stripped_extensions = load_with_round_trip_audit_from_source(
+           package_source, data_only=False
+       )
+       if (dropped_parts or stripped_extensions) and not approved_feature_loss:
+           wb.close()
+           raise RuntimeError(
+               f"openpyxl would drop parts={dropped_parts!r}, "
+               f"extensions={stripped_extensions!r}; obtain confirmation before editing"
+           )
+       ws = wb[source_sheet_name]
+       src = sheet_ref(ws)                          # e.g. "'Sales'!" or "'Raw Data'!"
+       require(hasattr(ws, "_cells"),
+               "aggregation requires a normal writable Worksheet")
+       source_cells = sorted(
+           (cell for cell in ws._cells.values()
+            if cell.row >= 2 and cell.column == 1 and cell.value is not None),
+           key=lambda cell: cell.row,
+       )
+       if source_cells:
+           min_source_row, max_source_row = source_cells[0].row, source_cells[-1].row
+           row_span = max_source_row - min_source_row + 1
+           require(row_span <= MAX_AGGREGATION_ROW_SPAN,
+                   f"aggregation row span is too large: {row_span}")
+       wanted_formula_coordinates = {
+           cell.coordinate for cell in source_cells if cell.data_type == "f"
+       }
+       package_source.seek(0)
+       with zipfile.ZipFile(package_source) as archive:
+           cached_region_formulas = cached_formula_coordinates_for_sheet(
+               archive, ws.title, wanted_formula_coordinates
+           )
+       package_source.seek(0)
+       value_wb = openpyxl.load_workbook(
+           package_source, read_only=True, data_only=True
+       )
+       try:
+           value_ws = value_wb[ws.title]
+           value_ws.reset_dimensions()
+           regions = []
+           seen_region_keys = set()
+           missing_region_caches = []
+           if source_cells:
+               source_by_row = {cell.row: cell for cell in source_cells}
+               value_rows = value_ws.iter_rows(
+                   min_row=min_source_row, max_row=max_source_row,
+                   min_col=1, max_col=1,
+               )
+               for row_index, value_row in enumerate(value_rows, start=min_source_row):
+                   source_cell = source_by_row.get(row_index)
+                   if source_cell is None:
+                       continue
+                   value_cell = value_row[0]
+                   region = (value_cell.value if source_cell.data_type == "f"
+                             else source_cell.value)
+                   if (source_cell.data_type == "f" and region is None
+                           and source_cell.coordinate not in cached_region_formulas):
+                       missing_region_caches.append(source_cell.coordinate)
+                       continue
+                   if region is None or region == "":  # keep valid falsey values: 0 and False
+                       continue
+                   key = (type(region), region)         # keep False distinct from numeric 0
+                   if key not in seen_region_keys:
+                       seen_region_keys.add(key)
+                       regions.append(region)           # stable order; no mixed-type sort
+       finally:
+           value_wb.close()
    if missing_region_caches:
        raise RuntimeError(
            f"aggregation keys have no cached value: {missing_region_caches}"
@@ -198,8 +246,8 @@ one you took:
    write values, and **label the sheet** ("values as of generation, not recalculated").
 
 3. **User's Excel/template pivot** - when the workbook already has slicers or a pivot the
-  user maintains, edit around it and re-run the `round_trip_changes` check from
-  [edit.md](edit.md) before saving.
+  user maintains, edit around it and run the feature-loss audit from [edit.md](edit.md) before
+  saving. Use `load_with_round_trip_audit_from_source()` and edit only the workbook it returns.
 
 ## Postcheck additions
 

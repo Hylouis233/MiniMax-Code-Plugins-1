@@ -209,7 +209,8 @@ section.left_margin, section.right_margin = Cm(2.8), Cm(2.6)
            or 0xF900 <= codepoint <= 0xFAFF   # CJK compatibility ideographs
            or 0xFE30 <= codepoint <= 0xFE6F   # CJK compatibility and small forms
            or 0xFF00 <= codepoint <= 0xFFEF   # fullwidth and halfwidth forms
-           or 0x20000 <= codepoint <= 0x3134F  # CJK unified ideograph extensions
+           or 0x20000 <= codepoint <= 0x3134F  # CJK unified ideograph extensions B-G
+           or 0x31350 <= codepoint <= 0x33479  # Unicode 17 extensions H-J
        )
        return "eastAsia" if uses_east_asian_slot else (
            "ascii" if codepoint < 128 else "hAnsi"

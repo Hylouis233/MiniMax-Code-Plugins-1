@@ -160,6 +160,9 @@ MAX_IMAGE_SOURCE_PIXELS = 25_000_000
 MAX_TOTAL_IMAGE_SOURCE_PIXELS = 50_000_000
 MAX_IMAGE_RENDER_PIXELS = 4_000_000
 MAX_TOTAL_IMAGE_RENDER_PIXELS = 20_000_000
+MAX_DRAWING_PATHS = 1_000
+MAX_DRAWING_RENDER_PIXELS = 4_000_000
+MAX_TOTAL_DRAWING_RENDER_PIXELS = 20_000_000
 
 def viewable_images(page):
     """Render bounded placement clips; unknown visibility keeps the page nonblank."""
@@ -199,6 +202,71 @@ def viewable_images(page):
         if any(pixmap.samples[pixmap.n - 1::pixmap.n]):
             visible.append(placement)
     return placements, visible, False
+
+def drawing_bounds(drawing):
+    """Include stroke width around the path geometry returned by PyMuPDF."""
+    try:
+        rectangle = fitz.Rect(drawing.get("rect"))
+    except (TypeError, ValueError):
+        raise ValueError("drawing has no finite bounding rectangle") from None
+    if not all(math.isfinite(value) for value in rectangle) or rectangle.is_infinite:
+        raise ValueError("drawing has no finite bounding rectangle")
+    rectangle.normalize()
+    path_type = drawing.get("type")
+    has_stroke = (
+        "s" in path_type if isinstance(path_type, str)
+        else drawing.get("color") is not None
+    )
+    if has_stroke:
+        width = drawing.get("width", 0)
+        if isinstance(width, bool):
+            raise ValueError("drawing has an invalid stroke width")
+        try:
+            width = float(width or 0)
+        except (TypeError, ValueError):
+            raise ValueError("drawing has an invalid stroke width") from None
+        if not math.isfinite(width) or width < 0:
+            raise ValueError("drawing has an invalid stroke width")
+        # PDF hairlines (width 0) still paint one device pixel at render time.
+        padding = max(width / 2, 0.5 if width == 0 else 0)
+        rectangle = fitz.Rect(
+            rectangle.x0 - padding, rectangle.y0 - padding,
+            rectangle.x1 + padding, rectangle.y1 + padding,
+        )
+    return rectangle
+
+def viewable_drawings(page):
+    """Render bounded path clips; unknown visibility keeps the page nonblank."""
+    try:
+        drawings = page.get_drawings()
+    except (RuntimeError, ValueError):
+        return [], [], True
+    if len(drawings) > MAX_DRAWING_PATHS:
+        return drawings, [], True
+    visible = []
+    total_render_pixels = 0
+    for drawing in drawings:
+        try:
+            bounds = drawing_bounds(drawing)
+        except ValueError:
+            return drawings, visible, True
+        clip = visible_clip(page, bounds)
+        if clip is None:
+            continue
+        render_pixels = math.ceil(clip.width) * math.ceil(clip.height)
+        total_render_pixels += render_pixels
+        if (render_pixels > MAX_DRAWING_RENDER_PIXELS
+                or total_render_pixels > MAX_TOTAL_DRAWING_RENDER_PIXELS):
+            return drawings, visible, True
+        try:
+            pixmap = page.get_pixmap(clip=clip, alpha=True, annots=False)
+        except (RuntimeError, ValueError):
+            return drawings, visible, True
+        if not pixmap.alpha:
+            return drawings, visible, True
+        if any(pixmap.samples[pixmap.n - 1::pixmap.n]):
+            visible.append(drawing)
+    return drawings, visible, False
 
 def rendered_interactives(page, items):
     rendered = []
@@ -271,12 +339,13 @@ for page in doc:
         "rotation": page.rotation,
     })
     image_placements, visible_images, image_visibility_unknown = viewable_images(page)
-    drawings = page.get_drawings()
+    drawings, visible_drawings, drawing_visibility_unknown = viewable_drawings(page)
     widgets, annotations, links, interaction_visibility_unknown = viewable_interactives(page)
     is_blank = not (
-        page.get_text().strip() or visible_images or drawings
+        page.get_text().strip() or visible_images or visible_drawings
         or widgets or annotations or links
-        or image_visibility_unknown or interaction_visibility_unknown
+        or image_visibility_unknown or drawing_visibility_unknown
+        or interaction_visibility_unknown
     )
     print(page.number + 1, "media_size:", media_size, "crop_size:", crop_size,
           "rotation:", page.rotation, "text_len:", len(page.get_text()),
@@ -284,7 +353,9 @@ for page in doc:
           "image_placements:", len(image_placements),
           "visible_images:", len(visible_images),
           "image_visibility_unknown:", image_visibility_unknown,
-          "drawings:", len(drawings),
+          "drawing_paths:", len(drawings),
+          "visible_drawings:", len(visible_drawings),
+          "drawing_visibility_unknown:", drawing_visibility_unknown,
           "widgets:", len(widgets), "annotations:", len(annotations),
           "links:", len(links), "interaction_visibility_unknown:",
           interaction_visibility_unknown, "blank:", is_blank)
@@ -295,7 +366,7 @@ print("crop_size_consistent:", len({row["crop_size"] for row in page_geometry}) 
 
 ## Checks worth automating
 
-- **Blank page detection**: flag only when text, visible painted image placements, drawings,
+- **Blank page detection**: flag only when text, visible painted image placements and vector paths,
   and viewable widgets, annotations, and links are all absent. Ignore interactive objects carrying
   invisible, hidden, or no-view flags, as well as empty, off-page, or unrendered appearances.
   `page.get_images()` lists every image XObject resource, including unused resources, and also
@@ -304,7 +375,11 @@ print("crop_size_consistent:", len({row["crop_size"] for row in page_geometry}) 
   clipping. Treat those boxes as diagnostics only. The bounded `viewable_images()` render checks
   alpha for each page-intersecting placement; a count, source-pixel, render-pixel, or decoder limit
   returns `image_visibility_unknown=True`, which must keep the page nonblank. Interactive form
-  fields are widgets rather
+  `page.get_drawings()` similarly reports paths that are off-page, fully clipped, hidden by page
+  state, or painted with zero opacity. The bounded `viewable_drawings()` checks each
+  page-intersecting path clip against the actual alpha render; path-count, render-pixel, or renderer
+  limits return `drawing_visibility_unknown=True`, which also keeps the page nonblank. Interactive
+  form fields are widgets rather
   than page text, so a three-content-stream predicate alone would misclassify a usable form
   page as blank. A blank page after generation usually means an overflowing flowable created it.
 - **Font inventory**: `page.get_fonts()` lists referenced fonts, including non-embedded base
@@ -323,6 +398,6 @@ print("crop_size_consistent:", len({row["crop_size"] for row in page_geometry}) 
   `pypdf.PdfReader` cross-check when provenance is unknown.
 
 Report findings as a table (page, media size, crop size, rotation, text chars, resource images,
-image placements, visible images, image visibility unknown, drawings, widgets, annotations,
-links, interaction visibility unknown, blank) - it
+image placements, visible images, image visibility unknown, drawing paths, visible drawings,
+drawing visibility unknown, widgets, annotations, links, interaction visibility unknown, blank) - it
 is what every downstream decision hangs off.

@@ -90,20 +90,28 @@ formula-injection protection**; do not present a raw export as safe to open in a
       if isinstance(value, str) and value.startswith("="):
           cell.data_type = "s"  # openpyxl otherwise promotes it to an XLSX formula
   ```
-- XLSX -> CSV: use a separate `data_only=True` read so formulas export the cached values users
-  see, not formula strings. Pair it with a formula-preserving read and report missing caches.
+- XLSX -> CSV: use a `data_only=True` read so formulas export the cached values users
+  see, not formula strings. Pair it with the sparse XML profile and report missing caches.
   `openpyxl` exposes both a missing cache and a present empty-string cache as `None`, so consult
   the worksheet XML. A nonempty `<v>` is cached; an empty `<v/>` is a valid displayed blank only
   when the formula cell explicitly has string-result type `t="str"`. A missing `<v>` or the bare
   empty `<v/>` that openpyxl writes for an uncalculated formula must fail closed. Cached values
-  can still be stale until a spreadsheet application recalculates the workbook:
+  can still be stale until a spreadsheet application recalculates the workbook. Copy the
+  bounded helpers from [package.md](package.md) and `worksheet_xml_profile()` from
+  [read.md](read.md) first: raw ZIP inspection and the value workbook must share one already
+  validated source identity. Refuse a logical CSV rectangle above the explicit cell budget;
+  never call an unbounded `iter_rows()` after `reset_dimensions()`.
 
   ```python
   import csv
+  import os
   import openpyxl
   import posixpath
   import zipfile
   from pathlib import Path
+  from tempfile import mkstemp
+  from openpyxl.utils import get_column_letter
+  from openpyxl.utils.cell import coordinate_to_tuple
   from xml.etree import ElementTree as ET
 
   FORMULA_OPERATORS = ("=", "+", "-", "@", "＝", "＋", "－", "＠")
@@ -113,6 +121,9 @@ formula-injection protection**; do not present a raw export as safe to open in a
   CELL_TAG = f"{{{MAIN_NS}}}c"
   FORMULA_TAG = f"{{{MAIN_NS}}}f"
   VALUE_TAG = f"{{{MAIN_NS}}}v"
+  INLINE_STRING_TAG = f"{{{MAIN_NS}}}is"
+  MAX_EXPLICIT_CELLS = 1_000_000
+  MAX_CSV_EXPORT_CELLS = 5_000_000
 
   def begins_spreadsheet_formula(value):
       index = 0
@@ -145,73 +156,62 @@ formula-injection protection**; do not present a raw export as safe to open in a
           item.attrib["Target"] for item in relationships.iter(f"{{{PKG_REL_NS}}}Relationship")
           if item.attrib["Id"] == relationship_id
       )
-      if target.startswith("/"):
-          return target.lstrip("/")
-      return posixpath.normpath(posixpath.join("xl", target))
-
-  def cached_formula_coordinates(archive, part):
-      """Find formula cells with a nonempty cache or an explicitly typed empty-string cache."""
-      cached = set()
-      coordinate = None
-      cell_type = None
-      has_formula = value_seen = False
-      value_text = None
-      with archive.open(part) as source:
-          for event, element in ET.iterparse(source, events=("start", "end")):
-              if event == "start" and element.tag == CELL_TAG:
-                  coordinate = element.attrib["r"]
-                  cell_type = element.attrib.get("t")
-                  has_formula = value_seen = False
-                  value_text = None
-              elif event == "end" and coordinate is not None:
-                  if element.tag == FORMULA_TAG:
-                      has_formula = True
-                  elif element.tag == VALUE_TAG:
-                      value_seen = True
-                      value_text = element.text
-                  elif element.tag == CELL_TAG:
-                      valid_cache = value_seen and (
-                          value_text not in (None, "") or cell_type == "str"
-                      )
-                      if has_formula and valid_cache:
-                          cached.add(coordinate)
-                      coordinate = None
-                  element.clear()
-              elif event == "end":
-                  element.clear()
-      return cached
+      part = target.lstrip("/") if target.startswith("/") else posixpath.normpath(
+          posixpath.join("xl", target)
+      )
+      require(part in archive.namelist(), f"worksheet part is missing: {part}")
+      return part
 
   input_path = "input.xlsx"
   sheet_name = "Data"
   export_mode = "safe"  # use "raw" only for explicitly requested trusted machine interchange
-  with zipfile.ZipFile(input_path) as archive:
-      part = worksheet_part(archive, sheet_name)
-      cached_formula_cells = cached_formula_coordinates(archive, part)
-  formula_wb = openpyxl.load_workbook(input_path, read_only=True, data_only=False)
-  value_wb = openpyxl.load_workbook(input_path, read_only=True, data_only=True)
-  formula_ws, value_ws = formula_wb[sheet_name], value_wb[sheet_name]
-  # Producer-written <dimension> metadata can look plausible while truncating real cells.
-  # Reset both paired streams before their first iter_rows() call.
-  formula_ws.reset_dimensions()
-  value_ws.reset_dimensions()
-  missing_caches = []
   output_path = Path("output.csv")
-  temporary_path = output_path.with_suffix(output_path.suffix + ".tmp")
-  with temporary_path.open("w", newline="", encoding="utf-8") as output:
-      writer = csv.writer(output, delimiter=delimiter_for(output_path))
-      for formula_row, value_row in zip(formula_ws.iter_rows(), value_ws.iter_rows()):
-          for formula_cell, value_cell in zip(formula_row, value_row):
-              if (formula_cell.data_type == "f" and value_cell.value is None
-                      and formula_cell.coordinate not in cached_formula_cells):
-                  missing_caches.append(formula_cell.coordinate)
-          writer.writerow([
-              spreadsheet_csv_field(cell.value, mode=export_mode) for cell in value_row
-          ])
-  formula_wb.close()
-  value_wb.close()
-  if missing_caches:
-      temporary_path.unlink(missing_ok=True)
-      raise RuntimeError(f"formula cells have no cached value: {missing_caches}")
+  temporary_path = None
+  try:
+    descriptor, temporary_name = mkstemp(
+        dir=output_path.parent, prefix=f".{output_path.name}.", suffix=".tmp"
+    )
+    temporary_path = Path(temporary_name)
+    os.close(descriptor)
+    with validated_xlsx_source(input_path) as package_source:
+      value_wb = openpyxl.load_workbook(package_source, read_only=True, data_only=True)
+      try:
+          package_source.seek(0)
+          with zipfile.ZipFile(package_source) as archive:
+              part = worksheet_part(archive, sheet_name)
+              profile = worksheet_xml_profile(archive, part)
+          if profile["missing_formula_count"]:
+              raise RuntimeError(
+                  "formula cells have no cached value: "
+                  f"{profile['missing_formula_samples']}"
+              )
+          value_ws = value_wb[sheet_name]
+          value_ws.reset_dimensions()
+          if profile["bounds"] is None:
+              rows = iter(())
+          else:
+              min_row, min_column, max_row, max_column = profile["bounds"]
+              export_cells = (max_row - min_row + 1) * (max_column - min_column + 1)
+              require(export_cells <= MAX_CSV_EXPORT_CELLS,
+                      f"CSV export rectangle is too large: {export_cells} cells")
+              rows = value_ws.iter_rows(
+                  min_row=min_row, min_col=min_column,
+                  max_row=max_row, max_col=max_column,
+                  values_only=True,
+              )
+          with temporary_path.open("w", newline="", encoding="utf-8") as output:
+              writer = csv.writer(output, delimiter=delimiter_for(output_path))
+              for value_row in rows:
+                  writer.writerow([
+                      spreadsheet_csv_field(value, mode=export_mode) for value in value_row
+                  ])
+      finally:
+          value_wb.close()
+  except Exception:
+      if temporary_path is not None:
+          temporary_path.unlink(missing_ok=True)
+      raise
+  require(temporary_path is not None, "CSV temporary output was not created")
   temporary_path.replace(output_path)
   ```
 

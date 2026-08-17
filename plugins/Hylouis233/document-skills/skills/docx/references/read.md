@@ -20,9 +20,60 @@ from docx.table import Table
 from docx.text.paragraph import Paragraph
 from docx.text.run import Run
 
+MC_NAMESPACE = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+MC_ALTERNATE_CONTENT = f"{{{MC_NAMESPACE}}}AlternateContent"
+MC_CHOICE = f"{{{MC_NAMESPACE}}}Choice"
+MC_FALLBACK = f"{{{MC_NAMESPACE}}}Fallback"
+SUPPORTED_MC_NAMESPACE_URIS = {
+    MC_NAMESPACE,
+    qn("w:p").split("}", 1)[0][1:],
+    qn("r:id").split("}", 1)[0][1:],
+}
+
+def alternate_content_branch(element):
+    """Select the first Choice whose required namespace URIs are understood."""
+    fallback = None
+    for child in element.iterchildren():
+        if child.tag == MC_CHOICE:
+            required_prefixes = (child.get("Requires") or "").split()
+            if required_prefixes and all(
+                child.nsmap.get(prefix) in SUPPORTED_MC_NAMESPACE_URIS
+                for prefix in required_prefixes
+            ):
+                return child
+        elif child.tag == MC_FALLBACK and fallback is None:
+            fallback = child
+    return fallback
+
+def unresolved_alternate_content(element):
+    return {
+        "kind": "AlternateContent",
+        "requires": [
+            (child.get("Requires") or "").split()
+            for child in element.iterchildren()
+            if child.tag == MC_CHOICE
+        ],
+        "reason": "no supported Choice and no Fallback",
+    }
+
+def iter_effective_children(root):
+    """Yield one selected markup-compatibility branch, never Choice and Fallback."""
+    for child in root.iterchildren():
+        if child.tag != MC_ALTERNATE_CONTENT:
+            yield "element", child
+            continue
+        branch = alternate_content_branch(child)
+        if branch is None:
+            yield "unreadable", unresolved_alternate_content(child)
+        else:
+            yield from iter_effective_children(branch)
+
 def iter_part_blocks(root, parent):
     """Yield each paragraph/table once, descending through block content controls."""
-    for child in root.iterchildren():
+    for child_kind, child in iter_effective_children(root):
+        if child_kind == "unreadable":
+            yield child_kind, child
+            continue
         if child.tag == qn("w:p"):
             yield "paragraph", Paragraph(child, parent)
         elif child.tag == qn("w:tbl"):
@@ -41,15 +92,24 @@ def iter_part_blocks(root, parent):
         else:
             yield from iter_part_blocks(child, parent)
 
-def iter_paragraph_runs(paragraph):
-    """Include runs wrapped by hyperlinks, fields, revisions, or inline content controls."""
+def iter_paragraph_items(paragraph):
+    """Include runs/unreadable records in their selected, rendered order."""
     def walk(element):
-        for child in element.iterchildren():
+        for child_kind, child in iter_effective_children(element):
+            if child_kind == "unreadable":
+                yield child_kind, child
+                continue
             if child.tag == qn("w:r"):
-                yield Run(child, paragraph)
+                yield "run", Run(child, paragraph)
             elif child.tag != qn("w:p"):  # nested text-box paragraphs are yielded separately
                 yield from walk(child)
     yield from walk(paragraph._p)
+
+def iter_paragraph_runs(paragraph):
+    """Yield only runs; paragraph_text separately reports unresolved alternatives."""
+    for kind, item in iter_paragraph_items(paragraph):
+        if kind == "run":
+            yield item
 
 def legacy_symbol_record(symbol):
     """Report font-specific w:sym content without guessing at a Unicode mapping."""
@@ -59,14 +119,47 @@ def legacy_symbol_record(symbol):
 
 def run_text(run):
     pieces = []
-    for child in run._r.xpath(
-        "w:br | w:cr | w:noBreakHyphen | w:ptab | w:t | w:tab | w:sym"
-    ):
-        pieces.append(legacy_symbol_record(child) if child.tag == qn("w:sym") else str(child))
+    text_tags = {
+        qn("w:br"), qn("w:cr"), qn("w:noBreakHyphen"), qn("w:ptab"),
+        qn("w:t"), qn("w:tab"), qn("w:sym"),
+    }
+    for child_kind, child in iter_effective_children(run._r):
+        if child_kind == "unreadable":
+            pieces.append(f"[unreadable {child['kind']}: {child['reason']}]")
+        elif child.tag in text_tags:
+            pieces.append(legacy_symbol_record(child) if child.tag == qn("w:sym") else str(child))
     return "".join(pieces)
 
 def paragraph_text(paragraph):
-    return "".join(run_text(run) for run in iter_paragraph_runs(paragraph))
+    pieces = []
+    for kind, item in iter_paragraph_items(paragraph):
+        pieces.append(
+            run_text(item) if kind == "run"
+            else f"[unreadable {item['kind']}: {item['reason']}]"
+        )
+    return "".join(pieces)
+
+def cell_paragraph_text(paragraph):
+    """Render cell controls as visible markers while honoring one MC branch."""
+    pieces = []
+    for kind, item in iter_paragraph_items(paragraph):
+        if kind == "unreadable":
+            pieces.append(f"[unreadable {item['kind']}: {item['reason']}]")
+            continue
+        for child_kind, child in iter_effective_children(item._r):
+            if child_kind == "unreadable":
+                pieces.append(f"[unreadable {child['kind']}: {child['reason']}]")
+            elif child.tag == qn("w:t"):
+                pieces.append(child.text or "")
+            elif child.tag in (qn("w:tab"), qn("w:ptab")):
+                pieces.append("<tab>")
+            elif child.tag in (qn("w:br"), qn("w:cr")):
+                pieces.append("<br>")
+            elif child.tag == qn("w:noBreakHyphen"):
+                pieces.append("-")
+            elif child.tag == qn("w:sym"):
+                pieces.append(legacy_symbol_record(child))
+    return "".join(pieces)
 
 def tc_text(tc, parent):
     """Cell text rebuilt per paragraph, keeping tabs and breaks visible.
@@ -78,26 +171,27 @@ def tc_text(tc, parent):
     for kind, block in iter_part_blocks(tc, parent):
         if kind != "paragraph":  # nested tables are represented recursively, not duplicated here
             continue
-        pieces = []
-        for node in block._p.iter():
-            if node.tag == qn("w:t"):
-                pieces.append(node.text or "")
-            elif node.tag == qn("w:tab"):
-                pieces.append("<tab>")
-            elif node.tag in (qn("w:br"), qn("w:cr")):
-                pieces.append("<br>")
-            elif node.tag == qn("w:noBreakHyphen"):
-                pieces.append("-")
-            elif node.tag == qn("w:sym"):
-                pieces.append(legacy_symbol_record(node))
-        paragraphs.append("".join(pieces))
+        paragraphs.append(cell_paragraph_text(block))
     return " / ".join(paragraphs)
+
+def iter_content_control_children(root, target_tag):
+    """Find physical rows/cells through sdtContent without entering nested tables."""
+    for child_kind, child in iter_effective_children(root):
+        if child_kind == "unreadable":
+            raise ValueError(
+                f"unresolved AlternateContent while locating {target_tag}: {child}"
+            )
+        if child.tag == target_tag:
+            yield child
+        elif child.tag == qn("w:sdt"):
+            for content in child.findall(qn("w:sdtContent")):
+                yield from iter_content_control_children(content, target_tag)
 
 def table_content(table):
     rows = []
-    for row in table.rows:
+    for row_element in iter_content_control_children(table._tbl, qn("w:tr")):
         rendered_cells = []
-        row_properties = row._tr.find(qn("w:trPr"))
+        row_properties = row_element.find(qn("w:trPr"))
         grid_before_node = None if row_properties is None else row_properties.find(qn("w:gridBefore"))
         grid_after_node = None if row_properties is None else row_properties.find(qn("w:gridAfter"))
         grid_before = 0 if grid_before_node is None else int(grid_before_node.get(qn("w:val"), "0"))
@@ -105,7 +199,7 @@ def table_content(table):
         column = grid_before
         # row.cells repeats a merge-origin proxy for every grid position it spans.
         # Walk physical w:tc elements and expose the merge structure instead.
-        for cell_element in row._tr.tc_lst:
+        for cell_element in iter_content_control_children(row_element, qn("w:tc")):
             cell_properties = cell_element.find(qn("w:tcPr"))
             grid_span = None if cell_properties is None else cell_properties.find(qn("w:gridSpan"))
             colspan = 1 if grid_span is None else int(grid_span.get(qn("w:val"), "1"))
@@ -154,8 +248,14 @@ Notes:
   when a table is yielded, so table text is not also emitted as prose; `table_content()` handles
   nested tables recursively and emits `grid_before`, `grid_after`, `column`, `colspan`, and
   `vMerge` metadata for physical cells instead of duplicating merge-origin text through
-  `row.cells`. The row-level grid omissions are required for nonuniform tables whose cells do
-  not start in logical column zero or do not extend to the final grid column.
+  `row.cells`. It walks physical rows and cells through `w:sdtContent`; python-docx's public row
+  and cell collections omit those wrapped elements. The row-level grid omissions are required
+  for nonuniform tables whose cells do not start in logical column zero or do not extend to the
+  final grid column.
+  `mc:AlternateContent` is evaluated once: the first Choice whose required namespace URIs this
+  extractor understands wins, otherwise the Fallback is used. An alternative without either a
+  supported Choice or a Fallback is reported as unreadable; mutually exclusive branches must
+  never be concatenated.
   Imported `w:altChunk` HTML/RTF/document parts are not modeled by python-docx; the traversal
   reports their relationship target and content type as `unreadable` instead of silently
   presenting an incomplete extraction. Convert them with a trusted office renderer before
