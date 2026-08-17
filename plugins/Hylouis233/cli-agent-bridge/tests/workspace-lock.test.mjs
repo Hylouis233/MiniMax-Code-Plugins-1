@@ -10,6 +10,7 @@ import {
   acquireGitWorkspaceLock,
   localHostIdentity,
   tryAcquireGitWorkspaceLock,
+  workspaceHistoryRef,
   workspaceLockRef,
   workspaceRecoveryRef,
   WorkspaceLockCancelledError,
@@ -503,9 +504,29 @@ test("periodic ownership probes do not create heartbeat blobs", async (context) 
   await new Promise((resolve) => setTimeout(resolve, 120));
   const countOutput = await git(repo, ["count-objects", "-v"]);
   const looseCount = Number(/^count:\s+(\d+)$/mu.exec(countOutput)?.[1]);
-  assert.equal(looseCount, 1,
-    "read-only heartbeat probes must leave only the current owner blob");
+  assert.equal(looseCount, 2,
+    "read-only heartbeat probes must add nothing beyond the owner and one activity blob");
   await result.lease.release();
+});
+
+test("each acquisition publishes a unique clock-independent activity marker", async (context) => {
+  const repo = await makeRepo(context);
+  const key = "git-worktree:" + repo;
+  const historyRef = workspaceHistoryRef(key);
+  const first = await tryAcquireGitWorkspaceLock({ cwd: repo, key, heartbeatMs: 60_000 });
+  assert.equal(first.acquired, true);
+  const firstOid = (await git(repo, ["rev-parse", historyRef])).trim();
+  const firstRecord = JSON.parse(await git(repo, ["cat-file", "blob", firstOid]));
+  await first.lease.release();
+
+  const second = await tryAcquireGitWorkspaceLock({ cwd: repo, key, heartbeatMs: 60_000 });
+  assert.equal(second.acquired, true);
+  const secondOid = (await git(repo, ["rev-parse", historyRef])).trim();
+  const secondRecord = JSON.parse(await git(repo, ["cat-file", "blob", secondOid]));
+  assert.notEqual(secondOid, firstOid, "activity identity must not depend on Date.now granularity");
+  assert.notEqual(secondRecord.ownerToken, firstRecord.ownerToken);
+  assert.match(secondRecord.ownerOid, /^[0-9a-f]{40,64}$/u);
+  await second.lease.release();
 });
 
 test("post-CAS cancellation reconciles the committed owner before returning", async (context) => {

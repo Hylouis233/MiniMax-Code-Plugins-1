@@ -113,6 +113,23 @@ if (spec.branchRoundTrip) {
   execFileSync("git", ["fetch", spec.remotePath, "refs/heads/topic"]);
   writeFileSync(path.resolve(process.cwd(), spec.writeFile), "worktree-only change\n");
   event("end");
+} else if (spec.writeConcurrencyHistory) {
+  event("start");
+  const record = JSON.stringify({
+    version: 1,
+    acquiredAt: spec.acquiredAt,
+    endedAt: spec.endedAt,
+    hostIdentity: "fixture:clock-skewed-host",
+  }) + "\n";
+  const oid = execFileSync(
+    "git", ["hash-object", "-w", "--stdin"],
+    { cwd: spec.historyStore, input: record, encoding: "utf8" },
+  ).trim();
+  execFileSync("git", ["update-ref", spec.historyRef, oid], { cwd: spec.historyStore });
+  if (spec.writeFile) {
+    writeFileSync(path.resolve(process.cwd(), spec.writeFile), "clock-independent overlap\n");
+  }
+  event("end");
 } else if (spec.corruptTraceThenWrite) {
   event("start");
   appendFileSync(process.env.GIT_TRACE2_EVENT, "{malformed-trace2-event\n");

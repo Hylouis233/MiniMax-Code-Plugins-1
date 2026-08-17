@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { access, chmod, copyFile, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 import { createServer } from "node:net";
 import { createInterface } from "node:readline";
 import test from "node:test";
@@ -22,7 +23,8 @@ import {
   backendEntryFromProbe, backendGitProvenanceEnvironment,
   closestExistingBase, committedDelta,
   gitCommonDirectory, gitWorktreeRoot, loadBackends, markWorkspaceQuarantined,
-  populateCommitishCache, readBackendGitProvenance, readWorkspaceQuarantine, runCommand, runGitCommand,
+  populateCommitishCache, readBackendGitProvenance, readRepositoryLockActivity,
+  readWorkspaceQuarantine, runCommand, runGitCommand, startStdioServer,
 } from "../server.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -265,6 +267,33 @@ function unconfirmedGitResult(overrides = {}) {
     ...overrides,
   };
 }
+
+test("repository activity snapshots read history before a separate live-ref scan", async () => {
+  const historyRef = workspaceLockRef("fixture-ordered-history") + ".history";
+  const activeRef = workspaceLockRef("fixture-ordered-active");
+  const historyOid = "1".repeat(40);
+  const activeOid = "2".repeat(40);
+  let calls = 0;
+  const activity = await readRepositoryLockActivity(pluginRoot, null, {
+    commandRunner: async () => {
+      calls += 1;
+      return unconfirmedGitResult({
+        exitCode: 0,
+        killed: false,
+        orphanedProcesses: false,
+        treeTerminated: true,
+        terminationError: "",
+        stdout: calls === 1
+          ? historyRef + "\t" + historyOid + "\n"
+          : historyRef + "\t" + historyOid + "\n" + activeRef + "\t" + activeOid + "\n",
+      });
+    },
+  });
+  assert.equal(calls, 2, "history and live refs must not share a non-atomic enumeration");
+  assert.equal(activity.historyRefs.get(historyRef), historyOid);
+  assert.equal(activity.activeRefs, 1,
+    "a lease created after history capture must be visible in the later live scan");
+});
 
 test("Git interruption never outruns unconfirmed descendant quarantine", async () => {
   const cancelled = { cancelled: false, controller: null };
@@ -1396,7 +1425,9 @@ test("backend configuration reads obey cancellation, deadline, and shutdown", as
   client.notify("notifications/cancelled", { requestId: 50_102 });
   const cancelled = await listing;
   assert.ok(Date.now() - cancelledAt < 1_500, "configuration cancellation must return promptly");
-  assert.deepEqual(cancelled.result.structuredContent.backends, []);
+  assert.equal(cancelled.result, undefined, JSON.stringify(cancelled));
+  assert.equal(cancelled.error?.code, -32800, JSON.stringify(cancelled));
+  assert.match(cancelled.error?.message ?? "", /list_backends cancelled/iu);
 
   await rm(startedFile, { force: true });
   const pending = client.request("tools/call", {
@@ -1461,7 +1492,8 @@ test("Windows config reader termination closes real named-pipe I/O", {
   const cancelledAt = Date.now();
   cancelledClient.notify("notifications/cancelled", { requestId: 50_201 });
   const cancelled = await listing;
-  assert.deepEqual(cancelled.result.structuredContent.backends, []);
+  assert.equal(cancelled.result, undefined, JSON.stringify(cancelled));
+  assert.equal(cancelled.error?.code, -32800, JSON.stringify(cancelled));
   assert.ok(Date.now() - cancelledAt < 1_500,
     "cancelling a named-pipe config read must terminate its managed helper");
   await waitForSocketClose(cancelledSocket, "cancelled read");
@@ -1575,6 +1607,40 @@ test("list_backends rejects a successful probe whose tree cleanup is unconfirmed
   assert.equal(entry.available, false);
   assert.equal(entry.version, null);
   assert.equal(entry.error, "fixture version-probe descendant remains");
+});
+
+test("list_backends preserves version-probe timeout, exit, stderr, and spawn failures", () => {
+  const spec = {
+    label: "Fixture", command: "fixture", buildArgs: ["<task>"], resumeArgs: null,
+  };
+  const timed = backendEntryFromProbe("fixture", spec, {
+    exitCode: 0,
+    timedOut: true,
+    treeTerminated: true,
+    stderr: "timeout diagnostic",
+    stdout: "fixture 1.2.3\n",
+  });
+  assert.equal(timed.available, false);
+  assert.equal(timed.version, null);
+  assert.match(timed.error, /timed out after 15000 ms.*timeout diagnostic/iu);
+
+  const nonzero = backendEntryFromProbe("fixture", spec, {
+    exitCode: 37,
+    timedOut: false,
+    treeTerminated: true,
+    stderr: "license unavailable",
+    errorMessage: "",
+  });
+  assert.match(nonzero.error, /exited with code 37.*license unavailable/iu);
+
+  const spawnFailure = backendEntryFromProbe("fixture", spec, {
+    exitCode: null,
+    timedOut: false,
+    treeTerminated: true,
+    stderr: "",
+    errorMessage: "spawn fixture ENOENT",
+  });
+  assert.equal(spawnFailure.error, "spawn fixture ENOENT");
 });
 
 test("cancellation requires a fresh workspace_status to reveal earlier edits", async (context) => {
@@ -1884,7 +1950,7 @@ test("the private lock store inherits the repository sharing mode", async (conte
   }
 });
 
-test("stale starting and running lease refs remain visible to attribution", async (context) => {
+test("every extant foreign lease ref remains visible to attribution", async (context) => {
   const { tempRoot, workspace, client } = await makeHarness(context);
   const initialized = await client.request("tools/call", {
     name: "workspace_status", arguments: { workspacePath: workspace },
@@ -1923,8 +1989,62 @@ test("stale starting and running lease refs remain visible to attribution", asyn
   const idle = await client.request("tools/call", {
     name: "workspace_status", arguments: { workspacePath: workspace },
   });
-  assert.equal(idle.result.structuredContent.git.concurrentDelegations, 0,
-    "a stale idle owner is not an active delegation");
+  assert.equal(idle.result.structuredContent.git.concurrentDelegations, 1,
+    "an idle foreign lease may still be between worker cleanup and its durable activity marker");
+});
+
+test("history ref changes disclose overlap without comparing host clocks", async (context) => {
+  const { tempRoot, workspace, client } = await makeHarness(context);
+  const initialized = await client.request("tools/call", {
+    name: "workspace_status", arguments: { workspacePath: workspace },
+  });
+  assert.equal(initialized.result.structuredContent.ok, true, JSON.stringify(initialized));
+  const store = await coordinationLockStore(workspace);
+  const historyRef = workspaceLockRef("fixture-clock-skewed-worktree") + ".history";
+  context.after(async () => {
+    try { await execFileAsync("git", ["update-ref", "-d", historyRef], { cwd: store }); } catch { /* gone */ }
+  });
+  const response = await client.request("tools/call", taskArguments(workspace, {
+    name: "clock-skewed-overlap",
+    eventFile: path.join(tempRoot, "clock-skewed-overlap.jsonl"),
+    writeConcurrencyHistory: true,
+    historyStore: store,
+    historyRef,
+    // The old Date.now comparison rejected this completed run as ancient even
+    // though its marker was created between the two repository snapshots.
+    acquiredAt: 1,
+    endedAt: 2,
+    writeFile: "clock-skewed-overlap.txt",
+  }));
+  const out = response.result.structuredContent;
+  assert.equal(out.ok, true, JSON.stringify(out));
+  assert.equal(out.repositoryConcurrency, true, JSON.stringify(out));
+  assert.equal(out.git.concurrentDelegations, 1, JSON.stringify(out.git));
+});
+
+test("an unavailable activity marker prevents backend launch", async (context) => {
+  const { tempRoot, workspace, client } = await makeHarness(context);
+  const initialized = await client.request("tools/call", {
+    name: "workspace_status", arguments: { workspacePath: workspace },
+  });
+  assert.equal(initialized.result.structuredContent.ok, true, JSON.stringify(initialized));
+  const commonDir = await canonicalGitCommonDirectory(workspace);
+  const store = await coordinationLockStore(workspace);
+  const lockRef = workspaceLockRef(await repositoryKey(commonDir));
+  const historyLock = path.join(store, lockRef + ".history.lock");
+  await mkdir(path.dirname(historyLock), { recursive: true });
+  await writeFile(historyLock, "blocked\n");
+  context.after(() => rm(historyLock, { force: true }));
+  const eventFile = path.join(tempRoot, "activity-marker-failure.jsonl");
+  const response = await client.request("tools/call", taskArguments(workspace, {
+    name: "must-not-start-without-activity-marker", eventFile,
+  }));
+  assert.match(response.error?.message ?? "", /workspace activity marker/iu, JSON.stringify(response));
+  assert.deepEqual(await events(eventFile), [], "the backend must not start before marker durability");
+  const { stdout: ownerRef } = await execFileAsync(
+    "git", ["rev-parse", "--verify", "--quiet", lockRef], { cwd: store },
+  ).catch((error) => ({ stdout: error.stdout ?? "" }));
+  assert.equal(ownerRef.trim(), "", "failed marker publication must compensate its owner ref");
 });
 
 test("concurrent first requests publish one valid repository identity", async (context) => {
@@ -3144,6 +3264,77 @@ test("workspace_status can be cancelled while queued for the workspace lock", as
   assert.equal((await delegated).result.structuredContent.ok, true);
 });
 
+test("an unterminated oversized JSON-RPC line is rejected and closes the server", async (context) => {
+  const child = spawn(process.execPath, [serverPath], {
+    env: process.env,
+    windowsHide: true,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  context.after(() => { if (child.exitCode === null) child.kill(); });
+  const exited = new Promise((resolve) => child.once("exit", (code) => resolve(code)));
+  child.stdin.write("x".repeat(1_000_001));
+  let timer;
+  const code = await Promise.race([
+    exited,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error("oversized unterminated line did not close server")), 3_000);
+    }),
+  ]).finally(() => clearTimeout(timer));
+  assert.equal(code, 1, stderr);
+  const response = JSON.parse(stdout.trim().split(/\r?\n/u)[0]);
+  assert.equal(response.error?.code, -32700, stdout);
+  assert.match(response.error?.message ?? "", /size limit/iu);
+});
+
+test("the stdio limit applies to each line rather than the whole input chunk", async () => {
+  const stdin = new PassThrough();
+  const stdout = new PassThrough();
+  let output = "";
+  let oversized = false;
+  stdout.setEncoding("utf8");
+  stdout.on("data", (chunk) => { output += chunk; });
+  startStdioServer({ stdin, stdout, onOversizedLine: () => { oversized = true; } });
+  const line = (id) => JSON.stringify({
+    jsonrpc: "2.0", id, method: "ping", params: { padding: "x".repeat(600_000) },
+  });
+  stdin.end(line(63_101) + "\n" + line(63_102) + "\n");
+  await waitFor(() => output.trim().split(/\r?\n/u).filter(Boolean).length === 2);
+  assert.equal(oversized, false, "two legal lines must not be rejected because their chunk is large");
+  assert.deepEqual(output.trim().split(/\r?\n/u).map((entry) => JSON.parse(entry).id), [
+    63_101, 63_102,
+  ]);
+});
+
+test("oversized JSON-RPC input uses awaited shutdown and releases an active lease", async (context) => {
+  const { tempRoot, workspace, configPath, client } = await makeHarness(context);
+  const eventFile = path.join(tempRoot, "oversized-shutdown-events.jsonl");
+  const pending = client.request("tools/call", taskArguments(workspace, {
+    name: "oversized-shutdown-worker", eventFile, delayMs: 60_000,
+  }), 63_001);
+  void pending.catch(() => {});
+  await waitFor(async () => (await events(eventFile)).some((item) => item.event === "start"));
+  const exited = new Promise((resolve) => client.child.once("exit", resolve));
+  const started = Date.now();
+  client.child.stdin.write("x".repeat(1_000_001));
+  await exited;
+  assert.ok(Date.now() - started < 12_000,
+    "oversized input must await active cleanup without leaving the server alive");
+
+  const replacement = new McpClient(configPath);
+  await replacement.initialize();
+  context.after(() => replacement.close());
+  const status = await replacement.request("tools/call", {
+    name: "workspace_status", arguments: { workspacePath: workspace },
+  });
+  assert.equal(status.result.structuredContent.ok, true, JSON.stringify(status));
+});
+
 test("closing MCP stdin terminates active worker descendants", async (context) => {
   const { tempRoot, workspace, client } = await makeHarness(context);
   const eventFile = path.join(tempRoot, "shutdown-events.jsonl");
@@ -3891,6 +4082,68 @@ test("successive fetches are detected even after FETCH_HEAD is overwritten", asy
   }
 });
 
+test("a partially successful nonzero fetch makes provenance uncertain", async (context) => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), "cli-agent-partial-fetch-test-"));
+  const workspace = path.join(tempRoot, "workspace");
+  const upstream = path.join(tempRoot, "upstream");
+  await mkdir(workspace);
+  await mkdir(upstream);
+  await initializeFixtureRepository(workspace);
+  await initializeFixtureRepository(upstream);
+  context.after(() => rm(tempRoot, { recursive: true, force: true }));
+
+  await execFileAsync("git", ["checkout", "-b", "good"], { cwd: upstream });
+  await writeFile(path.join(upstream, "good.txt"), "good remote ref\n");
+  await execFileAsync("git", ["add", "good.txt"], { cwd: upstream });
+  await execFileAsync("git", ["commit", "-m", "good remote update"], { cwd: upstream });
+  const { stdout: goodOidRaw } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: upstream });
+  const goodOid = goodOidRaw.trim();
+  await execFileAsync("git", ["checkout", "main"], { cwd: upstream });
+  await execFileAsync("git", ["checkout", "-b", "rejected"], { cwd: upstream });
+  await writeFile(path.join(upstream, "rejected.txt"), "rejected remote ref\n");
+  await execFileAsync("git", ["add", "rejected.txt"], { cwd: upstream });
+  await execFileAsync("git", ["commit", "-m", "rejected remote update"], { cwd: upstream });
+
+  await execFileAsync("git", ["checkout", "-b", "local-divergent"], { cwd: workspace });
+  await writeFile(path.join(workspace, "local-divergent.txt"), "local divergent history\n");
+  await execFileAsync("git", ["add", "local-divergent.txt"], { cwd: workspace });
+  await execFileAsync("git", ["commit", "-m", "local divergent destination"], { cwd: workspace });
+  const { stdout: localOidRaw } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: workspace });
+  const localOid = localOidRaw.trim();
+  await execFileAsync("git", ["checkout", "main"], { cwd: workspace });
+  await execFileAsync("git", ["branch", "-D", "local-divergent"], { cwd: workspace });
+  await execFileAsync("git", ["update-ref", "refs/custom/rejected", localOid], { cwd: workspace });
+
+  const tracePath = path.join(tempRoot, "partial-fetch.trace2");
+  const traceHandle = await open(tracePath, "wx+", 0o600);
+  context.after(() => traceHandle.close().catch(() => {}));
+  const traceIdentity = await traceHandle.stat({ bigint: true });
+  let fetchFailure = null;
+  try {
+    await execFileAsync("git", [
+      "fetch", upstream,
+      "refs/heads/good:refs/custom/imported-good",
+      "refs/heads/rejected:refs/custom/rejected",
+    ], { cwd: workspace, env: backendGitProvenanceEnvironment(tracePath) });
+  } catch (error) {
+    fetchFailure = error;
+  }
+  assert.ok(fetchFailure, "one rejected destination must make fetch nonzero");
+  assert.equal(fetchFailure.code, 1, String(fetchFailure.stderr ?? fetchFailure));
+  const { stdout: importedGood } = await execFileAsync(
+    "git", ["rev-parse", "refs/custom/imported-good"], { cwd: workspace },
+  );
+  const { stdout: rejectedAfter } = await execFileAsync(
+    "git", ["rev-parse", "refs/custom/rejected"], { cwd: workspace },
+  );
+  assert.equal(importedGood.trim(), goodOid, "the successful ref update proves partial mutation");
+  assert.equal(rejectedAfter.trim(), localOid, "the non-fast-forward destination must stay unchanged");
+  const provenance = await readBackendGitProvenance({
+    tracePath, handle: traceHandle, identity: traceIdentity,
+  }, workspace);
+  assert.deepEqual(provenance, { uncertain: true, sawFetch: true });
+});
+
 test("pull makes commit attribution explicitly unavailable", async (context) => {
   const { tempRoot, workspace, client } = await makeHarness(context);
   const upstream = path.join(tempRoot, "pull-upstream");
@@ -4043,14 +4296,48 @@ test("list_backends can be cancelled while a version probe hangs", async (contex
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), "cli-agent-bridge-test-"));
   context.after(async () => { await rm(tempRoot, { recursive: true, force: true }); });
   const hangScript = path.join(tempRoot, "hang-version.mjs");
-  await writeFile(hangScript, "setTimeout(() => {}, 60_000);\n");
+  const startedFile = path.join(tempRoot, "version-probe-started.txt");
+  await writeFile(hangScript,
+    "import{writeFileSync}from'node:fs';" +
+    `writeFileSync(${JSON.stringify(startedFile)},'started\\n');` +
+    "setTimeout(()=>{},60000);\n");
+  let hangingCommand;
+  if (process.platform === "win32") {
+    hangingCommand = path.join(tempRoot, "hang-version.cmd");
+    // Match the narrowly parsed npm-shim shape so the managed Windows runner
+    // can safely forward --version to the real Node entry without cmd quoting.
+    await writeFile(hangingCommand, [
+      "@ECHO off",
+      "SETLOCAL",
+      "SET dp0=%~dp0",
+      'IF EXIST "%dp0%\\node.exe" (',
+      '  SET "_prog=%dp0%\\node.exe"',
+      ") ELSE (",
+      '  SET "_prog=node"',
+      ")",
+      'endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%" "%dp0%\\hang-version.mjs" %*',
+      "",
+    ].join("\r\n"));
+  } else {
+    hangingCommand = path.join(tempRoot, "hang-version");
+    await writeFile(hangingCommand,
+      `#!${process.execPath}\nimport ${JSON.stringify(pathToFileURL(hangScript).href)};\n`);
+    await chmod(hangingCommand, 0o755);
+  }
   const configPath = path.join(tempRoot, "backends.json");
   await writeFile(configPath, JSON.stringify({
     backends: {
+      fast: {
+        label: "Fast backend",
+        command: process.execPath,
+        buildArgs: ["<task>"],
+        resumeArgs: null,
+        experimental: false,
+      },
       hang: {
         label: "Hanging backend",
-        command: process.execPath,
-        buildArgs: [hangScript, "<task>"],
+        command: hangingCommand,
+        buildArgs: ["<task>"],
         resumeArgs: null,
         experimental: false,
       },
@@ -4061,12 +4348,16 @@ test("list_backends can be cancelled while a version probe hangs", async (contex
   context.after(async () => { await client.close(); });
   const started = Date.now();
   const responsePromise = client.request("tools/call", { name: "list_backends", arguments: {} }, 4242);
-  await new Promise((resolve) => setTimeout(resolve, 200));
+  await waitFor(async () => {
+    try { return (await readFile(startedFile, "utf8")).includes("started"); } catch { return false; }
+  });
   client.notify("notifications/cancelled", { requestId: 4242 });
   const response = await responsePromise;
   const elapsed = Date.now() - started;
   assert.ok(elapsed < 12_000, "cancellation must terminate the probe well before the 15s timeout");
-  assert.ok(Array.isArray(response.result.structuredContent.backends));
+  assert.equal(response.result, undefined, JSON.stringify(response));
+  assert.equal(response.error?.code, -32800, JSON.stringify(response));
+  assert.match(response.error?.message ?? "", /list_backends cancelled/iu);
 });
 
 test("missing backend commands fail before workspace launch", {

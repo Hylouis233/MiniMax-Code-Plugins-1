@@ -47,6 +47,8 @@ const backgroundFinalizers = new Set();
 let quarantineReadTestCallCount = 0;
 const RAW_TAIL_CHARS = 60_000;
 const FETCH_PROVENANCE_TIPS = Symbol("fetchProvenanceTips");
+const LOCK_HISTORY_REFS = Symbol("lockHistoryRefs");
+const MAX_JSON_RPC_LINE_CHARS = 1_000_000;
 const QUARANTINE_RECORD_FILE = "record.json";
 const WORKSPACE_QUARANTINE_DIRECTORY = "cli-agent-bridge-quarantines";
 const TEST_RUNTIME_PLATFORM = process.env.NODE_ENV === "test"
@@ -1342,10 +1344,10 @@ export function backendGitProvenanceEnvironment(tracePath, baseEnvironment = pro
       delete env[name];
     }
   }
-  // Trace2 identifies successful fetch/pull commands in the canonical target
-  // repository. Git does not expose a complete, cross-version per-fetch tip
-  // log, so their presence makes commit attribution explicitly unavailable
-  // instead of relying on the last (overwritable) FETCH_HEAD contents.
+  // Trace2 identifies completed fetch/pull attempts in the canonical target
+  // repository. A nonzero fetch may already have updated some refs, and Git
+  // exposes no complete cross-version per-fetch tip log, so any such attempt
+  // makes attribution unavailable instead of trusting the last FETCH_HEAD.
   env.GIT_TRACE2_EVENT = tracePath;
   return env;
 }
@@ -1555,7 +1557,11 @@ export async function readBackendGitProvenance(provenance, worktreeRoot, options
       uncertain = true;
       continue;
     }
-    if (session.worktree === targetWorktree && session.exitCode === 0) {
+    // A non-zero fetch can still update a subset of its destinations before a
+    // later ref is rejected. Completion in the target repository is therefore
+    // enough to make exact commit attribution unavailable; exit status cannot
+    // prove that the repository was left untouched.
+    if (session.worktree === targetWorktree) {
       sawFetch = true;
       uncertain = true;
     }
@@ -1636,14 +1642,65 @@ export async function runGitCommand(args, {
   return result;
 }
 
-// A starting/running lease ref is conservatively active until its exact owner
-// CAS removes or transitions it. Periodic ownership probes intentionally avoid
-// writing heartbeat blobs, and a stale timestamp cannot prove that an escaped
-// worker (or a worker on another host sharing the repository) has stopped.
+// Every foreign exact lease ref is conservatively active until its owner CAS
+// removes it. State and wall-clock timestamps cannot prove that a worker (or a
+// worker on another host sharing the repository) is outside our snapshot.
+
+export async function readRepositoryLockActivity(lockStoreRoot, ownLockRef, options = {}) {
+  if (!lockStoreRoot) return { activeRefs: 0, historyRefs: new Map() };
+  const readRefs = async (label) => {
+    const storedRefs = await runGitCommand([
+      "for-each-ref", "--format=%(refname)%09%(objectname)", WORKSPACE_LOCK_REF_PREFIX,
+    ], { cwd: lockStoreRoot, ...options });
+    const failure = snapshotFailure(label, storedRefs);
+    if (failure) throw new Error("git snapshot unreliable: " + failure);
+    return String(storedRefs.stdout ?? "").split(/\r?\n/u);
+  };
+
+  // These are intentionally two ordered Git snapshots, not two views parsed
+  // from one for-each-ref result. A lease exists before its marker is
+  // published: if the history scan already sees a new marker, the later live
+  // scan must see its lease unless that run completed before target ref capture.
+  const historyRefs = new Map();
+  for (const line of await readRefs("git for-each-ref workspace activity history")) {
+    if (!line) continue;
+    const separator = line.indexOf("\t");
+    if (separator <= 0) continue;
+    const ref = line.slice(0, separator);
+    const oid = line.slice(separator + 1);
+    if (ref === ownLockRef || ref === ownLockRef + ".history") continue;
+    if (/^refs\/cli-agent-bridge\/workspace-locks\/[0-9a-f]{64}\.history$/u.test(ref)) {
+      historyRefs.set(ref, oid);
+    }
+  }
+  let activeRefs = 0;
+  for (const line of await readRefs("git for-each-ref workspace active leases")) {
+    if (!line) continue;
+    const separator = line.indexOf("\t");
+    if (separator <= 0) continue;
+    const ref = line.slice(0, separator);
+    if (ref === ownLockRef) continue;
+    if (/^refs\/cli-agent-bridge\/workspace-locks\/[0-9a-f]{64}$/u.test(ref)) {
+      // Ref existence is the conservative signal. Malformed, idle, pending,
+      // or quarantined owners cannot be dismissed using a foreign host clock.
+      activeRefs += 1;
+    }
+  }
+  return { activeRefs, historyRefs };
+}
 
 async function gitSnapshot(worktreeRoot, options = {}) {
   const ownLockRef = typeof options.ownLockRef === "string" ? options.ownLockRef : null;
   const lockStoreRoot = typeof options.lockStoreRoot === "string" ? options.lockStoreRoot : null;
+  const historyBaseline = options.concurrencyHistoryBaseline instanceof Map
+    ? options.concurrencyHistoryBaseline
+    : null;
+  // The before vector must precede every target-repository observation. If it
+  // were sampled at the end, a run completing between ref capture and this
+  // marker could be swallowed into the baseline and misattributed later.
+  let lockActivity = historyBaseline === null
+    ? await readRepositoryLockActivity(lockStoreRoot, ownLockRef, options)
+    : null;
   const jobs = [
     ["git status --short", "status", ["status", "--short", "--untracked-files=all", "--ignore-submodules=none"], false, false, true],
     ["git diff --stat", "diffStat", ["diff", "--ignore-submodules=none", "--stat"], false, false, true],
@@ -1751,46 +1808,21 @@ async function gitSnapshot(worktreeRoot, options = {}) {
       throw new Error("git snapshot unreliable: cannot read FETCH_HEAD: " + error.message);
     }
   }
-  const lockRefs = [];
-  if (lockStoreRoot) {
-    const storedRefs = await runGitCommand([
-      "for-each-ref", "--format=%(refname)%09%(objectname)", WORKSPACE_LOCK_REF_PREFIX,
-    ], { cwd: lockStoreRoot, ...options });
-    const storedRefsFailure = snapshotFailure("git for-each-ref workspace lock store", storedRefs);
-    if (storedRefsFailure) throw new Error("git snapshot unreliable: " + storedRefsFailure);
-    for (const line of String(storedRefs.stdout ?? "").split(/\r?\n/u)) {
-      if (!line) continue;
-      const separator = line.indexOf("\t");
-      if (separator <= 0) continue;
-      const ref = line.slice(0, separator);
-      if (ref !== ownLockRef) lockRefs.push(line.slice(separator + 1));
-    }
-  }
+  lockActivity ??= await readRepositoryLockActivity(lockStoreRoot, ownLockRef, options);
   // Linked worktrees serialize per worktree but share repository refs, so a
   // commit from a parallel delegation can land between our two snapshots.
-  // Detection combines two signals: leases that are active right now, and the
-  // persistent run-history records completed delegations leave behind, whose
-  // [acquiredAt, endedAt] window is checked against this snapshot's window.
-  const windowStart = Number.isFinite(options.concurrencyWindowStart)
-    ? options.concurrencyWindowStart
-    : Number.POSITIVE_INFINITY;
-  let concurrentDelegations = 0;
-  for (const oid of lockRefs) {
-    const blob = await runGitCommand(["cat-file", "blob", oid], { cwd: lockStoreRoot, ...options });
-    if (blob.exitCode !== 0) continue; // unreadable owner blob: ignore for disclosure
-    try {
-      const record = JSON.parse(blob.stdout);
-      if (Number.isFinite(record?.endedAt)) {
-        const acquiredAt = Number.isFinite(record.acquiredAt) ? record.acquiredAt : record.endedAt;
-        if (acquiredAt <= Date.now() && record.endedAt >= windowStart) {
-          concurrentDelegations += 1;
-        }
-        continue;
+  // Detection combines two clock-independent signals: leases that are active
+  // at either snapshot, and a changed persistent history-ref OID between the
+  // snapshots. Wall clocks from two hosts sharing a repository are not
+  // comparable and must never decide whether attribution is exact.
+  let concurrentDelegations = lockActivity.activeRefs;
+  if (historyBaseline) {
+    const historyNames = new Set([...historyBaseline.keys(), ...lockActivity.historyRefs.keys()]);
+    for (const ref of historyNames) {
+      if (historyBaseline.get(ref) !== lockActivity.historyRefs.get(ref)) {
+        concurrentDelegations += 1;
       }
-      const active = record &&
-        (record.workerState === "starting" || record.workerState === "running");
-      if (active) concurrentDelegations += 1;
-    } catch { /* malformed owner blob: ignore for disclosure */ }
+    }
   }
   const snapshot = {
     // The leading space in porcelain's first XY column is significant (for
@@ -1804,6 +1836,7 @@ async function gitSnapshot(worktreeRoot, options = {}) {
     fetchHeads,
     concurrentDelegations,
   };
+  Object.defineProperty(snapshot, LOCK_HISTORY_REFS, { value: lockActivity.historyRefs });
   return snapshot;
 }
 
@@ -2127,10 +2160,25 @@ export async function committedDelta(worktreeRoot, before, after, options = {}) 
 }
 
 export function backendEntryFromProbe(name, spec, check) {
-  const available = check.exitCode === 0 && check.treeTerminated === true;
-  const probeError = check.treeTerminated !== true
-    ? (check.terminationError || "backend version probe process tree could not be confirmed terminated")
-    : (check.errorMessage || "command not found or not executable");
+  const available = check.exitCode === 0 && check.treeTerminated === true && check.timedOut !== true;
+  const probeStderr = tail(String(check.stderr ?? ""), 500).trim();
+  let probeError = "";
+  if (check.treeTerminated !== true) {
+    probeError = check.terminationError ||
+      "backend version probe process tree could not be confirmed terminated";
+  } else if (check.timedOut) {
+    probeError = "backend version probe timed out after " + VERSION_CHECK_TIMEOUT_MS + " ms" +
+      (probeStderr ? ": " + probeStderr : "");
+  } else if (typeof check.exitCode === "number" && check.exitCode !== 0) {
+    probeError = "backend version probe exited with code " + check.exitCode +
+      (probeStderr ? ": " + probeStderr : "");
+  } else if (check.errorMessage) {
+    probeError = check.errorMessage;
+  } else if (probeStderr) {
+    probeError = "backend version probe failed: " + probeStderr;
+  } else {
+    probeError = "command not found or not executable";
+  }
   return {
     name,
     label: typeof spec.label === "string" ? spec.label : name,
@@ -2145,6 +2193,7 @@ export function backendEntryFromProbe(name, spec, check) {
 }
 
 async function listBackends(cancel = null) {
+  if (cancel?.cancelled) throw new OperationCancelledError("list_backends cancelled by client");
   if (!supportsReliableProcessContainment()) {
     return [{
       name: "unsupported-platform",
@@ -2162,20 +2211,18 @@ async function listBackends(cancel = null) {
   try {
     backends = await loadBackends({ cancel });
   } catch (error) {
-    if (error instanceof OperationCancelledError) return [];
     throw error;
   }
   const entries = [];
   for (const [name, spec] of Object.entries(backends)) {
     // A hung `--version` probe must not pin the request: the client can cancel
     // the discovery call, terminating the current probe and skipping the rest.
-    if (cancel?.cancelled) break;
+    if (cancel?.cancelled) throw new OperationCancelledError("list_backends cancelled by client");
     if (!spec || typeof spec.command !== "string") continue;
     let resolvedCommand;
     try {
       resolvedCommand = await resolveBackendCommand(spec.command, { cancel });
     } catch (error) {
-      if (error instanceof OperationCancelledError) break;
       throw error;
     }
     if (!resolvedCommand) {
@@ -2201,6 +2248,13 @@ async function listBackends(cancel = null) {
       },
     });
     if (cancel?.controller) cancel.controller = null;
+    if (cancel?.cancelled) {
+      if (check.treeTerminated !== true) {
+        throw new Error(check.terminationError ||
+          "backend version probe process tree could not be confirmed terminated");
+      }
+      throw new OperationCancelledError("list_backends cancelled by client");
+    }
     entries.push(backendEntryFromProbe(name, spec, check));
   }
   return entries;
@@ -2818,9 +2872,6 @@ async function delegateTask(rawArgs, cancel) {
         return gitProcessQuarantine;
       };
       const allowDirty = rawArgs.allowDirty === true;
-    // Attribution window for concurrency disclosure: everything between the
-    // before-snapshot and the after-snapshot.
-    const attributionWindowStart = Date.now();
     let before;
     try {
       before = await gitSnapshot(worktreeRoot, {
@@ -3104,7 +3155,7 @@ async function delegateTask(rawArgs, cancel) {
           deadline,
           ownLockRef: workspaceLease.ref,
           lockStoreRoot,
-          concurrencyWindowStart: attributionWindowStart,
+          concurrencyHistoryBaseline: before[LOCK_HISTORY_REFS],
           onUnconfirmedProcessTree: quarantineGitProcessTree,
         });
         Object.defineProperty(after, FETCH_PROVENANCE_TIPS, { value: fetchProvenanceTips });
@@ -3323,6 +3374,7 @@ function installShutdownHandlers(stdin, stdout = process.stdout) {
   process.once("exit", () => {
     for (const { cancel } of activeRequests.values()) cancel.cancel();
   });
+  return shutdown;
 }
 
 async function handleMessage(message) {
@@ -3376,6 +3428,11 @@ async function handleMessage(message) {
               content: [{ type: "text", text: lines.join("\n") }],
               structuredContent: { backends: entries },
             });
+          } catch (error) {
+            if (error instanceof OperationCancelledError) {
+              return jsonRpcError(message.id, -32800, "list_backends cancelled by client");
+            }
+            throw error;
           } finally {
             finishRequest();
           }
@@ -3536,7 +3593,11 @@ async function handleMessage(message) {
   }
 }
 
-function startStdioServer({ stdin = process.stdin, stdout = process.stdout } = {}) {
+export function startStdioServer({
+  stdin = process.stdin,
+  stdout = process.stdout,
+  onOversizedLine = () => stdin.destroy?.(),
+} = {}) {
   stdin.setEncoding("utf8");
   let buffer = "";
   stdin.on("data", (chunk) => {
@@ -3547,6 +3608,14 @@ function startStdioServer({ stdin = process.stdin, stdout = process.stdout } = {
       if (shutdownRequested) {
         buffer = "";
         break;
+      }
+      if (newlineIndex > MAX_JSON_RPC_LINE_CHARS) {
+        buffer = "";
+        stdout.write(JSON.stringify(jsonRpcError(
+          null, -32700, "JSON-RPC request line exceeds the configured size limit",
+        )) + "\n");
+        onOversizedLine();
+        return;
       }
       const line = buffer.slice(0, newlineIndex).trim();
       buffer = buffer.slice(newlineIndex + 1);
@@ -3565,10 +3634,19 @@ function startStdioServer({ stdin = process.stdin, stdout = process.stdout } = {
         stdout.write(JSON.stringify(jsonRpcError(null, -32603, error.message)) + "\n");
       });
     }
+    if (buffer.length > MAX_JSON_RPC_LINE_CHARS) {
+      buffer = "";
+      stdout.write(JSON.stringify(jsonRpcError(
+        null, -32700, "JSON-RPC request line exceeds the configured size limit",
+      )) + "\n");
+      onOversizedLine();
+    }
   });
 }
 
 if (process.argv[1] && process.argv[1] === fileURLToPath(import.meta.url)) {
-  startStdioServer();
-  installShutdownHandlers(process.stdin, process.stdout);
+  const shutdown = installShutdownHandlers(process.stdin, process.stdout);
+  startStdioServer({
+    onOversizedLine: () => shutdown(1),
+  });
 }

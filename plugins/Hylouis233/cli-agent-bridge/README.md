@@ -143,9 +143,10 @@ you already obtained a valid ID from that backend outside this Plugin.
 - Locking leaves the target repository refs, worktree, and index unchanged, but it requires writable
   metadata in the private bare lock store. Its initialization inherits the enclosing repository's
   `core.sharedRepository` mode for group/multi-user repositories. Each acquisition writes an owner
-  blob and temporarily updates a coordination ref there. Periodic ownership checks read that ref
-  without manufacturing new heartbeat blobs; any extant `starting`/`running` ref remains a
-  conservative attribution-overlap signal regardless of its last state-transition timestamp.
+  blob and temporarily updates a coordination ref there. Before returning an acquired lease, it
+  also publishes a unique activity-object ID. Snapshots compare activity IDs rather than clocks
+  from different hosts, and any extant foreign lease ref (including idle, pending, malformed, or
+  quarantined state) remains a conservative attribution-overlap signal.
   Each normal release schedules Git's safe automatic
   maintenance for superseded state. A failed release first leaves an exact-owner recovery record in
   the shared store, so another bridge process can finish cleanup after the transient failure clears.
@@ -195,8 +196,9 @@ you already obtained a valid ID from that backend outside this Plugin.
   reached through multiple moved refs is counted and logged once with all contributing labels;
   ref namespaces alone never prove that a commit came from outside the worker.
   Git exposes only the final, overwritable FETCH_HEAD and no complete cross-version per-fetch tip log.
-  A private, per-delegation Trace2 event stream therefore detects successful fetch/pull operations in
-  the canonical workspace; when one occurred, the response keeps the worktree/ref snapshot but marks
+  A private, per-delegation Trace2 event stream therefore detects completed fetch/pull attempts in
+  the canonical workspace, including nonzero fetches that may have updated only some destinations;
+  when one occurred, the response keeps the worktree/ref snapshot but marks
   commit attribution unavailable instead of guessing which commits were worker-created. The trace is
   user-private, bounded, consumed after worker cleanup, and removed before the response. Runs without
   fetch/pull batch commit-tip classification, and each changed target uses one boundary graph
@@ -207,6 +209,9 @@ you already obtained a valid ID from that backend outside this Plugin.
   and dsh needs a headless profile present under DSH_HOME/profiles.
 - Custom wrapper shims that re-bind dashed flags can misreport a backend as unavailable; point
   the backend command at the real executable to bypass the wrapper.
+- The stdio transport accepts newline-delimited JSON-RPC with a 1,000,000-character per-line
+  limit. An unterminated or complete line beyond that bound is rejected and closes the dispatch
+  gate through the same awaited cleanup path as host disconnect.
 
 ## Verification
 
@@ -224,7 +229,7 @@ operator approval rename, interruptible lease state updates, shared quarantine m
 discovery-phase cancellation (including list_backends probes), overall deadlines, cancel/timeout
 Windows Job Object termination, internal fail-closed process-tree state-machine fixtures,
 PID-reuse identity checks before signaling, unusual Git pathnames (including a trailing-space worktree
-root), JSON-RPC id typing, unborn HEAD and non-HEAD ref changes, checkout-only HEAD moves,
+root), JSON-RPC id typing and bounded lines, unborn HEAD and non-HEAD ref changes, checkout-only HEAD moves,
 single-count attribution for commits on the checked-out branch, fork-point diff baselines for
 new branches, non-commit refs, fetched-history exclusion, repository-wide serialization and
 failed-release recovery between linked worktrees,

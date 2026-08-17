@@ -39,31 +39,45 @@ export function workspaceLockRef(key) {
   return WORKSPACE_LOCK_REF_PREFIX + createHash("sha256").update(key).digest("hex");
 }
 
-// A completed delegation leaves a persistent run-window record under this ref
-// so later snapshots in the same repository can prove their attribution window
-// overlapped another worker, even after that worker's lease ref was deleted.
+// Every acquired lease publishes a unique persistent activity record before it
+// can return to a caller. Snapshots compare this ref's object id rather than
+// wall-clock timestamps, which are not comparable across repository hosts.
 export function workspaceHistoryRef(key) {
   return workspaceLockRef(key) + WORKSPACE_HISTORY_REF_SUFFIX;
 }
 
-async function writeRunHistory(cwd, lockRef, owner) {
-  try {
-    const record = {
-      version: 1,
-      acquiredAt: Number.isFinite(owner.acquiredAt) ? owner.acquiredAt : null,
-      endedAt: Date.now(),
-      hostIdentity: owner.hostIdentity,
-    };
-    const oidResult = await runGit(cwd, ["hash-object", "-w", "--stdin"], {
-      stdinText: JSON.stringify(record) + "\n",
-    });
-    const oid = oidResult.stdout.trim();
-    if (oidResult.exitCode !== 0 || !/^[0-9a-f]{40,64}$/u.test(oid)) return;
-    await runGit(cwd, ["update-ref", "--no-deref", lockRef + WORKSPACE_HISTORY_REF_SUFFIX, oid]);
-  } catch {
-    // Best effort: a missing history record only weakens concurrency
-    // disclosure, never correctness of locking.
+async function writeRunHistory(cwd, lockRef, ownerOid, owner) {
+  const deadline = Date.now() + GIT_TIMEOUT_MS;
+  const record = {
+    version: 2,
+    ownerOid,
+    ownerToken: owner.token,
+    hostIdentity: owner.hostIdentity,
+  };
+  const oidResult = await runGit(cwd, ["hash-object", "-w", "--stdin"], {
+    stdinText: JSON.stringify(record) + "\n",
+    deadline,
+  });
+  const oid = oidResult.stdout.trim();
+  if (oidResult.exitCode !== 0 || !/^[0-9a-f]{40,64}$/u.test(oid)) {
+    throw new Error("cannot write workspace activity marker blob");
   }
+  let lastError = null;
+  for (let attempt = 0; attempt < RELEASE_ATTEMPTS; attempt += 1) {
+    try {
+      const result = await runGit(cwd, [
+        "update-ref", "--no-deref", lockRef + WORKSPACE_HISTORY_REF_SUFFIX, oid,
+      ], { deadline });
+      if (result.exitCode === 0) return;
+      lastError = new Error(result.stderr || "cannot publish workspace activity marker");
+    } catch (error) {
+      lastError = error;
+    }
+    if (attempt + 1 < RELEASE_ATTEMPTS) {
+      await new Promise((resolve) => setTimeout(resolve, RELEASE_RETRY_MS));
+    }
+  }
+  throw new Error("cannot publish workspace activity marker", { cause: lastError });
 }
 
 export function workspaceRecoveryRef(lockRef, ownerOid) {
@@ -663,7 +677,6 @@ function createLease({ cwd, ref, oid, owner, heartbeatMs }) {
           } catch { /* the exact candidate set remains sufficient */ }
         }
         let deleted = false;
-        let deletedOwner = currentOwner;
         const removalErrors = [];
         for (const [candidateOid, candidateOwner] of candidateOwners) {
           try {
@@ -672,7 +685,6 @@ function createLease({ cwd, ref, oid, owner, heartbeatMs }) {
             );
             if (result.deleted) {
               deleted = true;
-              deletedOwner = candidateOwner;
               break;
             }
           } catch (error) {
@@ -695,7 +707,6 @@ function createLease({ cwd, ref, oid, owner, heartbeatMs }) {
             : new AggregateError(removalErrors, "cannot reconcile interrupted workspace lock state");
         }
         released = true;
-        if (deleted) await writeRunHistory(cwd, ref, deletedOwner);
         await maintainLockStore(cwd);
         if (lostError) throw lostError;
         if (!deleted) throw new Error("workspace lock ownership changed before release");
@@ -783,6 +794,19 @@ export async function tryAcquireGitWorkspaceLock({
     throw error;
   }
   if (!acquired) return { acquired: false, reason: "contended" };
+  try {
+    // This marker closes the attribution gap before any caller can inspect or
+    // modify the target repository. The owner ref remains visible until the
+    // marker is durable, so snapshots always observe at least one signal.
+    await writeRunHistory(cwd, ref, newOid, owner);
+  } catch (historyError) {
+    try {
+      await removeOwnedRefWithRecovery(cwd, ref, newOid, owner.token);
+    } catch (cleanupError) {
+      if (historyError.cause === undefined) historyError.cause = cleanupError;
+    }
+    throw historyError;
+  }
   if (localRecoveryAuthorized) locallyAbandonedRefs.delete(abandonmentKey);
   if (recovery) {
     await clearRecoveryAuthorization(cwd, recovery);
