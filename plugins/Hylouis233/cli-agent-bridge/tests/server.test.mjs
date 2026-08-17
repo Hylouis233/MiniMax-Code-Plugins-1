@@ -1322,7 +1322,6 @@ test("backend configuration cleanup uncertainty outranks cancellation", async (c
     stall: process.env.CLI_AGENT_BRIDGE_TEST_BACKEND_CONFIG_READ_STALL_FILE,
   };
   process.env.NODE_ENV = "test";
-  process.env.CLI_AGENT_BRIDGE_BACKENDS = config;
   process.env.CLI_AGENT_BRIDGE_TEST_BACKEND_CONFIG_READ_STALL_FILE = path.join(root, "unused");
   context.after(() => {
     if (saved.nodeEnv === undefined) delete process.env.NODE_ENV;
@@ -1332,22 +1331,27 @@ test("backend configuration cleanup uncertainty outranks cancellation", async (c
     if (saved.stall === undefined) delete process.env.CLI_AGENT_BRIDGE_TEST_BACKEND_CONFIG_READ_STALL_FILE;
     else process.env.CLI_AGENT_BRIDGE_TEST_BACKEND_CONFIG_READ_STALL_FILE = saved.stall;
   });
-  const cancel = testCancellation();
-  await assert.rejects(loadBackends({
-    cancel,
-    commandRunner: async () => {
-      cancel.cancel();
-      return {
-        treeTerminated: false,
-        terminationError: "fixture cleanup uncertainty",
-        timedOut: false,
-        exitCode: 0,
-        stderr: "",
-        stdout: "{}",
-        stdoutTruncated: false,
-      };
-    },
-  }), /cleanup could not be confirmed.*fixture cleanup uncertainty/iu);
+  for (const explicitOverride of [true, false]) {
+    if (explicitOverride) process.env.CLI_AGENT_BRIDGE_BACKENDS = config;
+    else delete process.env.CLI_AGENT_BRIDGE_BACKENDS;
+    const cancel = testCancellation();
+    await assert.rejects(loadBackends({
+      cancel,
+      commandRunner: async () => {
+        cancel.cancel();
+        return {
+          treeTerminated: false,
+          terminationError: "fixture cleanup uncertainty",
+          timedOut: false,
+          exitCode: 0,
+          stderr: "",
+          stdout: "{}",
+          stdoutTruncated: false,
+        };
+      },
+    }), /cleanup could not be confirmed.*fixture cleanup uncertainty/iu,
+    explicitOverride ? "explicit override" : "bundled configuration");
+  }
 });
 
 test("an unset backend override still loads the bundled configuration", async (context) => {

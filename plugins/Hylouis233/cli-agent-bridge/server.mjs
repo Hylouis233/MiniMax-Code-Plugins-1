@@ -317,7 +317,7 @@ async function readBackendConfiguration(file, options = {}) {
     });
     if (options.cancel?.controller === controller) options.cancel.controller = null;
     if (result.treeTerminated !== true) {
-      throw new Error(
+      throw new BackendConfigurationCleanupError(
         "backend configuration reader cleanup could not be confirmed: " +
         (result.terminationError || "process tree termination was unconfirmed"),
       );
@@ -354,7 +354,8 @@ export async function loadBackends(options = {}) {
     try {
       return await readBackendConfiguration(file, options);
     } catch (error) {
-      if (error instanceof OperationCancelledError || error instanceof DeadlineExceededError) {
+      if (error instanceof OperationCancelledError || error instanceof DeadlineExceededError ||
+          error instanceof BackendConfigurationCleanupError) {
         throw error;
       }
       throw new Error("cannot load explicit backend configuration " + file + ": " + error.message);
@@ -364,7 +365,8 @@ export async function loadBackends(options = {}) {
   try {
     return await readBackendConfiguration(bundled, options);
   } catch (error) {
-    if (error instanceof OperationCancelledError || error instanceof DeadlineExceededError) {
+    if (error instanceof OperationCancelledError || error instanceof DeadlineExceededError ||
+        error instanceof BackendConfigurationCleanupError) {
       throw error;
     }
     return FALLBACK_BACKENDS;
@@ -1294,6 +1296,7 @@ function snapshotFailure(label, result) {
 class OperationCancelledError extends Error {}
 class DeadlineExceededError extends Error {}
 class InvalidArgumentsError extends Error {}
+class BackendConfigurationCleanupError extends Error {}
 class GitProcessTreeUnconfirmedError extends Error {
   constructor(label, terminationError, quarantine = null) {
     super(label + " process tree could not be confirmed terminated: " + terminationError);
