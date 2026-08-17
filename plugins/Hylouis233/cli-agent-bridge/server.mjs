@@ -8,12 +8,12 @@
 
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { chmod, mkdir, mkdtemp, open, readFile, realpath, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, open, readFile, realpath, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
-import { resolvePathCommand, safeGitInvocation } from "./git-executable.mjs";
+import { resolvePathCommand, safeGitInvocation, subscribePathCommand } from "./git-executable.mjs";
 import { initializeProcessTree, isProcessTreeAlive, refreshProcessTree, signalProcessTree, waitForChildExit, waitForProcessTreeExit } from "./process-tree.mjs";
 import {
   acquireGitWorkspaceLock,
@@ -40,6 +40,7 @@ const MAX_CAPTURE_CHARS = 5_000_000;
 const RAW_TAIL_CHARS = 60_000;
 const FETCH_PROVENANCE_TIPS = Symbol("fetchProvenanceTips");
 const QUARANTINE_RECORD_FILE = "record.json";
+const WORKSPACE_QUARANTINE_DIRECTORY = "cli-agent-bridge-quarantines";
 const TEST_RUNTIME_PLATFORM = process.env.NODE_ENV === "test"
   ? process.env.CLI_AGENT_BRIDGE_TEST_PLATFORM
   : "";
@@ -60,23 +61,6 @@ function trustedWindowsPowerShell() {
     windowsRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe",
   );
 }
-
-function currentUserLockScope() {
-  let identity;
-  try {
-    const user = os.userInfo();
-    identity = Number.isInteger(user.uid) && user.uid >= 0
-      ? process.platform + ":uid:" + String(user.uid)
-      : process.platform + ":" + user.username + ":" + user.homedir;
-  } catch {
-    identity = process.platform + ":" + (process.env.USERNAME ?? process.env.USER ?? os.homedir());
-  }
-  return createHash("sha256").update(identity).digest("hex").slice(0, 20);
-}
-
-const WORKSPACE_LOCK_ROOT = path.join(
-  os.tmpdir(), "minimax-cli-agent-bridge-locks-" + currentUserLockScope(),
-);
 
 // Built-in defaults. The sibling backends.json (or the CLI_AGENT_BRIDGE_BACKENDS
 // environment variable) overrides these; a missing or invalid file falls back
@@ -674,6 +658,43 @@ function interruptibleFilesystemOperation(operation, { cancel = null, deadline =
   });
 }
 
+function resolveBackendCommand(command, options = {}) {
+  const { cancel = null, deadline = null } = options;
+  if (cancel?.cancelled) return Promise.reject(new OperationCancelledError("operation cancelled by client"));
+  if (deadline !== null && Date.now() >= deadline) {
+    return Promise.reject(new DeadlineExceededError("delegation deadline exceeded"));
+  }
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timer = null;
+    let unsubscribeCancel = () => {};
+    let unsubscribeResolution = () => {};
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      unsubscribeCancel();
+      unsubscribeResolution();
+      callback(value);
+    };
+    const cancelled = () => finish(
+      reject, new OperationCancelledError("operation cancelled by client"),
+    );
+    if (typeof cancel?.subscribe === "function") unsubscribeCancel = cancel.subscribe(cancelled);
+    else if (cancel?.promise) void cancel.promise.then(cancelled);
+    if (deadline !== null) {
+      timer = setTimeout(() => finish(
+        reject, new DeadlineExceededError("delegation deadline exceeded"),
+      ), Math.max(0, deadline - Date.now()));
+    }
+    unsubscribeResolution = subscribePathCommand(
+      command,
+      (value) => finish(resolve, value),
+      (error) => finish(reject, error),
+    );
+  });
+}
+
 async function validateWorkspace(workspacePath, options = {}) {
   if (typeof workspacePath !== "string" || !workspacePath.trim()) {
     throw new Error("workspacePath must be a non-empty string");
@@ -964,6 +985,55 @@ async function ensureRepositoryId(storeRoot, options = {}) {
   return await publishRepositoryIdRef(storeRoot, publishedLegacy, options);
 }
 
+async function ensureWorkspaceQuarantineRoot(storeRoot, options = {}) {
+  const storeMetadata = await interruptibleFilesystemOperation(lstat(storeRoot), options);
+  if (!storeMetadata.isDirectory() || storeMetadata.isSymbolicLink()) {
+    throw new Error("workspace lock store must be a real directory before quarantine state is trusted");
+  }
+  const quarantineRoot = path.join(storeRoot, WORKSPACE_QUARANTINE_DIRECTORY);
+  const fileMode = await repositoryIdMode(storeRoot, options);
+  const directoryMode = fileMode | ((fileMode & 0o444) >> 2) |
+    (process.platform !== "win32" && (fileMode & 0o060) === 0o060 ? 0o2000 : 0);
+  let metadata = null;
+  try {
+    metadata = await interruptibleFilesystemOperation(lstat(quarantineRoot), options);
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  if (!metadata) {
+    const creatingCandidate = mkdtemp(path.join(storeRoot, ".cli-agent-bridge-quarantines-"));
+    let candidateRoot;
+    try {
+      candidateRoot = await interruptibleFilesystemOperation(creatingCandidate, options);
+    } catch (error) {
+      void creatingCandidate.then((lateRoot) => rm(lateRoot, { recursive: true, force: true }))
+        .catch(() => {});
+      throw error;
+    }
+    try {
+      if (process.platform !== "win32") {
+        await interruptibleFilesystemOperation(chmod(candidateRoot, directoryMode), options);
+      }
+      try {
+        await interruptibleFilesystemOperation(rename(candidateRoot, quarantineRoot), options);
+      } catch (error) {
+        if (!["EEXIST", "ENOTEMPTY", "EPERM"].includes(error.code)) throw error;
+      }
+    } finally {
+      await rm(candidateRoot, { recursive: true, force: true });
+    }
+    metadata = await interruptibleFilesystemOperation(lstat(quarantineRoot), options);
+  }
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+    throw new Error("workspace quarantine root must be a real directory inside the lock store");
+  }
+  if (process.platform !== "win32" &&
+      (metadata.mode & directoryMode) !== directoryMode) {
+    throw new Error("workspace quarantine root does not preserve the repository sharing mode");
+  }
+  return quarantineRoot;
+}
+
 async function ensureWorkspaceLockStore(gitCommonDir, options = {}) {
   const storeRoot = path.join(gitCommonDir, WORKSPACE_LOCK_STORE_NAME);
   let initialized = false;
@@ -1015,7 +1085,12 @@ async function ensureWorkspaceLockStore(gitCommonDir, options = {}) {
   // On Linux storeRoot may be below /proc/<bridge-pid>/fd/<directory-fd>.
   // Keep that stable alias instead of resolving it back to a pathname that a
   // concurrent repository rename can invalidate while the lease is active.
-  return { root: storeRoot, repositoryId: await ensureRepositoryId(storeRoot, options) };
+  const repositoryId = await ensureRepositoryId(storeRoot, options);
+  return {
+    root: storeRoot,
+    repositoryId,
+    quarantineRoot: await ensureWorkspaceQuarantineRoot(storeRoot, options),
+  };
 }
 
 function snapshotFailure(label, result) {
@@ -1044,10 +1119,12 @@ class GitProcessTreeUnconfirmedError extends Error {
 
 const BACKEND_GIT_ROUTING_VARIABLES = new Set([
   "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR", "GIT_CONFIG",
-  "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS", "GIT_DIR", "GIT_GRAFT_FILE",
-  "GIT_IMPLICIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_NAMESPACE", "GIT_OBJECT_DIRECTORY",
-  "GIT_PREFIX", "GIT_QUARANTINE_PATH", "GIT_REPLACE_REF_BASE", "GIT_SHALLOW_FILE",
-  "GIT_WORK_TREE",
+  "GIT_CEILING_DIRECTORIES", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS", "GIT_DIR",
+  "GIT_DISCOVERY_ACROSS_FILESYSTEM", "GIT_GRAFT_FILE",
+  "GIT_IMPLICIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_NAMESPACE", "GIT_NO_REPLACE_OBJECTS",
+  "GIT_OBJECT_DIRECTORY", "GIT_PREFIX", "GIT_QUARANTINE_PATH", "GIT_REFERENCE_BACKEND",
+  "GIT_REPLACE_REF_BASE",
+  "GIT_SHALLOW_FILE", "GIT_WORK_TREE",
 ]);
 
 function gitCommandIndex(argv) {
@@ -1667,7 +1744,13 @@ async function listBackends(cancel = null) {
       });
       continue;
     }
-    const resolvedCommand = await resolvePathCommand(spec.command);
+    let resolvedCommand;
+    try {
+      resolvedCommand = await resolveBackendCommand(spec.command, { cancel });
+    } catch (error) {
+      if (error instanceof OperationCancelledError) break;
+      throw error;
+    }
     if (!resolvedCommand) {
       entries.push({
         name,
@@ -1706,17 +1789,17 @@ async function listBackends(cancel = null) {
   return entries;
 }
 
-function workspaceQuarantinePath(key) {
+function workspaceQuarantinePath(quarantineRoot, key) {
   const digest = createHash("sha256").update(key).digest("hex");
-  return path.join(WORKSPACE_LOCK_ROOT, digest + ".quarantine");
+  return path.join(quarantineRoot, digest + ".quarantine");
 }
 
-function workspaceQuarantineRecoveryPath(key) {
-  return workspaceQuarantinePath(key) + ".recovery-approved";
+function workspaceQuarantineRecoveryPath(quarantineRoot, key) {
+  return workspaceQuarantinePath(quarantineRoot, key) + ".recovery-approved";
 }
 
-async function readWorkspaceQuarantine(key) {
-  const quarantinePath = workspaceQuarantinePath(key);
+async function readWorkspaceQuarantine(quarantineRoot, key) {
+  const quarantinePath = workspaceQuarantinePath(quarantineRoot, key);
   try {
     const marker = await stat(quarantinePath);
     let raw = null;
@@ -1734,7 +1817,7 @@ async function readWorkspaceQuarantine(key) {
     try {
       details = typeof raw === "string" ? JSON.parse(raw) : { error: "invalid quarantine record" };
     } catch { details = { error: "invalid quarantine record" }; }
-    return { quarantinePath, details };
+    return { quarantinePath: await realpath(quarantinePath), details };
   } catch (error) {
     if (error.code === "ENOENT") return null;
     throw error;
@@ -1745,9 +1828,9 @@ async function readWorkspaceQuarantine(key) {
 // inference from an absent temporary file. The random id binds authorization
 // to the exact quarantined lease and prevents a stale approval from carrying
 // over to a later incident.
-async function quarantineRecoveryApproved(key, owner) {
+async function quarantineRecoveryApproved(quarantineRoot, key, owner) {
   try {
-    const recoveryPath = workspaceQuarantineRecoveryPath(key);
+    const recoveryPath = workspaceQuarantineRecoveryPath(quarantineRoot, key);
     const marker = await stat(recoveryPath);
     const raw = marker.isDirectory()
       ? await readFile(path.join(recoveryPath, QUARANTINE_RECORD_FILE), "utf8")
@@ -1760,16 +1843,27 @@ async function quarantineRecoveryApproved(key, owner) {
   }
 }
 
-async function clearQuarantineRecoveryApproval(key) {
-  await rm(workspaceQuarantineRecoveryPath(key), { recursive: true, force: true });
+async function clearQuarantineRecoveryApproval(quarantineRoot, key) {
+  await rm(workspaceQuarantineRecoveryPath(quarantineRoot, key), { recursive: true, force: true });
 }
 
-export async function markWorkspaceQuarantined(key, details, quarantineId = randomUUID()) {
+export async function markWorkspaceQuarantined(
+  quarantineRoot, key, details, quarantineId = randomUUID(),
+) {
   if (typeof quarantineId !== "string" || !quarantineId) {
     throw new Error("quarantine id is unavailable");
   }
-  await mkdir(WORKSPACE_LOCK_ROOT, { recursive: true, mode: 0o700 });
-  const quarantinePath = workspaceQuarantinePath(key);
+  const rootMetadata = await lstat(quarantineRoot);
+  if (!rootMetadata.isDirectory() || rootMetadata.isSymbolicLink()) {
+    throw new Error("workspace quarantine root is not a trusted lock-store directory");
+  }
+  const quarantinePath = workspaceQuarantinePath(quarantineRoot, key);
+  const markerDirectoryMode = process.platform === "win32"
+    ? 0o700
+    : rootMetadata.mode & 0o2777;
+  const markerFileMode = process.platform === "win32"
+    ? 0o600
+    : rootMetadata.mode & 0o666;
   const token = process.pid + "-" + randomUUID();
   const temporaryPath = quarantinePath + ".owner-" + token;
   const record = {
@@ -1779,10 +1873,14 @@ export async function markWorkspaceQuarantined(key, details, quarantineId = rand
     processIdentity: await cachedProcessStartIdentity(process.pid),
     quarantinedAt: new Date().toISOString(),
   };
-  await mkdir(temporaryPath, { mode: 0o700 });
+  await mkdir(temporaryPath, { mode: markerDirectoryMode });
+  if (process.platform !== "win32") await chmod(temporaryPath, markerDirectoryMode);
   await writeFile(path.join(temporaryPath, QUARANTINE_RECORD_FILE), JSON.stringify(record), {
-    flag: "wx", mode: 0o600,
+    flag: "wx", mode: markerFileMode,
   });
+  if (process.platform !== "win32") {
+    await chmod(path.join(temporaryPath, QUARANTINE_RECORD_FILE), markerFileMode);
+  }
   let preserveTemporary = false;
   let published = false;
   try {
@@ -1812,7 +1910,7 @@ export async function markWorkspaceQuarantined(key, details, quarantineId = rand
   } finally {
     if (!preserveTemporary) await rm(temporaryPath, { recursive: true, force: true });
   }
-  return { quarantinePath, quarantineId, details: record };
+  return { quarantinePath: await realpath(quarantinePath), quarantineId, details: record };
 }
 
 let linuxBootIdPromise = null;
@@ -1880,7 +1978,8 @@ async function serverProcessStartIdentity() {
 const workspaceLocks = new Map();
 const quarantinedWorkspaces = new Set();
 async function quarantineLeaseForProcessTree({
-  lockKey, workspaceLease, backend, workspacePath, worktreeRoot, terminationError,
+  quarantineRoot, lockKey, workspaceLease, backend, workspacePath, worktreeRoot,
+  terminationError,
 }) {
   quarantinedWorkspaces.add(lockKey);
   workspaceLease.retain();
@@ -1889,7 +1988,9 @@ async function quarantineLeaseForProcessTree({
   const details = {
     backend, workspacePath, worktreeRoot, lockRef: workspaceLease.ref, terminationError,
   };
-  const quarantine = await markWorkspaceQuarantined(lockKey, details, quarantineId);
+  const quarantine = await markWorkspaceQuarantined(
+    quarantineRoot, lockKey, details, quarantineId,
+  );
   await workspaceLease.markWorkerQuarantined(quarantine.quarantineId);
   quarantinedWorkspaces.delete(lockKey);
   return { quarantinePath: quarantine.quarantinePath, details: quarantine.details };
@@ -2100,6 +2201,10 @@ function quarantinedWorkspaceStatus(id, { workspacePath = "", worktreeRoot = "" 
 }
 
 async function delegateTask(rawArgs, cancel) {
+  const timeoutMs = Number.isInteger(rawArgs?.timeoutMs)
+    ? Math.min(MAX_TIMEOUT_MS, Math.max(MIN_TIMEOUT_MS, rawArgs.timeoutMs))
+    : DEFAULT_TIMEOUT_MS;
+  const deadline = Date.now() + timeoutMs;
   const backends = await loadBackends();
   if (!rawArgs || typeof rawArgs.backend !== "string" || !rawArgs.backend.trim()) {
     throw new Error("backend must be a non-empty string");
@@ -2133,7 +2238,24 @@ async function delegateTask(rawArgs, cancel) {
       experimental: Boolean(spec.experimental),
     };
   }
-  const backendCommand = await resolvePathCommand(spec.command);
+  let backendCommand;
+  try {
+    backendCommand = await resolveBackendCommand(spec.command, { cancel, deadline });
+  } catch (error) {
+    if (error instanceof OperationCancelledError) {
+      return cancelledDelegation({ backend, workspacePath: "", worktreeRoot: "", spec });
+    }
+    if (error instanceof DeadlineExceededError) {
+      return lockDeadlineDelegation({
+        backend,
+        workspacePath: "",
+        worktreeRoot: "",
+        spec,
+        error: "delegation timed out while resolving the backend command; the worker never started",
+      });
+    }
+    throw error;
+  }
   if (!backendCommand) {
     return {
       ok: false,
@@ -2154,14 +2276,11 @@ async function delegateTask(rawArgs, cancel) {
       experimental: Boolean(spec.experimental),
     };
   }
-  const timeoutMs = Number.isInteger(rawArgs.timeoutMs)
-    ? Math.min(MAX_TIMEOUT_MS, Math.max(MIN_TIMEOUT_MS, rawArgs.timeoutMs))
-    : DEFAULT_TIMEOUT_MS;
-  const deadline = Date.now() + timeoutMs;
   let workspacePath = "";
   let worktreeRoot = "";
   let gitCommonDir = "";
   let lockStoreRoot = "";
+  let quarantineRoot = "";
   let repositoryAccess = null;
   try {
     if (cancel?.cancelled) {
@@ -2175,6 +2294,7 @@ async function delegateTask(rawArgs, cancel) {
     repositoryAccess = await openRepositoryAccess(gitCommonDir, { cancel, deadline });
     const lockStore = await ensureWorkspaceLockStore(repositoryAccess.commonDir, { cancel, deadline });
     lockStoreRoot = lockStore.root;
+    quarantineRoot = lockStore.quarantineRoot;
     repositoryAccess.key = repositoryLockKey(gitCommonDir, lockStore.repositoryId);
   } catch (error) {
     await repositoryAccess?.close().catch(() => {});
@@ -2194,13 +2314,13 @@ async function delegateTask(rawArgs, cancel) {
   }
   const lockKey = repositoryAccess.key;
   try {
-    const existingQuarantine = await readWorkspaceQuarantine(lockKey);
+    const existingQuarantine = await readWorkspaceQuarantine(quarantineRoot, lockKey);
     if (quarantinedWorkspaces.has(lockKey) || existingQuarantine) {
       return quarantinedDelegation({ backend, workspacePath, worktreeRoot, spec }, existingQuarantine);
     }
     let observedQuarantine = null;
     return await withWorkspaceLock(lockKey, lockStoreRoot, async (workspaceLease) => {
-    const sharedQuarantine = await readWorkspaceQuarantine(lockKey);
+    const sharedQuarantine = await readWorkspaceQuarantine(quarantineRoot, lockKey);
     if (quarantinedWorkspaces.has(lockKey) || sharedQuarantine) {
       return quarantinedDelegation({ backend, workspacePath, worktreeRoot, spec }, sharedQuarantine);
     }
@@ -2210,6 +2330,7 @@ async function delegateTask(rawArgs, cancel) {
     let gitProcessQuarantine = null;
     const quarantineGitProcessTree = async ({ label, terminationError }) => {
       gitProcessQuarantine ??= await quarantineLeaseForProcessTree({
+        quarantineRoot,
         lockKey,
         workspaceLease,
         backend: label,
@@ -2406,7 +2527,7 @@ async function delegateTask(rawArgs, cancel) {
         // The pending CAS above makes a crash during marker publication
         // unreclaimable. Only a complete, atomically published record advances
         // the lease to the operator-recoverable quarantined state.
-        const quarantine = await markWorkspaceQuarantined(lockKey, {
+        const quarantine = await markWorkspaceQuarantined(quarantineRoot, lockKey, {
           backend,
           workspacePath,
           worktreeRoot,
@@ -2538,10 +2659,12 @@ async function delegateTask(rawArgs, cancel) {
       deadline,
       onCancelled: () => cancelledDelegation({ backend, workspacePath, worktreeRoot, spec }),
       onDeadline: () => lockDeadlineDelegation({ backend, workspacePath, worktreeRoot, spec }),
-      operatorRecoveryApproved: (owner) => quarantineRecoveryApproved(lockKey, owner),
-      onAcquired: () => clearQuarantineRecoveryApproval(lockKey),
+      operatorRecoveryApproved: (owner) => quarantineRecoveryApproved(
+        quarantineRoot, lockKey, owner,
+      ),
+      onAcquired: () => clearQuarantineRecoveryApproval(quarantineRoot, lockKey),
       isUnavailable: async () => {
-        observedQuarantine = await readWorkspaceQuarantine(lockKey);
+        observedQuarantine = await readWorkspaceQuarantine(quarantineRoot, lockKey);
         return quarantinedWorkspaces.has(lockKey) || Boolean(observedQuarantine);
       },
       onUnavailable: () => quarantinedDelegation(
@@ -2730,6 +2853,7 @@ async function handleMessage(message) {
           let worktreeRoot = "";
           let gitCommonDir = "";
           let lockStoreRoot = "";
+          let quarantineRoot = "";
           let repositoryAccess = null;
           try {
             workspacePath = await validateWorkspace(args.workspacePath, { cancel });
@@ -2742,6 +2866,7 @@ async function handleMessage(message) {
               repositoryAccess = await openRepositoryAccess(gitCommonDir, { cancel });
               const lockStore = await ensureWorkspaceLockStore(repositoryAccess.commonDir, { cancel });
               lockStoreRoot = lockStore.root;
+              quarantineRoot = lockStore.quarantineRoot;
               repositoryAccess.key = repositoryLockKey(gitCommonDir, lockStore.repositoryId);
             } catch (error) {
               if (error instanceof OperationCancelledError) {
@@ -2751,7 +2876,7 @@ async function handleMessage(message) {
             }
             if (cancel.cancelled) return cancelledWorkspaceStatus(message.id, { workspacePath, worktreeRoot });
             const lockKey = repositoryAccess.key;
-            const existingQuarantine = await readWorkspaceQuarantine(lockKey);
+            const existingQuarantine = await readWorkspaceQuarantine(quarantineRoot, lockKey);
             if (quarantinedWorkspaces.has(lockKey) || existingQuarantine) {
               return quarantinedWorkspaceStatus(
                 message.id, { workspacePath, worktreeRoot }, existingQuarantine,
@@ -2759,7 +2884,7 @@ async function handleMessage(message) {
             }
             let observedQuarantine = null;
             return await withWorkspaceLock(lockKey, lockStoreRoot, async (workspaceLease) => {
-              const sharedQuarantine = await readWorkspaceQuarantine(lockKey);
+              const sharedQuarantine = await readWorkspaceQuarantine(quarantineRoot, lockKey);
               if (quarantinedWorkspaces.has(lockKey) || sharedQuarantine) {
                 return quarantinedWorkspaceStatus(
                   message.id, { workspacePath, worktreeRoot }, sharedQuarantine,
@@ -2768,6 +2893,7 @@ async function handleMessage(message) {
               let gitProcessQuarantine = null;
               const quarantineGitProcessTree = async ({ label, terminationError }) => {
                 gitProcessQuarantine ??= await quarantineLeaseForProcessTree({
+                  quarantineRoot,
                   lockKey,
                   workspaceLease,
                   backend: label,
@@ -2803,10 +2929,12 @@ async function handleMessage(message) {
             }, {
               cancel,
               onCancelled: () => cancelledWorkspaceStatus(message.id, { workspacePath, worktreeRoot }),
-              operatorRecoveryApproved: (owner) => quarantineRecoveryApproved(lockKey, owner),
-              onAcquired: () => clearQuarantineRecoveryApproval(lockKey),
+              operatorRecoveryApproved: (owner) => quarantineRecoveryApproved(
+                quarantineRoot, lockKey, owner,
+              ),
+              onAcquired: () => clearQuarantineRecoveryApproval(quarantineRoot, lockKey),
               isUnavailable: async () => {
-                observedQuarantine = await readWorkspaceQuarantine(lockKey);
+                observedQuarantine = await readWorkspaceQuarantine(quarantineRoot, lockKey);
                 return quarantinedWorkspaces.has(lockKey) || Boolean(observedQuarantine);
               },
               onUnavailable: () => quarantinedWorkspaceStatus(

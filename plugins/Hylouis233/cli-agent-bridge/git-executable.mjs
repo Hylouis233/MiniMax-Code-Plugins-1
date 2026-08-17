@@ -1,9 +1,9 @@
 import { constants } from "node:fs";
-import { access, realpath, stat } from "node:fs/promises";
+import { access, appendFile, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 
 let executablePromise = null;
-const pathCommandPromises = new Map();
+const pathCommandEntries = new Map();
 
 async function resolveGitExecutable() {
   const names = process.platform === "win32" ? ["git.exe", "git.com"] : ["git"];
@@ -25,6 +25,16 @@ async function resolveGitExecutable() {
 }
 
 async function resolvePathCommandUncached(command) {
+  if (process.env.NODE_ENV === "test") {
+    const delayMs = Number(process.env.CLI_AGENT_BRIDGE_TEST_COMMAND_RESOLUTION_DELAY_MS ?? 0);
+    if (Number.isFinite(delayMs) && delayMs > 0) {
+      const startedFile = process.env.CLI_AGENT_BRIDGE_TEST_COMMAND_RESOLUTION_STARTED_FILE;
+      if (typeof startedFile === "string" && path.isAbsolute(startedFile)) {
+        await appendFile(startedFile, "started\n");
+      }
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
   if (path.isAbsolute(command)) {
     try {
       await access(command, process.platform === "win32" ? constants.F_OK : constants.X_OK);
@@ -51,24 +61,56 @@ async function resolvePathCommandUncached(command) {
   return null;
 }
 
-export function resolvePathCommand(command) {
-  if (typeof command !== "string" || !command) return Promise.resolve(null);
-  if (!pathCommandPromises.has(command)) {
-    const resolution = resolvePathCommandUncached(command);
-    pathCommandPromises.set(command, resolution);
-    // Share an in-flight lookup and retain positive results, but do not make a
-    // missing/not-yet-installed CLI permanent for the lifetime of the server.
-    // The identity guard prevents an older completion from deleting a newer
-    // retry that has already occupied the same cache slot.
-    void resolution.then((resolved) => {
-      if (resolved === null && pathCommandPromises.get(command) === resolution) {
-        pathCommandPromises.delete(command);
+function pathCommandEntry(command) {
+  if (typeof command !== "string" || !command) {
+    return { promise: Promise.resolve(null), settled: true, value: null, error: null };
+  }
+  if (!pathCommandEntries.has(command)) {
+    const entry = {
+      promise: resolvePathCommandUncached(command),
+      settled: false,
+      value: null,
+      error: null,
+      waiters: new Set(),
+    };
+    pathCommandEntries.set(command, entry);
+    // The core lookup has exactly one settlement reaction. Request-scoped
+    // waiters subscribe below and can be removed on cancel/deadline, so a
+    // permanently stalled filesystem lookup cannot retain one closure per
+    // abandoned request.
+    void entry.promise.then((resolved) => {
+      entry.settled = true;
+      entry.value = resolved;
+      for (const waiter of entry.waiters) waiter.resolve(resolved);
+      entry.waiters.clear();
+      // Retain positive results, but retry a missing/not-yet-installed CLI.
+      if (resolved === null && pathCommandEntries.get(command) === entry) {
+        pathCommandEntries.delete(command);
       }
-    }, () => {
-      if (pathCommandPromises.get(command) === resolution) pathCommandPromises.delete(command);
+    }, (error) => {
+      entry.settled = true;
+      entry.error = error;
+      for (const waiter of entry.waiters) waiter.reject(error);
+      entry.waiters.clear();
+      if (pathCommandEntries.get(command) === entry) pathCommandEntries.delete(command);
     });
   }
-  return pathCommandPromises.get(command);
+  return pathCommandEntries.get(command);
+}
+
+export function resolvePathCommand(command) {
+  return pathCommandEntry(command).promise;
+}
+
+export function subscribePathCommand(command, resolve, reject) {
+  const entry = pathCommandEntry(command);
+  if (entry.settled) {
+    queueMicrotask(() => entry.error ? reject(entry.error) : resolve(entry.value));
+    return () => {};
+  }
+  const waiter = { resolve, reject };
+  entry.waiters.add(waiter);
+  return () => { entry.waiters.delete(waiter); };
 }
 
 export function trustedGitExecutable() {

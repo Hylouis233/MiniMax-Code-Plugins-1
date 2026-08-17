@@ -184,9 +184,12 @@ you already obtained a valid ID from that backend outside this Plugin.
   and `git --git-dir=<lock-store> cat-file blob <object-id>`. The JSON owner record contains the
   server/worker state and PIDs. Only after checking those processes and escaped descendants are
   gone, clear the listed ref with `git --git-dir=<lock-store> update-ref -d <lock-ref>`. The
-  quarantine marker itself lives in a current-user-scoped OS temporary directory. New markers are
-  atomically claimed directories (legacy marker files remain readable), so publication does not
-  depend on hard-link support and the reported path is renamed the same way during recovery.
+  quarantine marker itself lives under the repository's private
+  `cli-agent-bridge-lock-store.git/cli-agent-bridge-quarantines` directory. This makes repository
+  access, rather than a predictable shared temporary path, the collaboration boundary for manual
+  recovery (including repositories shared deliberately by multiple users). New markers are
+  atomically claimed directories, so publication does not depend on hard-link support and the
+  reported path is renamed the same way during recovery.
   On Linux, zombie-only tracked trees count as terminated; zombies cannot edit the workspace and
   may otherwise persist when container PID 1 does not reap them.
 - Cancelling a workspace_status request interrupts its queued lock wait or Git snapshot and returns

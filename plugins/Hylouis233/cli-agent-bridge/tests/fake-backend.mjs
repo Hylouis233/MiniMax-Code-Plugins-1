@@ -38,6 +38,17 @@ if (spec.branchRoundTrip) {
 } else if (spec.commitCurrent) {
   // Commit on the currently checked-out branch: HEAD and its branch ref move together.
   event("start");
+  if (spec.environmentFile) {
+    writeFileSync(spec.environmentFile, JSON.stringify({
+      GIT_DIR: process.env.GIT_DIR ?? null,
+      GIT_WORK_TREE: process.env.GIT_WORK_TREE ?? null,
+      GIT_INDEX_FILE: process.env.GIT_INDEX_FILE ?? null,
+      GIT_CEILING_DIRECTORIES: process.env.GIT_CEILING_DIRECTORIES ?? null,
+      GIT_NO_REPLACE_OBJECTS: process.env.GIT_NO_REPLACE_OBJECTS ?? null,
+      GIT_SSH_COMMAND: process.env.GIT_SSH_COMMAND ?? null,
+      GH_TOKEN: process.env.GH_TOKEN ?? null,
+    }));
+  }
   writeFileSync(path.resolve(process.cwd(), spec.writeFile ?? "current.txt"), spec.contents ?? "current\n");
   execFileSync("git", ["add", spec.writeFile ?? "current.txt"]);
   execFileSync("git", ["commit", "-m", spec.commitMessage ?? "worker commit on current branch"]);

@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
 import {
   localHostIdentity, WORKSPACE_LOCK_REF_PREFIX, workspaceLockRef,
 } from "../workspace-lock.mjs";
-import { resolvePathCommand, safeGitInvocation } from "../git-executable.mjs";
+import { resolvePathCommand, safeGitInvocation, subscribePathCommand } from "../git-executable.mjs";
 import {
   backendGitProvenanceEnvironment, closestExistingBase, committedDelta, markWorkspaceQuarantined,
   populateCommitishCache, readBackendGitProvenance, runCommand, runGitCommand,
@@ -41,6 +41,38 @@ test("failed backend command resolutions are retried after installation", async 
   await copyFile(process.execPath, executable);
   if (process.platform !== "win32") await chmod(executable, 0o755);
   assert.equal(await resolvePathCommand(command), await realpath(executable));
+});
+
+test("abandoned command-resolution waiters detach from the shared lookup", async (context) => {
+  const binRoot = await mkdtemp(path.join(os.tmpdir(), "cli-agent-resolution-waiter-test-"));
+  context.after(() => rm(binRoot, { recursive: true, force: true }));
+  const originalPath = process.env.PATH;
+  const originalNodeEnv = process.env.NODE_ENV;
+  const originalDelay = process.env.CLI_AGENT_BRIDGE_TEST_COMMAND_RESOLUTION_DELAY_MS;
+  process.env.PATH = binRoot + path.delimiter + (originalPath ?? "");
+  process.env.NODE_ENV = "test";
+  process.env.CLI_AGENT_BRIDGE_TEST_COMMAND_RESOLUTION_DELAY_MS = "100";
+  context.after(() => {
+    process.env.PATH = originalPath;
+    if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = originalNodeEnv;
+    if (originalDelay === undefined) delete process.env.CLI_AGENT_BRIDGE_TEST_COMMAND_RESOLUTION_DELAY_MS;
+    else process.env.CLI_AGENT_BRIDGE_TEST_COMMAND_RESOLUTION_DELAY_MS = originalDelay;
+  });
+  const command = "detachable-backend-" + String(process.pid) + "-" + String(Date.now());
+  const executable = path.join(binRoot, command + (process.platform === "win32" ? ".exe" : ""));
+  await copyFile(process.execPath, executable);
+  if (process.platform !== "win32") await chmod(executable, 0o755);
+  let callbacks = 0;
+  const unsubscribe = subscribePathCommand(
+    command,
+    () => { callbacks += 1; },
+    () => { callbacks += 1; },
+  );
+  unsubscribe();
+  assert.equal(await resolvePathCommand(command), await realpath(executable));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(callbacks, 0, "a cancelled/deadline waiter must not be retained until core lookup settles");
 });
 
 test("safe Git invocations use an unpopulatable hook sink and ignore inherited repositories", async (context) => {
@@ -104,6 +136,56 @@ test("safe Git invocations use an unpopulatable hook sink and ignore inherited r
     await realpath(path.resolve(workspace, backendDiscovery.stdout.trim())),
     await realpath(path.join(workspace, ".git")),
   );
+});
+
+test("delegated workers ignore inherited Git routing while preserving authentication", async (context) => {
+  const unrelatedRoot = await mkdtemp(path.join(os.tmpdir(), "cli-agent-worker-routing-test-"));
+  const unrelated = path.join(unrelatedRoot, "unrelated");
+  await mkdir(unrelated);
+  await initializeFixtureRepository(unrelated);
+  context.after(() => rm(unrelatedRoot, { recursive: true, force: true }));
+  const { stdout: unrelatedHeadText } = await execFileAsync(
+    "git", ["rev-parse", "HEAD"], { cwd: unrelated },
+  );
+  const authentication = {
+    GIT_SSH_COMMAND: "ssh -F preserved-fixture-config",
+    GH_TOKEN: "preserved-fixture-token",
+  };
+  const { tempRoot, workspace, client } = await makeHarness(context, {
+    extraEnv: {
+      GIT_DIR: path.join(unrelated, ".git"),
+      GIT_WORK_TREE: unrelated,
+      GIT_INDEX_FILE: path.join(unrelated, ".git", "index"),
+      GIT_CEILING_DIRECTORIES: unrelatedRoot,
+    GIT_NO_REPLACE_OBJECTS: null,
+      ...authentication,
+    },
+  });
+  const environmentFile = path.join(tempRoot, "delegated-environment.json");
+  const response = await client.request("tools/call", taskArguments(workspace, {
+    name: "sanitized-worker-routing",
+    commitCurrent: true,
+    writeFile: "target-worker.txt",
+    commitMessage: "commit in requested workspace",
+    environmentFile,
+  }));
+  const out = response.result.structuredContent;
+  assert.equal(out.ok, true, JSON.stringify(out));
+  assert.match(out.commits.log, /commit in requested workspace/u);
+  await access(path.join(workspace, "target-worker.txt"));
+  await assert.rejects(access(path.join(unrelated, "target-worker.txt")), /ENOENT/u);
+  const { stdout: unrelatedAfter } = await execFileAsync("git", ["rev-parse", "HEAD"], {
+    cwd: unrelated,
+  });
+  assert.equal(unrelatedAfter.trim(), unrelatedHeadText.trim());
+  assert.deepEqual(JSON.parse(await readFile(environmentFile, "utf8")), {
+    GIT_DIR: null,
+    GIT_WORK_TREE: null,
+    GIT_INDEX_FILE: null,
+    GIT_CEILING_DIRECTORIES: null,
+    GIT_NO_REPLACE_OBJECTS: null,
+    ...authentication,
+  });
 });
 
 function unconfirmedGitResult(overrides = {}) {
@@ -757,15 +839,6 @@ test("cancellation in the spawn-to-controller window never launches the backend"
   await assert.rejects(access(marker), /ENOENT/u);
 });
 
-function currentUserLockRoot() {
-  const user = os.userInfo();
-  const identity = Number.isInteger(user.uid) && user.uid >= 0
-    ? process.platform + ":uid:" + String(user.uid)
-    : process.platform + ":" + user.username + ":" + user.homedir;
-  const scope = createHash("sha256").update(identity).digest("hex").slice(0, 20);
-  return path.join(os.tmpdir(), "minimax-cli-agent-bridge-locks-" + scope);
-}
-
 async function canonicalGitCommonDirectory(workspace) {
   const { stdout } = await execFileAsync("git", ["rev-parse", "--git-common-dir"], { cwd: workspace });
   return await realpath(path.resolve(workspace, stdout.replace(/\r?\n$/u, "")));
@@ -798,7 +871,9 @@ async function repositoryKey(canonicalGitCommonDir) {
 async function repositoryStatePaths(canonicalGitCommonDir) {
   const key = await repositoryKey(canonicalGitCommonDir);
   const digest = createHash("sha256").update(key).digest("hex");
-  const root = currentUserLockRoot();
+  const root = path.join(
+    canonicalGitCommonDir, "cli-agent-bridge-lock-store.git", "cli-agent-bridge-quarantines",
+  );
   return {
     root,
     quarantinePath: path.join(root, digest + ".quarantine"),
@@ -882,7 +957,7 @@ function execServer(configPath, extraEnv = {}) {
   });
 }
 
-async function makeHarness(context, { unborn = false } = {}) {
+async function makeHarness(context, { unborn = false, extraEnv = {} } = {}) {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), "cli-agent-bridge-test-"));
   const workspace = path.join(tempRoot, "workspace");
   await mkdir(workspace);
@@ -899,7 +974,7 @@ async function makeHarness(context, { unborn = false } = {}) {
       },
     },
   }));
-  const client = new McpClient(configPath);
+  const client = new McpClient(configPath, extraEnv);
   await client.initialize();
   context.after(async () => {
     await client.close();
@@ -1112,6 +1187,30 @@ test("the private lock store inherits the repository sharing mode", async (conte
     ))).mode & 0o777;
     assert.equal(legacyIdentityMode & 0o060, 0o060,
       "rolling-upgrade readers in the repository group must be able to read the identity anchor");
+    const quarantineRoot = path.join(lockStore, "cli-agent-bridge-quarantines");
+    const quarantineRootMode = (await stat(quarantineRoot)).mode & 0o2777;
+    const quarantineMode = quarantineRootMode & 0o777;
+    assert.equal(quarantineMode & 0o070, 0o070,
+      "the repository group must be able to publish and recover quarantine records");
+    assert.equal(quarantineRootMode & 0o2000, 0o2000,
+      "shared quarantine records must inherit the repository group");
+    assert.deepEqual(
+      (await readdir(lockStore)).filter((name) => name.startsWith(".cli-agent-bridge-quarantines-")),
+      [],
+      "atomic root publication must not leave a candidate directory behind",
+    );
+    const quarantine = await markWorkspaceQuarantined(
+      quarantineRoot, "shared-quarantine-mode", { terminationError: "fixture" },
+    );
+    context.after(() => rm(quarantine.quarantinePath, { recursive: true, force: true }));
+    const markerMode = (await stat(quarantine.quarantinePath)).mode & 0o2777;
+    const recordMode = (await stat(path.join(
+      quarantine.quarantinePath, "record.json",
+    ))).mode & 0o777;
+    assert.equal(markerMode & 0o2070, 0o2070,
+      "other repository-group users must be able to traverse and rename the marker");
+    assert.equal(recordMode & 0o060, 0o060,
+      "other repository-group users must be able to read the incident-bound recovery id");
   }
 });
 
@@ -1342,7 +1441,7 @@ test("Git snapshot clean filters remain process-contained", {
   if (!out.ok) {
     assert.match(out.error, /repository helper process tree could not be confirmed/iu);
     assert.ok(out.quarantinePath, JSON.stringify(out));
-    context.after(() => unlink(out.quarantinePath).catch(() => {}));
+    context.after(() => rm(out.quarantinePath, { recursive: true, force: true }));
   }
   assert.equal(await readFile(ready, "utf8"), "invoked",
     "the fixture must prove that Git executed the configured clean filter");
@@ -1719,9 +1818,75 @@ test("a quarantine marker blocks delegations in every server process", async (co
   }
 });
 
+test("quarantine state ignores attacker-precreated temporary roots", async (context) => {
+  const attackerTemp = await mkdtemp(path.join(os.tmpdir(), "cli-agent-attacker-temp-"));
+  context.after(() => rm(attackerTemp, { recursive: true, force: true }));
+  const user = os.userInfo();
+  const identity = Number.isInteger(user.uid) && user.uid >= 0
+    ? process.platform + ":uid:" + String(user.uid)
+    : process.platform + ":" + user.username + ":" + user.homedir;
+  const legacyRoot = path.join(
+    attackerTemp,
+    "minimax-cli-agent-bridge-locks-" +
+      createHash("sha256").update(identity).digest("hex").slice(0, 20),
+  );
+  await mkdir(legacyRoot, { mode: 0o777 });
+  if (process.platform !== "win32") await chmod(legacyRoot, 0o777);
+  const tempEnvironment = process.platform === "win32"
+    ? { TEMP: attackerTemp, TMP: attackerTemp }
+    : { TMPDIR: attackerTemp };
+  const { workspace, client } = await makeHarness(context, { extraEnv: tempEnvironment });
+  const initialized = await client.request("tools/call", {
+    name: "workspace_status", arguments: { workspacePath: workspace },
+  });
+  assert.equal(initialized.result.structuredContent.ok, true, JSON.stringify(initialized));
+  const commonDir = await canonicalGitCommonDirectory(workspace);
+  const key = await repositoryKey(commonDir);
+  const digest = createHash("sha256").update(key).digest("hex");
+  const forgedPath = path.join(legacyRoot, digest + ".quarantine");
+  await writeFile(forgedPath, JSON.stringify({ terminationError: "attacker-controlled marker" }));
+
+  const response = await client.request("tools/call", {
+    name: "workspace_status", arguments: { workspacePath: workspace },
+  });
+  assert.equal(response.result.structuredContent.ok, true, JSON.stringify(response));
+  const state = await repositoryStatePaths(commonDir);
+  assert.equal(
+    state.root,
+    path.join(commonDir, "cli-agent-bridge-lock-store.git", "cli-agent-bridge-quarantines"),
+  );
+  assert.notEqual(path.dirname(state.quarantinePath), legacyRoot);
+});
+
+test("a substituted quarantine-root link is rejected before marker state is trusted", async (context) => {
+  const { tempRoot, workspace, client } = await makeHarness(context);
+  const initialized = await client.request("tools/call", {
+    name: "workspace_status", arguments: { workspacePath: workspace },
+  });
+  assert.equal(initialized.result.structuredContent.ok, true, JSON.stringify(initialized));
+  const state = await repositoryStatePaths(await canonicalGitCommonDirectory(workspace));
+  const attackerDirectory = path.join(tempRoot, "attacker-controlled-quarantine-root");
+  await mkdir(attackerDirectory);
+  await rm(state.root, { recursive: true, force: true });
+  await symlink(
+    attackerDirectory,
+    state.root,
+    process.platform === "win32" ? "junction" : "dir",
+  );
+
+  const response = await client.request("tools/call", {
+    name: "workspace_status", arguments: { workspacePath: workspace },
+  });
+  assert.match(response.error?.message ?? "", /quarantine root must be a real directory/iu,
+    JSON.stringify(response));
+  assert.deepEqual(await readdir(attackerDirectory), []);
+});
+
 test("quarantine publication uses an exclusive directory claim without hard links", async (context) => {
+  const quarantineRoot = await mkdtemp(path.join(os.tmpdir(), "cli-agent-quarantine-store-test-"));
+  context.after(() => rm(quarantineRoot, { recursive: true, force: true }));
   const key = "quarantine-directory-publication:" + String(process.pid) + ":" + String(Date.now());
-  const quarantine = await markWorkspaceQuarantined(key, {
+  const quarantine = await markWorkspaceQuarantined(quarantineRoot, key, {
     backend: "fixture", terminationError: "descendants remain uncertain",
   });
   context.after(() => rm(quarantine.quarantinePath, { recursive: true, force: true }));
@@ -1732,7 +1897,9 @@ test("quarantine publication uses an exclusive directory claim without hard link
   assert.equal(record.quarantineId, quarantine.quarantineId);
   assert.equal(record.terminationError, "descendants remain uncertain");
   await assert.rejects(
-    markWorkspaceQuarantined(key, { terminationError: "must not replace the first incident" }),
+    markWorkspaceQuarantined(
+      quarantineRoot, key, { terminationError: "must not replace the first incident" },
+    ),
     /quarantine marker already exists/iu,
   );
 });
@@ -1882,6 +2049,44 @@ test("cancellation interrupts workspace filesystem canonicalization", async (con
     "filesystem validation must not pin the request after cancellation");
   assert.equal(response.result.structuredContent.cancelled, true);
   await assert.rejects(access(path.join(workspace, "canonicalization-bypass.txt")), /ENOENT/u);
+});
+
+test("backend command resolution obeys cancellation and the absolute request deadline", async (context) => {
+  const resolutionRoot = await mkdtemp(path.join(os.tmpdir(), "cli-agent-resolution-deadline-test-"));
+  const resolutionStartedFile = path.join(resolutionRoot, "started.txt");
+  context.after(() => rm(resolutionRoot, { recursive: true, force: true }));
+  const { tempRoot, workspace, client } = await makeHarness(context, {
+    extraEnv: {
+      NODE_ENV: "test",
+      CLI_AGENT_BRIDGE_TEST_COMMAND_RESOLUTION_DELAY_MS: "60000",
+      CLI_AGENT_BRIDGE_TEST_COMMAND_RESOLUTION_STARTED_FILE: resolutionStartedFile,
+    },
+  });
+  const eventFile = path.join(tempRoot, "resolution-must-not-start.jsonl");
+  const cancelledRequest = client.request("tools/call", taskArguments(workspace, {
+    name: "cancelled-during-resolution", eventFile,
+  }, { timeoutMs: 20_000 }), 612);
+  await waitFor(() => access(resolutionStartedFile).then(() => true, () => false));
+  const cancelledAt = Date.now();
+  client.notify("notifications/cancelled", { requestId: 612 });
+  const cancelled = await cancelledRequest;
+  assert.ok(Date.now() - cancelledAt < 1_500,
+    "command resolution must stop pinning a cancelled request promptly");
+  assert.equal(cancelled.result.structuredContent.cancelled, true, JSON.stringify(cancelled));
+
+  const deadlineStarted = Date.now();
+  const timedOut = await client.request("tools/call", taskArguments(workspace, {
+    name: "timed-out-during-resolution", eventFile,
+  }, { timeoutMs: 5_000 }), 613);
+  const elapsed = Date.now() - deadlineStarted;
+  assert.ok(elapsed >= 4_500 && elapsed < 8_000,
+    "command resolution must use the request's existing absolute deadline");
+  assert.equal(timedOut.result.structuredContent.timedOut, true, JSON.stringify(timedOut));
+  assert.equal(timedOut.result.structuredContent.treeTerminated, true);
+  assert.match(timedOut.result.structuredContent.error, /resolving the backend command/iu);
+  assert.equal((await readFile(resolutionStartedFile, "utf8")).trim().split(/\r?\n/u).length, 1,
+    "cancelled and timed-out callers must share the same underlying filesystem lookup");
+  assert.equal((await events(eventFile)).length, 0, "the backend must never be launched");
 });
 
 test("cancellation terminates descendants before returning", async (context) => {
@@ -2300,6 +2505,32 @@ test("a worker ref pointing at a non-commit object is reported without failing t
   assert.ok(out.commits.refsChanged.some((item) => item.ref === "refs/tags/blobtag" && item.after),
     JSON.stringify(out.commits.refsChanged));
   assert.match(out.commits.log, /non-commit object/u);
+});
+
+test("a worker commit reachable only through a new tag remains attributed", async (context) => {
+  const { workspace, client } = await makeHarness(context);
+  const refName = "refs/tags/tag-only-worker-commit";
+  const temporaryBranch = "temporary-tag-only-worker-commit";
+  const response = await client.request("tools/call", taskArguments(workspace, {
+    name: "tag-only-worker-commit",
+    moveBlobRefToCommit: true,
+    refName,
+    branchName: temporaryBranch,
+    writeFile: "tag-only-worker.txt",
+    commitMessage: "worker commit retained only by tag",
+  }));
+  const out = response.result.structuredContent;
+  assert.equal(out.ok, true, JSON.stringify(out));
+  assert.equal(out.gitBefore.head, out.git.head, "the temporary branch must not move final HEAD");
+  assert.deepEqual(out.commits.refsChanged.map((item) => item.ref), [refName]);
+  assert.equal(out.commits.newCommitCount, 1, out.commits.log);
+  assert.equal((out.commits.log.match(/worker commit retained only by tag/gu) ?? []).length, 1);
+  assert.match(out.commits.diffStat, /tag-only-worker\.txt/u);
+  await assert.rejects(
+    execFileAsync("git", ["rev-parse", "--verify", "refs/heads/" + temporaryBranch], {
+      cwd: workspace,
+    }),
+  );
 });
 
 test("target refs resembling coordination refs remain visible to attribution", async (context) => {
@@ -2799,7 +3030,7 @@ test("workspace lock metadata is absent from mirrored repository refs", async (c
   if (!out.ok) {
     assert.match(out.error, /process tree could not be confirmed terminated/iu);
     assert.ok(out.quarantinePath, JSON.stringify(out));
-    context.after(() => unlink(out.quarantinePath).catch(() => {}));
+    context.after(() => rm(out.quarantinePath, { recursive: true, force: true }));
   }
   const { stdout: mirroredRefs } = await execFileAsync(
     "git", ["for-each-ref", "--format=%(refname)"], { cwd: mirror },
