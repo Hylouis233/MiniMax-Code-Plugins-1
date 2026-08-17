@@ -62,7 +62,9 @@ inside the target git repository, and their results come back as a git diff for 
   writes a shared quarantine marker that blocks every bridge process. After checking for leftover
   processes, an operator must deliberately rename the reported quarantinePath with the
   `.recovery-approved` suffix. Mere marker absence never authorizes recovery. The workspace may
-  still contain edits made before cancellation, so still review the returned snapshot.
+  still contain edits made before cancellation. After cleanup completes, call `workspace_status`
+  in a fresh request and review that snapshot; the cancelled delegation's `git` field may be null.
+  If quarantine blocks that status request, complete the documented recovery procedure first.
 - Snapshot reliability: a worker's changes to Git refs are compared as well as final HEAD, and a
   truncated Git capture fails closed. If outputTruncated/stderrTruncated is true, treat the returned
   backend tail as partial.

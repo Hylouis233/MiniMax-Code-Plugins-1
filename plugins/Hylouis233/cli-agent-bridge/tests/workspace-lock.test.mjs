@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile, execFileSync } from "node:child_process";
 import { writeFileSync } from "node:fs";
-import { access, chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -392,6 +392,64 @@ test("workspace-lock Git operations disable repository transaction hooks", {
   await assert.rejects(access(ready), /ENOENT/u,
     "coordination refs must never execute repository-controlled transaction hooks");
   await acquisition.lease.release();
+});
+
+test("workspace-lock Git resolution detaches cancelled and expired waiters", async (context) => {
+  const repo = await makeRepo(context);
+  const startedFile = path.join(path.dirname(repo), "git-resolution-started.txt");
+  const moduleUrl = new URL("../workspace-lock.mjs", import.meta.url).href;
+  const source = [
+    `import {tryAcquireGitWorkspaceLock,WorkspaceLockCancelledError,WorkspaceLockDeadlineError} from ${JSON.stringify(moduleUrl)}`,
+    "const listeners=new Set()",
+    "let resolveCancelled",
+    "const cancel={cancelled:false,promise:new Promise(r=>{resolveCancelled=r}),subscribe(fn){listeners.add(fn);return()=>listeners.delete(fn)},cancel(){this.cancelled=true;resolveCancelled();for(const fn of [...listeners])fn()}}",
+    "setTimeout(()=>cancel.cancel(),100)",
+    `const repo=${JSON.stringify(repo)}`,
+    "const outcomes=[]",
+    "try{await tryAcquireGitWorkspaceLock({cwd:repo,key:'cancelled-resolution',cancel,deadline:Date.now()+5000})}catch(error){outcomes.push(error instanceof WorkspaceLockCancelledError?'cancelled':error.name)}",
+    "const passive={cancelled:false,promise:new Promise(()=>{}),subscribe(){return()=>{}}}",
+    "try{await tryAcquireGitWorkspaceLock({cwd:repo,key:'expired-resolution',cancel:passive,deadline:Date.now()+200})}catch(error){outcomes.push(error instanceof WorkspaceLockDeadlineError?'deadline':error.name)}",
+    "process.stdout.write(outcomes.join(','))",
+    "process.exit(outcomes.join(',')==='cancelled,deadline'?0:3)",
+  ].join(";");
+  const { stdout } = await execFileAsync(process.execPath, [
+    "--input-type=module", "-e", source,
+  ], {
+    timeout: 5_000,
+    env: {
+      ...process.env,
+      NODE_ENV: "test",
+      CLI_AGENT_BRIDGE_TEST_GIT_RESOLUTION_DELAY_MS: "60000",
+      CLI_AGENT_BRIDGE_TEST_GIT_RESOLUTION_STARTED_FILE: startedFile,
+    },
+  });
+  assert.equal(stdout, "cancelled,deadline");
+  assert.equal((await readFile(startedFile, "utf8")).trim().split(/\r?\n/u).length, 1,
+    "both abandoned callers must share one underlying Git lookup");
+
+  const gitModuleUrl = new URL("../git-executable.mjs", import.meta.url).href;
+  const spawnMarker = path.join(path.dirname(repo), "workspace-git-spawned.txt");
+  const launchGuardSource = [
+    `import {tryAcquireGitWorkspaceLock,WorkspaceLockDeadlineError} from ${JSON.stringify(moduleUrl)}`,
+    `import {trustedGitExecutable} from ${JSON.stringify(gitModuleUrl)}`,
+    "await trustedGitExecutable()",
+    "process.env.NODE_ENV='test'",
+    "process.env.CLI_AGENT_BRIDGE_TEST_GIT_INVOCATION_DELAY_MS='250'",
+    `process.env.CLI_AGENT_BRIDGE_TEST_WORKSPACE_GIT_SPAWNED_FILE=${JSON.stringify(spawnMarker)}`,
+    `const repo=${JSON.stringify(repo)}`,
+    "const passive={cancelled:false,promise:new Promise(()=>{}),subscribe(){return()=>{}}}",
+    "let outcome='resolved'",
+    "try{await tryAcquireGitWorkspaceLock({cwd:repo,key:'post-builder-deadline',cancel:passive,deadline:Date.now()+100})}catch(error){outcome=error instanceof WorkspaceLockDeadlineError?'deadline':error.name}",
+    "process.stdout.write(outcome)",
+    "process.exit(outcome==='deadline'?0:3)",
+  ].join(";");
+  const launchGuard = await execFileAsync(process.execPath, [
+    "--input-type=module", "-e", launchGuardSource,
+  ], { timeout: 5_000, env: { ...process.env } });
+  assert.equal(launchGuard.stdout, "deadline",
+    "workspace-lock must recheck the absolute deadline immediately before Git launch");
+  await assert.rejects(access(spawnMarker), /ENOENT/u,
+    "workspace-lock must not spawn Git after invocation setup exhausts the deadline");
 });
 
 test("quarantined leases require an explicit token-bound recovery approval", async (context) => {

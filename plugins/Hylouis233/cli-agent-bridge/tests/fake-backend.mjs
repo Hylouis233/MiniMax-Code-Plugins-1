@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { appendFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -117,6 +117,20 @@ if (spec.branchRoundTrip) {
   event("start");
   appendFileSync(process.env.GIT_TRACE2_EVENT, "{malformed-trace2-event\n");
   writeFileSync(path.resolve(process.cwd(), spec.writeFile), "trace fallback worktree change\n");
+  event("end");
+} else if (spec.replaceTraceThenWrite) {
+  event("start");
+  const tracePath = process.env.GIT_TRACE2_EVENT;
+  if (spec.traceRootFile) writeFileSync(spec.traceRootFile, path.dirname(tracePath));
+  unlinkSync(tracePath);
+  writeFileSync(tracePath, "");
+  writeFileSync(path.resolve(process.cwd(), spec.writeFile), "replacement trace worktree change\n");
+  event("end");
+} else if (spec.writeBeforeDelay) {
+  event("start");
+  writeFileSync(path.resolve(process.cwd(), spec.writeFile), spec.contents ?? "written before cancellation\n");
+  event("written");
+  await delay(spec.delayMs ?? 60_000);
   event("end");
 } else if (spec.mirrorPush) {
   event("start");

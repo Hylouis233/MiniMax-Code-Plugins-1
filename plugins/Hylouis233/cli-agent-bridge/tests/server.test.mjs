@@ -1,20 +1,24 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { access, chmod, copyFile, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
+import { access, chmod, copyFile, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
 import test from "node:test";
 import { promisify } from "node:util";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
   localHostIdentity, WORKSPACE_LOCK_REF_PREFIX, workspaceLockRef,
 } from "../workspace-lock.mjs";
-import { resolvePathCommand, safeGitInvocation, subscribePathCommand } from "../git-executable.mjs";
 import {
-  backendGitProvenanceEnvironment, closestExistingBase, committedDelta, markWorkspaceQuarantined,
+  resolvePathCommand, safeGitInvocation, subscribePathCommand, subscribeTrustedGitExecutable,
+  trustedGitExecutable,
+} from "../git-executable.mjs";
+import {
+  backendEntryFromProbe, backendGitProvenanceEnvironment, closestExistingBase, committedDelta,
+  loadBackends, markWorkspaceQuarantined,
   populateCommitishCache, readBackendGitProvenance, runCommand, runGitCommand,
 } from "../server.mjs";
 
@@ -73,6 +77,66 @@ test("abandoned command-resolution waiters detach from the shared lookup", async
   assert.equal(await resolvePathCommand(command), await realpath(executable));
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(callbacks, 0, "a cancelled/deadline waiter must not be retained until core lookup settles");
+});
+
+test("trusted Git resolution caches success while abandoned waiters stay detached", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "cli-agent-git-entry-test-"));
+  const startedFile = path.join(root, "started.txt");
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const saved = {
+    nodeEnv: process.env.NODE_ENV,
+    delay: process.env.CLI_AGENT_BRIDGE_TEST_GIT_RESOLUTION_DELAY_MS,
+    started: process.env.CLI_AGENT_BRIDGE_TEST_GIT_RESOLUTION_STARTED_FILE,
+  };
+  process.env.NODE_ENV = "test";
+  process.env.CLI_AGENT_BRIDGE_TEST_GIT_RESOLUTION_DELAY_MS = "100";
+  process.env.CLI_AGENT_BRIDGE_TEST_GIT_RESOLUTION_STARTED_FILE = startedFile;
+  context.after(() => {
+    if (saved.nodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = saved.nodeEnv;
+    if (saved.delay === undefined) delete process.env.CLI_AGENT_BRIDGE_TEST_GIT_RESOLUTION_DELAY_MS;
+    else process.env.CLI_AGENT_BRIDGE_TEST_GIT_RESOLUTION_DELAY_MS = saved.delay;
+    if (saved.started === undefined) delete process.env.CLI_AGENT_BRIDGE_TEST_GIT_RESOLUTION_STARTED_FILE;
+    else process.env.CLI_AGENT_BRIDGE_TEST_GIT_RESOLUTION_STARTED_FILE = saved.started;
+  });
+
+  let abandonedCallbacks = 0;
+  const unsubscribePending = subscribeTrustedGitExecutable(
+    () => { abandonedCallbacks += 1; }, () => { abandonedCallbacks += 1; },
+  );
+  unsubscribePending();
+  const first = await trustedGitExecutable();
+  assert.equal(first, await realpath(first));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(abandonedCallbacks, 0);
+  assert.equal((await readFile(startedFile, "utf8")).trim().split(/\r?\n/u).length, 1);
+  assert.equal(await trustedGitExecutable(), first, "the canonical positive result must stay cached");
+  assert.equal((await readFile(startedFile, "utf8")).trim().split(/\r?\n/u).length, 1,
+    "a positive cached result must not restart filesystem resolution");
+
+  const unsubscribeSettled = subscribeTrustedGitExecutable(
+    () => { abandonedCallbacks += 1; }, () => { abandonedCallbacks += 1; },
+  );
+  unsubscribeSettled();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(abandonedCallbacks, 0,
+    "same-tick unsubscribe must suppress an already-settled queued callback");
+});
+
+test("failed trusted Git resolutions are retried", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "cli-agent-git-retry-test-"));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const savedPath = process.env.PATH;
+  process.env.PATH = root;
+  context.after(() => { process.env.PATH = savedPath; });
+  const module = await import(new URL(
+    "../git-executable.mjs?git-retry=" + encodeURIComponent(String(Date.now())), import.meta.url,
+  ));
+  await assert.rejects(module.trustedGitExecutable(), /cannot locate git/iu);
+  const executable = path.join(root, process.platform === "win32" ? "git.exe" : "git");
+  await writeFile(executable, "fixture\n");
+  if (process.platform !== "win32") await chmod(executable, 0o755);
+  assert.equal(await module.trustedGitExecutable(), await realpath(executable));
 });
 
 test("safe Git invocations use an unpopulatable hook sink and ignore inherited repositories", async (context) => {
@@ -225,6 +289,30 @@ test("Git interruption never outruns unconfirmed descendant quarantine", async (
   });
   assert.equal(deadlineResult.treeTerminated, false,
     "the snapshot caller must receive the unsafe cleanup result before the deadline is reported");
+});
+
+test("Git commands do not launch after invocation setup crosses the deadline", async (context) => {
+  const savedNodeEnv = process.env.NODE_ENV;
+  const savedDelay = process.env.CLI_AGENT_BRIDGE_TEST_GIT_INVOCATION_DELAY_MS;
+  await trustedGitExecutable();
+  process.env.NODE_ENV = "test";
+  process.env.CLI_AGENT_BRIDGE_TEST_GIT_INVOCATION_DELAY_MS = "100";
+  context.after(() => {
+    if (savedNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = savedNodeEnv;
+    if (savedDelay === undefined) delete process.env.CLI_AGENT_BRIDGE_TEST_GIT_INVOCATION_DELAY_MS;
+    else process.env.CLI_AGENT_BRIDGE_TEST_GIT_INVOCATION_DELAY_MS = savedDelay;
+  });
+  let runnerCalls = 0;
+  await assert.rejects(runGitCommand(["version"], {
+    cwd: pluginRoot,
+    deadline: Date.now() + 50,
+    commandRunner: async () => {
+      runnerCalls += 1;
+      return unconfirmedGitResult({ treeTerminated: true, terminationError: "" });
+    },
+  }), /deadline/iu);
+  assert.equal(runnerCalls, 0);
 });
 
 test("committed-delta baseline preparation uses bounded batch queries", async () => {
@@ -942,10 +1030,17 @@ class McpClient {
     if (this.child.exitCode !== null) return;
     const exited = new Promise((resolve) => this.child.once("exit", resolve));
     this.child.stdin.end();
-    await Promise.race([
-      exited,
-      new Promise((_, reject) => setTimeout(() => reject(new Error("server did not exit after stdin closed")), 15_000)),
-    ]);
+    let timer = null;
+    try {
+      await Promise.race([
+        exited,
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error("server did not exit after stdin closed")), 15_000);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 }
 
@@ -1022,6 +1117,262 @@ async function waitFor(predicate, timeoutMs = 10_000) {
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
 }
+
+async function makeTraceFixture(context) {
+  const root = await mkdtemp(path.join(os.tmpdir(), "cli-agent-trace-fd-test-"));
+  const tracePath = path.join(root, "git.trace");
+  const handle = await open(tracePath, "wx+", 0o600);
+  const identity = await handle.stat({ bigint: true });
+  let closed = false;
+  context.after(async () => {
+    if (!closed) await handle.close().catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  });
+  return {
+    root,
+    tracePath,
+    handle,
+    identity,
+    async close() {
+      if (closed) return;
+      closed = true;
+      await handle.close();
+    },
+  };
+}
+
+function testCancellation() {
+  const listeners = new Set();
+  return {
+    cancelled: false,
+    subscribe(listener) {
+      listeners.add(listener);
+      return () => { listeners.delete(listener); };
+    },
+    cancel() {
+      if (this.cancelled) return;
+      this.cancelled = true;
+      for (const listener of [...listeners]) listener();
+    },
+  };
+}
+
+test("explicit backend configuration overrides fail closed atomically", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "cli-agent-explicit-config-test-"));
+  const workspace = path.join(root, "workspace");
+  await mkdir(workspace);
+  await initializeFixtureRepository(workspace);
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const cases = [
+    { name: "empty-path", configPath: "" },
+    { name: "missing-file", configPath: path.join(root, "missing.json") },
+    { name: "malformed-json", content: "{" },
+    { name: "missing-backends", content: "{}" },
+    { name: "array-backends", content: JSON.stringify({ backends: [] }) },
+    { name: "empty-backends", content: JSON.stringify({ backends: {} }) },
+    { name: "invalid-entry", content: JSON.stringify({
+      backends: { broken: { command: process.execPath, buildArgs: "<task>" } },
+    }) },
+  ];
+  for (const fixture of cases) {
+    const configPath = fixture.configPath ?? path.join(root, fixture.name + ".json");
+    if (fixture.content !== undefined) await writeFile(configPath, fixture.content);
+    const client = new McpClient(configPath);
+    await client.initialize();
+    try {
+      const listed = await client.request("tools/call", {
+        name: "list_backends", arguments: {},
+      });
+      assert.equal(listed.error?.code, -32603, fixture.name + ": " + JSON.stringify(listed));
+      assert.match(listed.error.message, /explicit backend configuration/iu);
+      const delegated = await client.request("tools/call", {
+        name: "delegate_task",
+        arguments: { backend: "codex", task: "must not start", workspacePath: workspace },
+      });
+      assert.equal(delegated.error?.code, -32603,
+        fixture.name + ": " + JSON.stringify(delegated));
+      assert.match(delegated.error.message, /explicit backend configuration/iu);
+    } finally {
+      await client.close();
+    }
+  }
+});
+
+test("an unset backend override still loads the bundled configuration", async (context) => {
+  const original = process.env.CLI_AGENT_BRIDGE_BACKENDS;
+  delete process.env.CLI_AGENT_BRIDGE_BACKENDS;
+  context.after(() => {
+    if (original === undefined) delete process.env.CLI_AGENT_BRIDGE_BACKENDS;
+    else process.env.CLI_AGENT_BRIDGE_BACKENDS = original;
+  });
+  const backends = await loadBackends();
+  assert.ok(backends.codex);
+  assert.deepEqual(backends.codex.buildArgs, ["exec", "--", "<task>"]);
+});
+
+test("explicit invalid delegation timeouts are rejected before side effects", async (context) => {
+  const { tempRoot, workspace, client } = await makeHarness(context);
+  const eventFile = path.join(tempRoot, "invalid-timeout-events.jsonl");
+  for (const timeoutMs of ["5000", 5_000.5, null, false, 4_999, 3_600_001]) {
+    const response = await client.request("tools/call", taskArguments(workspace, {
+      name: "invalid-timeout", eventFile,
+    }, { timeoutMs }));
+    assert.equal(response.error?.code, -32602, JSON.stringify(response));
+    assert.equal(
+      response.error.message,
+      "timeoutMs must be an integer between 5000 and 3600000 milliseconds",
+    );
+  }
+  assert.deepEqual(await events(eventFile), [], "an invalid timeout must not launch a worker");
+});
+
+test("Git executable resolution obeys request cancellation, deadline, and shutdown", async (context) => {
+  const resolverRoot = await mkdtemp(path.join(os.tmpdir(), "cli-agent-git-resolution-test-"));
+  const startedFile = path.join(resolverRoot, "started.txt");
+  context.after(() => rm(resolverRoot, { recursive: true, force: true }));
+  const { tempRoot, workspace, client } = await makeHarness(context, {
+    extraEnv: {
+      NODE_ENV: "test",
+      CLI_AGENT_BRIDGE_TEST_GIT_RESOLUTION_DELAY_MS: "60000",
+      CLI_AGENT_BRIDGE_TEST_GIT_RESOLUTION_STARTED_FILE: startedFile,
+    },
+  });
+
+  const cancelledRequest = client.request("tools/call", {
+    name: "workspace_status", arguments: { workspacePath: workspace },
+  }, 51_001);
+  await waitFor(async () => {
+    try { return (await readFile(startedFile, "utf8")).includes("started"); } catch { return false; }
+  });
+  const cancelledAt = Date.now();
+  client.notify("notifications/cancelled", { requestId: 51_001 });
+  const cancelled = await cancelledRequest;
+  assert.equal(cancelled.result.structuredContent.cancelled, true, JSON.stringify(cancelled));
+  assert.ok(Date.now() - cancelledAt < 1_500, "Git resolution cancellation must detach promptly");
+
+  const eventFile = path.join(tempRoot, "git-resolution-events.jsonl");
+  const timed = await client.request("tools/call", taskArguments(workspace, {
+    name: "git-resolution-deadline", eventFile,
+  }, { timeoutMs: 5_000 }), 51_002);
+  assert.equal(timed.result.structuredContent.timedOut, true, JSON.stringify(timed));
+  assert.match(timed.result.structuredContent.error, /identifying the Git worktree/iu);
+  assert.deepEqual(await events(eventFile), [], "the backend must not start after resolution timeout");
+  assert.equal((await readFile(startedFile, "utf8")).trim().split(/\r?\n/u).length, 1,
+    "cancelled and timed-out waiters must share one core Git lookup");
+
+  const pending = client.request("tools/call", {
+    name: "workspace_status", arguments: { workspacePath: workspace },
+  }, 51_003);
+  void pending.catch(() => {});
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const shutdownAt = Date.now();
+  await client.disconnectInput();
+  assert.ok(Date.now() - shutdownAt < 3_000,
+    "stdin shutdown must detach the active Git-resolution waiter");
+});
+
+test("list_backends rejects a successful probe whose tree cleanup is unconfirmed", () => {
+  const entry = backendEntryFromProbe("fixture", {
+    label: "Fixture", command: "fixture", buildArgs: ["<task>"], resumeArgs: null,
+  }, {
+    exitCode: 0,
+    treeTerminated: false,
+    terminationError: "fixture version-probe descendant remains",
+    errorMessage: "",
+    stdout: "fixture 1.2.3\n",
+  });
+  assert.equal(entry.available, false);
+  assert.equal(entry.version, null);
+  assert.equal(entry.error, "fixture version-probe descendant remains");
+});
+
+test("cancellation requires a fresh workspace_status to reveal earlier edits", async (context) => {
+  const { tempRoot, workspace, client } = await makeHarness(context);
+  const eventFile = path.join(tempRoot, "cancelled-edit-events.jsonl");
+  const changedFile = "cancelled-edit.txt";
+  const pending = client.request("tools/call", taskArguments(workspace, {
+    name: "cancelled-edit", eventFile, writeBeforeDelay: true, writeFile: changedFile,
+  }), 51_004);
+  await waitFor(async () => (await events(eventFile)).some((item) => item.event === "written"));
+  client.notify("notifications/cancelled", { requestId: 51_004 });
+  const cancelled = await pending;
+  const cancelledOut = cancelled.result.structuredContent;
+  assert.equal(cancelledOut.cancelled, true, JSON.stringify(cancelledOut));
+  assert.equal(cancelledOut.treeTerminated, true, JSON.stringify(cancelledOut));
+  assert.equal(cancelledOut.git, null,
+    "the cancelled response must not be treated as evidence that no edits occurred");
+
+  const status = await client.request("tools/call", {
+    name: "workspace_status", arguments: { workspacePath: workspace },
+  });
+  const statusOut = status.result.structuredContent;
+  assert.equal(statusOut.ok, true, JSON.stringify(statusOut));
+  assert.ok(statusOut.git.changedFiles.includes(changedFile), JSON.stringify(statusOut.git));
+});
+
+test("provenance setup obeys cancellation and deadline before worker launch", async (context) => {
+  const setupRoot = await mkdtemp(path.join(os.tmpdir(), "cli-agent-trace-setup-test-"));
+  const startedFile = path.join(setupRoot, "started.txt");
+  context.after(() => rm(setupRoot, { recursive: true, force: true }));
+  const { tempRoot, workspace, client } = await makeHarness(context, {
+    extraEnv: {
+      NODE_ENV: "test",
+      CLI_AGENT_BRIDGE_TEST_TRACE_CREATION_DELAY_MS: "60000",
+      CLI_AGENT_BRIDGE_TEST_TRACE_CREATION_STARTED_FILE: startedFile,
+    },
+  });
+  const eventFile = path.join(tempRoot, "trace-setup-events.jsonl");
+  const cancelledRequest = client.request("tools/call", taskArguments(workspace, {
+    name: "cancelled-trace-setup", eventFile,
+  }), 51_005);
+  await waitFor(async () => {
+    try { return (await readFile(startedFile, "utf8")).trim().length > 0; } catch { return false; }
+  }, 20_000);
+  client.notify("notifications/cancelled", { requestId: 51_005 });
+  const cancelled = await cancelledRequest;
+  assert.equal(cancelled.result.structuredContent.cancelled, true, JSON.stringify(cancelled));
+
+  const timed = await client.request("tools/call", taskArguments(workspace, {
+    name: "expired-trace-setup", eventFile,
+  }, { timeoutMs: 5_000 }), 51_006);
+  assert.equal(timed.result.structuredContent.timedOut, true, JSON.stringify(timed));
+  assert.match(timed.result.structuredContent.error, /preparing Git provenance/iu);
+  assert.deepEqual(await events(eventFile), [], "trace setup interruption must precede worker launch");
+  for (const traceRoot of (await readFile(startedFile, "utf8")).trim().split(/\r?\n/u)) {
+    await assert.rejects(access(traceRoot), /ENOENT/u,
+      "interrupted provenance setup must close its handle and remove its private root");
+  }
+});
+
+test("shutdown waits for a late provenance-setup cleanup", async (context) => {
+  const setupRoot = await mkdtemp(path.join(os.tmpdir(), "cli-agent-trace-shutdown-test-"));
+  const startedFile = path.join(setupRoot, "started.txt");
+  const releaseFile = path.join(setupRoot, "release.txt");
+  context.after(() => rm(setupRoot, { recursive: true, force: true }));
+  const { tempRoot, workspace, client } = await makeHarness(context, {
+    extraEnv: {
+      NODE_ENV: "test",
+      CLI_AGENT_BRIDGE_TEST_TRACE_PENDING_STEP_RELEASE_FILE: releaseFile,
+      CLI_AGENT_BRIDGE_TEST_TRACE_CREATION_STARTED_FILE: startedFile,
+    },
+  });
+  const eventFile = path.join(tempRoot, "trace-shutdown-events.jsonl");
+  const pending = client.request("tools/call", taskArguments(workspace, {
+    name: "pending-trace-setup", eventFile,
+  }), 51_007);
+  await waitFor(async () => {
+    try { return (await readFile(startedFile, "utf8")).trim().length > 0; } catch { return false; }
+  }, 20_000);
+  const traceRoot = (await readFile(startedFile, "utf8")).trim();
+  client.notify("notifications/cancelled", { requestId: 51_007 });
+  const response = await pending;
+  assert.equal(response.result.structuredContent.cancelled, true, JSON.stringify(response));
+  await writeFile(releaseFile, "release\n");
+  await client.disconnectInput();
+  await assert.rejects(access(traceRoot), /ENOENT/u,
+    "shutdown must await the registered late cleanup before exiting");
+  assert.deepEqual(await events(eventFile), []);
+});
 
 test("Codex templates delimit option-looking task text", async () => {
   const backends = JSON.parse(await readFile(path.join(pluginRoot, "backends.json"), "utf8")).backends;
@@ -1948,8 +2299,8 @@ test("quarantine recovery requires an explicit incident-bound approval", async (
   const eventFile = path.join(tempRoot, "explicit-recovery-events.jsonl");
   const absentOnly = await client.request("tools/call", taskArguments(workspace, {
     name: "must-not-run-after-marker-loss", eventFile,
-  }, { timeoutMs: 700 }), 132);
-  assert.equal(absentOnly.result.structuredContent.ok, false);
+  }, { timeoutMs: 5_000 }), 132);
+  assert.equal(absentOnly.result.structuredContent.ok, false, JSON.stringify(absentOnly));
   assert.match(absentOnly.result.structuredContent.error, /timed out.*workspace lock/iu);
   assert.equal((await events(eventFile)).length, 0);
 
@@ -2809,6 +3160,112 @@ test("direct remote-tracking ref writes do not hide worker-created commits", asy
   assert.match(out.commits.diffStat, /worker-after-fetch\.txt/u);
 });
 
+test("provenance reads stay bound to the originally opened regular file", async (context) => {
+  const fixture = await makeTraceFixture(context);
+  await unlink(fixture.tracePath);
+  await writeFile(fixture.tracePath, "");
+  await assert.rejects(
+    readBackendGitProvenance(fixture, pluginRoot),
+    /no longer identifies the original regular file/iu,
+  );
+});
+
+test("provenance reads reject FIFO and device symlink replacements without hanging", {
+  skip: process.platform !== "linux",
+}, async () => {
+  const source = [
+    "import {execFileSync} from 'node:child_process'",
+    "import {mkdtemp,open,rm,symlink,unlink} from 'node:fs/promises'",
+    "import os from 'node:os'",
+    "import path from 'node:path'",
+    `import {readBackendGitProvenance} from ${JSON.stringify(pathToFileURL(serverPath).href)}`,
+    "const mode=process.argv[1]",
+    "const root=await mkdtemp(path.join(os.tmpdir(),'trace-replacement-child-'))",
+    "const tracePath=path.join(root,'git.trace')",
+    "const handle=await open(tracePath,'wx+',0o600)",
+    "const identity=await handle.stat({bigint:true})",
+    "await unlink(tracePath)",
+    "if(mode==='fifo')execFileSync('mkfifo',[tracePath]);else await symlink('/dev/zero',tracePath)",
+    "let rejected=false",
+    "try{await readBackendGitProvenance({tracePath,handle,identity},process.cwd())}catch{rejected=true}",
+    "await handle.close();await rm(root,{recursive:true,force:true})",
+    "if(!rejected)process.exit(3)",
+  ].join(";");
+  for (const mode of ["fifo", "device"]) {
+    await execFileAsync(process.execPath, [
+      "--max-old-space-size=32", "--input-type=module", "-e", source, mode,
+    ], { timeout: 3_000, maxBuffer: 1_000_000 });
+  }
+});
+
+test("provenance reads are bounded and interruptible", async (context) => {
+  const oversized = await makeTraceFixture(context);
+  await oversized.handle.truncate(5_000_001);
+  await assert.rejects(
+    readBackendGitProvenance(oversized, pluginRoot),
+    /capture limit/iu,
+  );
+
+  const cancelledFixture = await makeTraceFixture(context);
+  let readStartedResolve;
+  const readStarted = new Promise((resolve) => { readStartedResolve = resolve; });
+  const stalledHandle = {
+    stat: (...args) => cancelledFixture.handle.stat(...args),
+    read: async () => {
+      readStartedResolve();
+      return await new Promise(() => {});
+    },
+  };
+  const cancel = testCancellation();
+  const cancelledRead = readBackendGitProvenance({
+    ...cancelledFixture, handle: stalledHandle,
+  }, pluginRoot, { cancel });
+  await readStarted;
+  const cancelledAt = Date.now();
+  cancel.cancel();
+  await assert.rejects(cancelledRead, /cancelled/iu);
+  assert.ok(Date.now() - cancelledAt < 1_000);
+
+  let expiredCalls = 0;
+  const expiredHandle = {
+    stat: async () => { expiredCalls += 1; return cancelledFixture.identity; },
+    read: async () => { expiredCalls += 1; return { bytesRead: 0 }; },
+  };
+  await assert.rejects(readBackendGitProvenance({
+    ...cancelledFixture, handle: expiredHandle,
+  }, pluginRoot, { deadline: Date.now() - 1 }), /deadline/iu);
+  assert.equal(expiredCalls, 0, "an already-expired read must not start filesystem I/O");
+
+  const denseFixture = await makeTraceFixture(context);
+  const denseTrace = Buffer.from("{}\n".repeat(1_600_000));
+  await denseFixture.handle.write(denseTrace, 0, denseTrace.length, 0);
+  const parsingAt = Date.now();
+  await assert.rejects(readBackendGitProvenance(
+    denseFixture, pluginRoot, { deadline: parsingAt + 100 },
+  ), /deadline/iu);
+  assert.ok(Date.now() - parsingAt < 1_500,
+    "parsing a dense bounded trace must continue to observe the request deadline");
+});
+
+test("a replaced backend provenance path degrades attribution and is cleaned up", async (context) => {
+  const { tempRoot, workspace, client } = await makeHarness(context);
+  const traceRootFile = path.join(tempRoot, "trace-root.txt");
+  const response = await client.request("tools/call", taskArguments(workspace, {
+    name: "replace-provenance",
+    replaceTraceThenWrite: true,
+    traceRootFile,
+    writeFile: "replacement-provenance.txt",
+  }));
+  const out = response.result.structuredContent;
+  assert.equal(out.ok, true, JSON.stringify(out));
+  assert.ok(out.git.changedFiles.includes("replacement-provenance.txt"), JSON.stringify(out.git));
+  assert.equal(out.commits.attributionUnavailable, true, JSON.stringify(out.commits));
+  assert.equal(out.commits.newCommitCount, null);
+  const traceRoot = await readFile(traceRootFile, "utf8");
+  await assert.rejects(access(traceRoot), /ENOENT/u,
+    "the controlled provenance directory should be removed after the worker settles");
+});
+
 test("a workspace fetch makes commit attribution explicitly unavailable", async (context) => {
   const { tempRoot, workspace, client } = await makeHarness(context);
   const requestDirectory = path.join(workspace, "nested-request-directory");
@@ -2869,7 +3326,9 @@ test("successive fetches are detected even after FETCH_HEAD is overwritten", asy
   await rm(path.join(workspace, ".git", "FETCH_HEAD"), { force: true });
 
   const tracePath = path.join(tempRoot, "successive-fetch.trace2");
-  await writeFile(tracePath, "");
+  const traceHandle = await open(tracePath, "wx+", 0o600);
+  context.after(() => traceHandle.close().catch(() => {}));
+  const traceIdentity = await traceHandle.stat({ bigint: true });
   const env = backendGitProvenanceEnvironment(tracePath);
   await execFileAsync("git", [
     "-c", "protocol.version=0", "fetch", "--no-write-fetch-head",
@@ -2882,7 +3341,9 @@ test("successive fetches are detected even after FETCH_HEAD is overwritten", asy
   await execFileAsync("git", ["fetch", third.upstream, "refs/heads/topic"], { cwd: workspace, env });
   await execFileAsync("git", ["update-ref", "refs/custom/imported-c", third.oid], { cwd: workspace, env });
 
-  const provenance = await readBackendGitProvenance({ tracePath }, workspace);
+  const provenance = await readBackendGitProvenance({
+    tracePath, handle: traceHandle, identity: traceIdentity,
+  }, workspace);
   assert.equal(provenance.sawFetch, true);
   assert.equal(provenance.uncertain, true,
     "any successful target-repository fetch makes commit attribution unavailable");

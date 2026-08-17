@@ -8,12 +8,14 @@
 
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { chmod, lstat, mkdir, mkdtemp, open, readFile, realpath, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, open, readFile, realpath, rename, rm, rmdir, stat, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
-import { resolvePathCommand, safeGitInvocation, subscribePathCommand } from "./git-executable.mjs";
+import {
+  resolvePathCommand, safeGitInvocation, subscribePathCommand, subscribeTrustedGitExecutable,
+} from "./git-executable.mjs";
 import { initializeProcessTree, isProcessTreeAlive, refreshProcessTree, signalProcessTree, waitForChildExit, waitForProcessTreeExit } from "./process-tree.mjs";
 import {
   acquireGitWorkspaceLock,
@@ -37,6 +39,10 @@ const KILL_GRACE_MS = Number.isInteger(TEST_KILL_GRACE_MS) && TEST_KILL_GRACE_MS
   ? Math.min(10_000, TEST_KILL_GRACE_MS)
   : 10_000;
 const MAX_CAPTURE_CHARS = 5_000_000;
+const MAX_TRACE_EVENT_CHARS = 256_000;
+const TRACE_PARSE_YIELD_CHARS = 64 * 1024;
+const TRACE_CLEANUP_TIMEOUT_MS = 1_000;
+const backgroundFinalizers = new Set();
 const RAW_TAIL_CHARS = 60_000;
 const FETCH_PROVENANCE_TIPS = Symbol("fetchProvenanceTips");
 const QUARANTINE_RECORD_FILE = "record.json";
@@ -62,9 +68,9 @@ function trustedWindowsPowerShell() {
   );
 }
 
-// Built-in defaults. The sibling backends.json (or the CLI_AGENT_BRIDGE_BACKENDS
-// environment variable) overrides these; a missing or invalid file falls back
-// to this table.
+// Built-in defaults. A missing or invalid bundled sibling backends.json falls
+// back to this table. An explicitly configured CLI_AGENT_BRIDGE_BACKENDS path
+// is authoritative and fails closed on every load or validation error.
 const FALLBACK_BACKENDS = {
   claude: {
     label: "Claude Code",
@@ -181,32 +187,67 @@ const TOOLS = [
   },
 ];
 
-async function loadBackends() {
-  const override = process.env.CLI_AGENT_BRIDGE_BACKENDS;
-  const candidates = [];
-  if (override) candidates.push(path.resolve(override));
-  candidates.push(path.join(path.dirname(fileURLToPath(import.meta.url)), "backends.json"));
-  for (const file of candidates) {
+function validateBackendConfiguration(parsed, file) {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) ||
+      !parsed.backends || typeof parsed.backends !== "object" || Array.isArray(parsed.backends)) {
+    throw new Error("backend configuration must contain a backends object");
+  }
+  const entries = Object.entries(parsed.backends);
+  if (entries.length === 0) throw new Error("backend configuration backends object is empty");
+  const configDirectory = path.dirname(file);
+  return Object.fromEntries(entries.map(([name, spec]) => {
+    if (!name.trim() || !spec || typeof spec !== "object" || Array.isArray(spec)) {
+      throw new Error("backend configuration entry " + JSON.stringify(name) + " is invalid");
+    }
+    if (typeof spec.command !== "string" || !spec.command.trim()) {
+      throw new Error("backend configuration entry " + JSON.stringify(name) + " has no command");
+    }
+    if (!Array.isArray(spec.buildArgs) || !spec.buildArgs.every((arg) => typeof arg === "string")) {
+      throw new Error("backend configuration entry " + JSON.stringify(name) + " has invalid buildArgs");
+    }
+    if (spec.resumeArgs !== undefined && spec.resumeArgs !== null &&
+        (!Array.isArray(spec.resumeArgs) || !spec.resumeArgs.every((arg) => typeof arg === "string"))) {
+      throw new Error("backend configuration entry " + JSON.stringify(name) + " has invalid resumeArgs");
+    }
+    return [name, /[\\/]/u.test(spec.command)
+      ? { ...spec, command: path.resolve(configDirectory, spec.command) }
+      : spec];
+  }));
+}
+
+function trackBackgroundFinalizer(promise) {
+  const finalizer = Promise.resolve(promise).catch(() => {});
+  backgroundFinalizers.add(finalizer);
+  void finalizer.finally(() => { backgroundFinalizers.delete(finalizer); });
+  return finalizer;
+}
+
+async function readBackendConfiguration(file) {
+  return validateBackendConfiguration(JSON.parse(await readFile(file, "utf8")), file);
+}
+
+export async function loadBackends() {
+  const hasOverride = Object.prototype.hasOwnProperty.call(
+    process.env, "CLI_AGENT_BRIDGE_BACKENDS",
+  );
+  if (hasOverride) {
+    const override = process.env.CLI_AGENT_BRIDGE_BACKENDS;
+    if (typeof override !== "string" || !override.trim()) {
+      throw new Error("explicit backend configuration path is empty");
+    }
+    const file = path.resolve(override);
     try {
-      const raw = await readFile(file, "utf8");
-      const parsed = JSON.parse(raw);
-      const backends = parsed && typeof parsed === "object" && parsed.backends && typeof parsed.backends === "object"
-        ? parsed.backends
-        : FALLBACK_BACKENDS;
-      if (Object.keys(backends).length > 0) {
-        const configDirectory = path.dirname(file);
-        return Object.fromEntries(Object.entries(backends).map(([name, spec]) => {
-          if (!spec || typeof spec.command !== "string" || !/[\\/]/u.test(spec.command)) {
-            return [name, spec];
-          }
-          return [name, { ...spec, command: path.resolve(configDirectory, spec.command) }];
-        }));
-      }
-    } catch {
-      // fall through to the next candidate
+      return await readBackendConfiguration(file);
+    } catch (error) {
+      throw new Error("cannot load explicit backend configuration " + file + ": " + error.message);
     }
   }
-  return FALLBACK_BACKENDS;
+  const bundled = path.join(path.dirname(fileURLToPath(import.meta.url)), "backends.json");
+  try {
+    return await readBackendConfiguration(bundled);
+  } catch {
+    return FALLBACK_BACKENDS;
+  }
 }
 
 function substituteArgs(template, task, session) {
@@ -658,7 +699,7 @@ function interruptibleFilesystemOperation(operation, { cancel = null, deadline =
   });
 }
 
-function resolveBackendCommand(command, options = {}) {
+function waitForResolution(subscribe, options = {}) {
   const { cancel = null, deadline = null } = options;
   if (cancel?.cancelled) return Promise.reject(new OperationCancelledError("operation cancelled by client"));
   if (deadline !== null && Date.now() >= deadline) {
@@ -687,12 +728,21 @@ function resolveBackendCommand(command, options = {}) {
         reject, new DeadlineExceededError("delegation deadline exceeded"),
       ), Math.max(0, deadline - Date.now()));
     }
-    unsubscribeResolution = subscribePathCommand(
-      command,
+    unsubscribeResolution = subscribe(
       (value) => finish(resolve, value),
       (error) => finish(reject, error),
     );
   });
+}
+
+function resolveBackendCommand(command, options = {}) {
+  return waitForResolution(
+    (resolve, reject) => subscribePathCommand(command, resolve, reject), options,
+  );
+}
+
+function resolveTrustedGitExecutable(options = {}) {
+  return waitForResolution(subscribeTrustedGitExecutable, options);
 }
 
 async function validateWorkspace(workspacePath, options = {}) {
@@ -1109,6 +1159,7 @@ function snapshotFailure(label, result) {
 
 class OperationCancelledError extends Error {}
 class DeadlineExceededError extends Error {}
+class InvalidArgumentsError extends Error {}
 class GitProcessTreeUnconfirmedError extends Error {
   constructor(label, terminationError, quarantine = null) {
     super(label + " process tree could not be confirmed terminated: " + terminationError);
@@ -1162,57 +1213,202 @@ export function backendGitProvenanceEnvironment(tracePath, baseEnvironment = pro
   return env;
 }
 
-async function createBackendGitProvenance(baseEnvironment = process.env) {
-  const root = await mkdtemp(path.join(os.tmpdir(), "minimax-cli-agent-fetch-"));
-  const tracePath = path.join(root, "git.trace");
+async function createBackendGitProvenance(baseEnvironment = process.env, options = {}) {
+  let root = "";
+  let tracePath = "";
+  let handle = null;
+  let pendingOperation = Promise.resolve();
+  const step = async (start, remember = () => {}) => {
+    checkTraceInterruption(options);
+    const operation = Promise.resolve().then(start).then((value) => {
+      remember(value);
+      return value;
+    });
+    pendingOperation = operation.catch(() => {});
+    return await interruptibleFilesystemOperation(operation, options);
+  };
+  const cleanup = async () => {
+    await pendingOperation;
+    await handle?.close().catch(() => {});
+    if (root) await rm(root, { recursive: true, force: true }).catch(() => {});
+  };
   try {
-    await chmod(root, 0o700);
-    await writeFile(tracePath, "", { flag: "wx", mode: 0o600 });
+    root = await step(
+      () => mkdtemp(path.join(os.tmpdir(), "minimax-cli-agent-fetch-")),
+      (value) => { root = value; tracePath = path.join(value, "git.trace"); },
+    );
+    if (process.env.NODE_ENV === "test") {
+      const releaseFile = process.env.CLI_AGENT_BRIDGE_TEST_TRACE_PENDING_STEP_RELEASE_FILE;
+      if (typeof releaseFile === "string" && path.isAbsolute(releaseFile)) {
+        await step(async () => {
+          const startedFile = process.env.CLI_AGENT_BRIDGE_TEST_TRACE_CREATION_STARTED_FILE;
+          if (typeof startedFile === "string" && path.isAbsolute(startedFile)) {
+            await writeFile(startedFile, root + "\n", { flag: "a" });
+          }
+          while (true) {
+            try {
+              await stat(releaseFile);
+              break;
+            } catch (error) {
+              if (error.code !== "ENOENT") throw error;
+              await new Promise((resolve) => setTimeout(resolve, 25));
+            }
+          }
+        });
+      }
+    }
+    await step(() => chmod(root, 0o700));
+    const rootIdentity = await step(() => lstat(root, { bigint: true }));
+    if (!rootIdentity.isDirectory() || rootIdentity.isSymbolicLink() ||
+        !sameTraceIdentity(rootIdentity, rootIdentity)) {
+      throw new Error("Git fetch provenance root has no stable directory identity");
+    }
+    handle = await step(
+      () => open(tracePath, "wx+", 0o600),
+      (value) => { handle = value; },
+    );
+    await step(() => handle.chmod(0o600));
+    const identity = await step(() => handle.stat({ bigint: true }));
+    if (!identity.isFile() || !sameTraceIdentity(identity, identity)) {
+      throw new Error("Git fetch provenance trace has no stable regular-file identity");
+    }
+    if (process.env.NODE_ENV === "test") {
+      const delayMs = Number(process.env.CLI_AGENT_BRIDGE_TEST_TRACE_CREATION_DELAY_MS ?? 0);
+      if (Number.isFinite(delayMs) && delayMs > 0) {
+        const startedFile = process.env.CLI_AGENT_BRIDGE_TEST_TRACE_CREATION_STARTED_FILE;
+        if (typeof startedFile === "string" && path.isAbsolute(startedFile)) {
+          await writeFile(startedFile, root + "\n", { flag: "a" });
+        }
+        await interruptibleFilesystemOperation(
+          new Promise((resolve) => setTimeout(resolve, delayMs)), options,
+        );
+      }
+    }
     return {
-      root, tracePath,
+      root, rootIdentity, tracePath, handle, identity,
       env: backendGitProvenanceEnvironment(tracePath, baseEnvironment),
     };
   } catch (error) {
-    await rm(root, { recursive: true, force: true }).catch(() => {});
+    if (error instanceof OperationCancelledError || error instanceof DeadlineExceededError) {
+      // A raced filesystem call may finish after the request unwinds. Its
+      // remembered root/handle is cleaned asynchronously once that call settles.
+      trackBackgroundFinalizer(cleanup());
+    } else {
+      await cleanup();
+    }
     throw error;
   }
 }
 
-export async function readBackendGitProvenance(provenance, worktreeRoot) {
-  const traceStat = await stat(provenance.tracePath);
-  if (traceStat.size > MAX_CAPTURE_CHARS) {
+function sameTraceIdentity(left, right) {
+  return left.dev !== 0n && left.ino !== 0n &&
+    left.dev === right.dev && left.ino === right.ino;
+}
+
+function sameTraceSnapshot(left, right) {
+  return sameTraceIdentity(left, right) && left.size === right.size &&
+    left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
+}
+
+async function readBoundedTrace(handle, options = {}) {
+  const captured = Buffer.allocUnsafe(MAX_CAPTURE_CHARS + 1);
+  let offset = 0;
+  while (offset < captured.length) {
+    checkTraceInterruption(options);
+    const length = Math.min(64 * 1024, captured.length - offset);
+    const { bytesRead } = await interruptibleFilesystemOperation(
+      handle.read(captured, offset, length, offset), options,
+    );
+    if (bytesRead === 0) break;
+    offset += bytesRead;
+  }
+  if (offset > MAX_CAPTURE_CHARS) {
     throw new Error("Git fetch provenance trace exceeded the capture limit");
   }
-  const trace = await readFile(provenance.tracePath, "utf8");
+  return new TextDecoder("utf-8", { fatal: true }).decode(captured.subarray(0, offset));
+}
+
+function checkTraceInterruption({ cancel = null, deadline = null } = {}) {
+  if (cancel?.cancelled) throw new OperationCancelledError("operation cancelled by client");
+  if (deadline !== null && Date.now() >= deadline) {
+    throw new DeadlineExceededError("delegation deadline exceeded");
+  }
+}
+
+export async function readBackendGitProvenance(provenance, worktreeRoot, options = {}) {
+  if (!provenance?.handle || !provenance?.identity) {
+    throw new Error("Git fetch provenance trace handle is unavailable");
+  }
+  checkTraceInterruption(options);
+  const [before, pathBefore] = await Promise.all([
+    interruptibleFilesystemOperation(provenance.handle.stat({ bigint: true }), options),
+    interruptibleFilesystemOperation(lstat(provenance.tracePath, { bigint: true }), options),
+  ]);
+  if (!before.isFile() || !pathBefore.isFile() ||
+      !sameTraceIdentity(before, provenance.identity) || !sameTraceIdentity(pathBefore, before)) {
+    throw new Error("Git fetch provenance trace path no longer identifies the original regular file");
+  }
+  if (before.size > BigInt(MAX_CAPTURE_CHARS)) {
+    throw new Error("Git fetch provenance trace exceeded the capture limit");
+  }
+  const trace = await readBoundedTrace(provenance.handle, options);
+  checkTraceInterruption(options);
+  const [after, pathAfter] = await Promise.all([
+    interruptibleFilesystemOperation(provenance.handle.stat({ bigint: true }), options),
+    interruptibleFilesystemOperation(lstat(provenance.tracePath, { bigint: true }), options),
+  ]);
+  if (!pathAfter.isFile() || !sameTraceSnapshot(before, after) ||
+      !sameTraceIdentity(pathAfter, after)) {
+    throw new Error("Git fetch provenance trace changed while it was being read");
+  }
   const sessions = new Map();
   const normalizeWorktree = (value) => {
     const normalized = path.resolve(String(value ?? ""));
     return process.platform === "win32" ? normalized.toLowerCase() : normalized;
   };
   const targetWorktree = normalizeWorktree(worktreeRoot);
-  for (const line of trace.split(/\r?\n/u)) {
-    if (!line.startsWith("{")) continue;
-    let event;
-    try {
-      event = JSON.parse(line);
-    } catch {
-      throw new Error("Git fetch provenance trace contained malformed Trace2 JSON");
+  let offset = 0;
+  let nextYield = TRACE_PARSE_YIELD_CHARS;
+  checkTraceInterruption(options);
+  while (offset <= trace.length) {
+    const newline = trace.indexOf("\n", offset);
+    const end = newline === -1 ? trace.length : newline;
+    if (end - offset > MAX_TRACE_EVENT_CHARS) {
+      throw new Error("Git fetch provenance trace contained an oversized Trace2 event");
     }
-    if (event?.event === "start") {
-      const commandIndex = Array.isArray(event.argv) ? gitCommandIndex(event.argv) : -1;
-      const command = commandIndex >= 0 ? event.argv[commandIndex] : "";
-      if (command === "fetch" || command === "pull") {
-        sessions.set(event.sid, { command, worktree: null, exitCode: null, exited: false });
+    let line = trace.slice(offset, end);
+    if (line.endsWith("\r")) line = line.slice(0, -1);
+    if (line.startsWith("{")) {
+      let event;
+      try {
+        event = JSON.parse(line);
+      } catch {
+        throw new Error("Git fetch provenance trace contained malformed Trace2 JSON");
       }
-    } else if (event?.event === "def_repo") {
-      const session = sessions.get(event.sid);
-      if (session) session.worktree = normalizeWorktree(event.worktree);
-    } else if (event?.event === "exit") {
-      const session = sessions.get(event.sid);
-      if (session) {
-        session.exited = true;
-        session.exitCode = event.code;
+      if (event?.event === "start") {
+        const commandIndex = Array.isArray(event.argv) ? gitCommandIndex(event.argv) : -1;
+        const command = commandIndex >= 0 ? event.argv[commandIndex] : "";
+        if (command === "fetch" || command === "pull") {
+          sessions.set(event.sid, { command, worktree: null, exitCode: null, exited: false });
+        }
+      } else if (event?.event === "def_repo") {
+        const session = sessions.get(event.sid);
+        if (session) session.worktree = normalizeWorktree(event.worktree);
+      } else if (event?.event === "exit") {
+        const session = sessions.get(event.sid);
+        if (session) {
+          session.exited = true;
+          session.exitCode = event.code;
+        }
       }
+    }
+    if (newline === -1) break;
+    offset = end + 1;
+    if (offset >= nextYield) {
+      checkTraceInterruption(options);
+      await new Promise((resolve) => setImmediate(resolve));
+      checkTraceInterruption(options);
+      nextYield = offset + TRACE_PARSE_YIELD_CHARS;
     }
   }
   let uncertain = false;
@@ -1230,6 +1426,32 @@ export async function readBackendGitProvenance(provenance, worktreeRoot) {
   return { uncertain, sawFetch };
 }
 
+async function cleanupBackendGitProvenance(provenance) {
+  // Only operate through the retained original handle and exact path names.
+  // The backend knows this directory and may replace entries inside it, so a
+  // recursive removal could be redirected or made unbounded after the worker.
+  const options = { deadline: Date.now() + TRACE_CLEANUP_TIMEOUT_MS };
+  await interruptibleFilesystemOperation(
+    provenance?.handle?.truncate(0), options,
+  ).catch(() => {});
+  await interruptibleFilesystemOperation(
+    provenance?.handle?.close(), options,
+  ).catch(() => {});
+  try {
+    checkTraceInterruption(options);
+    const root = await interruptibleFilesystemOperation(
+      lstat(provenance.root, { bigint: true }), options,
+    );
+    if (!root.isDirectory() || root.isSymbolicLink() ||
+        !sameTraceIdentity(root, provenance.rootIdentity)) return;
+    await interruptibleFilesystemOperation(unlink(provenance.tracePath), options).catch(() => {});
+    await interruptibleFilesystemOperation(rmdir(provenance.root), options).catch(() => {});
+  } catch {
+    // A replaced/missing root is untrusted. Leave it untouched; the retained
+    // original trace handle has already been truncated and closed.
+  }
+}
+
 export async function runGitCommand(args, {
   cwd,
   cancel = null,
@@ -1241,9 +1463,12 @@ export async function runGitCommand(args, {
   commandRunner = runCommand,
 } = {}) {
   if (cancel?.cancelled) throw new OperationCancelledError("operation cancelled by client");
-  const remaining = deadline === null ? GIT_TIMEOUT_MS : deadline - Date.now();
+  const resolutionDeadline = deadline ?? Date.now() + timeoutMs;
+  const executable = await resolveTrustedGitExecutable({ cancel, deadline: resolutionDeadline });
+  const git = await safeGitInvocation(args, process.env, executable);
+  if (cancel?.cancelled) throw new OperationCancelledError("operation cancelled by client");
+  const remaining = resolutionDeadline - Date.now();
   if (remaining <= 0) throw new DeadlineExceededError("delegation deadline exceeded");
-  const git = await safeGitInvocation(args);
   let controller = null;
   const result = await commandRunner(git.command, git.args, {
     cwd,
@@ -1722,6 +1947,24 @@ export async function committedDelta(worktreeRoot, before, after, options = {}) 
   };
 }
 
+export function backendEntryFromProbe(name, spec, check) {
+  const available = check.exitCode === 0 && check.treeTerminated === true;
+  const probeError = check.treeTerminated !== true
+    ? (check.terminationError || "backend version probe process tree could not be confirmed terminated")
+    : (check.errorMessage || "command not found or not executable");
+  return {
+    name,
+    label: typeof spec.label === "string" ? spec.label : name,
+    command: spec.command,
+    available,
+    experimental: Boolean(spec.experimental),
+    version: available ? tail(check.stdout, 200).trim() : null,
+    error: available ? "" : probeError,
+    resumeSupported: Array.isArray(spec.resumeArgs),
+    notes: typeof spec.notes === "string" ? spec.notes : "",
+  };
+}
+
 async function listBackends(cancel = null) {
   const backends = await loadBackends();
   const entries = [];
@@ -1774,17 +2017,7 @@ async function listBackends(cancel = null) {
       },
     });
     if (cancel?.controller) cancel.controller = null;
-    entries.push({
-      name,
-      label: typeof spec.label === "string" ? spec.label : name,
-      command: spec.command,
-      available: check.exitCode === 0,
-      experimental: Boolean(spec.experimental),
-      version: check.exitCode === 0 ? tail(check.stdout, 200).trim() : null,
-      error: check.exitCode === 0 ? "" : (check.errorMessage || "command not found or not executable"),
-      resumeSupported: Array.isArray(spec.resumeArgs),
-      notes: typeof spec.notes === "string" ? spec.notes : "",
-    });
+    entries.push(backendEntryFromProbe(name, spec, check));
   }
   return entries;
 }
@@ -2201,9 +2434,15 @@ function quarantinedWorkspaceStatus(id, { workspacePath = "", worktreeRoot = "" 
 }
 
 async function delegateTask(rawArgs, cancel) {
-  const timeoutMs = Number.isInteger(rawArgs?.timeoutMs)
-    ? Math.min(MAX_TIMEOUT_MS, Math.max(MIN_TIMEOUT_MS, rawArgs.timeoutMs))
-    : DEFAULT_TIMEOUT_MS;
+  const hasTimeout = Boolean(rawArgs && Object.prototype.hasOwnProperty.call(rawArgs, "timeoutMs"));
+  if (hasTimeout && (!Number.isInteger(rawArgs.timeoutMs) ||
+      rawArgs.timeoutMs < MIN_TIMEOUT_MS || rawArgs.timeoutMs > MAX_TIMEOUT_MS)) {
+    throw new InvalidArgumentsError(
+      "timeoutMs must be an integer between " + String(MIN_TIMEOUT_MS) +
+        " and " + String(MAX_TIMEOUT_MS) + " milliseconds",
+    );
+  }
+  const timeoutMs = hasTimeout ? rawArgs.timeoutMs : DEFAULT_TIMEOUT_MS;
   const deadline = Date.now() + timeoutMs;
   const backends = await loadBackends();
   if (!rawArgs || typeof rawArgs.backend !== "string" || !rawArgs.backend.trim()) {
@@ -2442,7 +2681,7 @@ async function delegateTask(rawArgs, cancel) {
       }
       throw error;
     }
-    const remaining = deadline - Date.now();
+    let remaining = deadline - Date.now();
     if (remaining <= 0) {
       return {
         ok: false,
@@ -2478,9 +2717,45 @@ async function delegateTask(rawArgs, cancel) {
       ownershipLostError ??= error;
     });
     let workerLockUpdate = Promise.resolve();
-    const gitProvenance = await createBackendGitProvenance();
+    let gitProvenance;
+    try {
+      gitProvenance = await createBackendGitProvenance(process.env, { cancel, deadline });
+    } catch (error) {
+      if (error instanceof OperationCancelledError) {
+        return cancelledDelegation({ backend, workspacePath, worktreeRoot, spec, before });
+      }
+      if (error instanceof DeadlineExceededError) {
+        return {
+          ok: false,
+          error: "delegation timed out while preparing Git provenance; the worker never started",
+          backend, workspacePath, worktreeRoot, exitCode: null, timedOut: true, killed: false, cancelled: false,
+          treeTerminated: true, outputTail: "", stderrTail: "",
+          gitBefore: before, git: before, commits: null,
+          experimental: Boolean(spec.experimental),
+        };
+      }
+      throw error;
+    }
+    remaining = deadline - Date.now();
+    if (cancel?.cancelled) {
+      await cleanupBackendGitProvenance(gitProvenance);
+      return cancelledDelegation({ backend, workspacePath, worktreeRoot, spec, before });
+    }
+    if (remaining <= 0) {
+      await cleanupBackendGitProvenance(gitProvenance);
+      return {
+        ok: false,
+        error: "delegation timed out after preflight; the worker never started",
+        backend, workspacePath, worktreeRoot, exitCode: null, timedOut: true, killed: false, cancelled: false,
+        treeTerminated: true, outputTail: "", stderrTail: "",
+        gitBefore: before, git: before, commits: null,
+        experimental: Boolean(spec.experimental),
+      };
+    }
     let fetchProvenanceTips = { uncertain: false, sawFetch: false };
     let result;
+    let workerRunFailed = false;
+    let workerRunError = null;
     try {
       result = await runCommand(backendCommand, args, {
         cwd: workspacePath,
@@ -2506,12 +2781,19 @@ async function delegateTask(rawArgs, cancel) {
             });
         },
       });
+    } catch (error) {
+      workerRunFailed = true;
+      workerRunError = error;
     } finally {
       // Once runCommand settles it has completed tree cleanup. Clear the
       // numeric-PID controller before any later I/O can fail or yield.
       workerFinished = true;
       if (cancel?.controller === workerController) cancel.controller = null;
       workerController = null;
+    }
+    if (workerRunFailed) {
+      await cleanupBackendGitProvenance(gitProvenance);
+      throw workerRunError;
     }
     let quarantinePath = "";
     try {
@@ -2559,7 +2841,9 @@ async function delegateTask(rawArgs, cancel) {
       }
       if (result.treeTerminated) {
         try {
-          fetchProvenanceTips = await readBackendGitProvenance(gitProvenance, worktreeRoot);
+          fetchProvenanceTips = await readBackendGitProvenance(
+            gitProvenance, worktreeRoot, { cancel, deadline },
+          );
         } catch {
           // A malformed, truncated, or missing trace cannot justify commit
           // attribution. Preserve the completed worker result and disclose the
@@ -2570,7 +2854,7 @@ async function delegateTask(rawArgs, cancel) {
     } finally {
       // Cleanup is privacy hygiene, not a workspace-safety gate. In particular,
       // it must never replace a durable quarantine result with a released lease.
-      await rm(gitProvenance.root, { recursive: true, force: true }).catch(() => {});
+      await cleanupBackendGitProvenance(gitProvenance);
     }
     let after = null;
     let commits = null;
@@ -2748,6 +3032,22 @@ async function terminateActiveRequests(reason = "shutdown") {
   // Let each request unwind its lock/snapshot finally blocks before the server
   // exits, avoiding an unnecessary stale cross-process lock after clean shutdown.
   await Promise.allSettled(entries.map((entry) => entry.done));
+  // An interrupted provenance setup may have a native filesystem operation
+  // completing after its request returns. Give its known-root cleanup a short,
+  // bounded shutdown window without letting a stalled filesystem pin exit.
+  if (backgroundFinalizers.size > 0) {
+    let timer = null;
+    try {
+      await Promise.race([
+        Promise.allSettled([...backgroundFinalizers]),
+        new Promise((resolve) => {
+          timer = setTimeout(resolve, TRACE_CLEANUP_TIMEOUT_MS);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
 }
 
 function installShutdownHandlers(stdin, stdout = process.stdout) {
@@ -2966,7 +3266,11 @@ async function handleMessage(message) {
         return jsonRpcError(message.id, -32601, "Method not found: " + String(message.method));
     }
   } catch (error) {
-    return jsonRpcError(message.id, -32603, error.message);
+    return jsonRpcError(
+      message.id,
+      error instanceof InvalidArgumentsError ? -32602 : -32603,
+      error.message,
+    );
   }
 }
 

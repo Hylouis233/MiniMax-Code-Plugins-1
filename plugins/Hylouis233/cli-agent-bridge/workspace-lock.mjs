@@ -1,9 +1,10 @@
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { appendFile } from "node:fs/promises";
 import os from "node:os";
 
-import { safeGitInvocation } from "./git-executable.mjs";
+import { safeGitInvocation, subscribeTrustedGitExecutable } from "./git-executable.mjs";
 
 export const WORKSPACE_LOCK_REF_PREFIX = "refs/cli-agent-bridge/workspace-locks/";
 const WORKSPACE_HISTORY_REF_SUFFIX = ".history";
@@ -142,6 +143,38 @@ function checkInterrupted(cancel, deadline) {
   }
 }
 
+function resolveTrustedGitExecutable(cancel, deadline) {
+  checkInterrupted(cancel, deadline);
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timer = null;
+    let unsubscribeCancel = () => {};
+    let unsubscribeResolution = () => {};
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      unsubscribeCancel();
+      unsubscribeResolution();
+      callback(value);
+    };
+    const cancelled = () => finish(
+      reject, new WorkspaceLockCancelledError("workspace lock acquisition cancelled"),
+    );
+    if (typeof cancel?.subscribe === "function") unsubscribeCancel = cancel.subscribe(cancelled);
+    else if (cancel?.promise) void cancel.promise.then(cancelled);
+    if (deadline !== null) {
+      timer = setTimeout(() => finish(
+        reject, new WorkspaceLockDeadlineError("workspace lock acquisition deadline exceeded"),
+      ), Math.max(0, deadline - Date.now()));
+    }
+    unsubscribeResolution = subscribeTrustedGitExecutable(
+      (value) => finish(resolve, value),
+      (error) => finish(reject, error),
+    );
+  });
+}
+
 async function runGit(cwd, args, {
   stdinText,
   cancel = null,
@@ -149,9 +182,21 @@ async function runGit(cwd, args, {
   returnOnTimeout = false,
 } = {}) {
   checkInterrupted(cancel, deadline);
-  const remaining = deadline === null ? GIT_TIMEOUT_MS : deadline - Date.now();
-  const timeoutMs = Math.max(1, Math.min(GIT_TIMEOUT_MS, remaining));
-  const git = await safeGitInvocation(args);
+  const resolutionDeadline = deadline ?? Date.now() + GIT_TIMEOUT_MS;
+  const executable = await resolveTrustedGitExecutable(cancel, resolutionDeadline);
+  const git = await safeGitInvocation(args, process.env, executable);
+  checkInterrupted(cancel, resolutionDeadline);
+  const remaining = resolutionDeadline - Date.now();
+  if (remaining <= 0) {
+    throw new WorkspaceLockDeadlineError("workspace lock acquisition deadline exceeded");
+  }
+  const timeoutMs = Math.min(GIT_TIMEOUT_MS, remaining);
+  if (process.env.NODE_ENV === "test") {
+    const spawnedFile = process.env.CLI_AGENT_BRIDGE_TEST_WORKSPACE_GIT_SPAWNED_FILE;
+    if (typeof spawnedFile === "string" && spawnedFile) {
+      await appendFile(spawnedFile, "spawned\n");
+    }
+  }
   const result = await new Promise((resolve) => {
     const child = spawn(git.command, git.args, {
       cwd,
