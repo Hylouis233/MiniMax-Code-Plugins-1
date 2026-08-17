@@ -64,21 +64,16 @@ def type3_charprocs_status(document, xref, font_type):
             return "malformed"
         try:
             dictionary_source = document.xref_object(dictionary_xref, compressed=True)
-            glyph_names = document.xref_get_keys(dictionary_xref)
+            dictionary_is_stream = document.xref_is_stream(dictionary_xref)
         except (RuntimeError, ValueError):
             return "uninspectable"
-        if not dictionary_source.lstrip().startswith("<<") or not glyph_names:
+        dictionary_source = dictionary_source.strip()
+        if (dictionary_is_stream or not dictionary_source.startswith("<<")
+                or not dictionary_source.endswith(">>")):
             return "malformed"
-        glyph_xrefs = []
-        for glyph_name in glyph_names:
-            try:
-                glyph_type, glyph_value = document.xref_get_key(dictionary_xref, glyph_name)
-            except (RuntimeError, ValueError):
-                return "uninspectable"
-            glyph_xref = indirect_xref(glyph_value) if glyph_type == "xref" else None
-            if glyph_xref is None:
-                return "malformed"
-            glyph_xrefs.append(glyph_xref)
+        parse_status, glyph_xrefs = direct_charproc_xrefs(dictionary_source)
+        if parse_status != "parsed":
+            return parse_status
     else:
         return "malformed"
     for glyph_xref in glyph_xrefs:

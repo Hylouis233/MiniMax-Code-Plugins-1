@@ -183,21 +183,16 @@ def type3_charprocs_status(document, xref, font_type):
             return "malformed"
         try:
             dictionary_source = document.xref_object(dictionary_xref, compressed=True)
-            glyph_names = document.xref_get_keys(dictionary_xref)
+            dictionary_is_stream = document.xref_is_stream(dictionary_xref)
         except (RuntimeError, ValueError):
             return "uninspectable"
-        if not dictionary_source.lstrip().startswith("<<") or not glyph_names:
+        dictionary_source = dictionary_source.strip()
+        if (dictionary_is_stream or not dictionary_source.startswith("<<")
+                or not dictionary_source.endswith(">>")):
             return "malformed"
-        glyph_xrefs = []
-        for glyph_name in glyph_names:
-            try:
-                glyph_type, glyph_value = document.xref_get_key(dictionary_xref, glyph_name)
-            except (RuntimeError, ValueError):
-                return "uninspectable"
-            glyph_xref = indirect_xref(glyph_value) if glyph_type == "xref" else None
-            if glyph_xref is None:
-                return "malformed"
-            glyph_xrefs.append(glyph_xref)
+        parse_status, glyph_xrefs = direct_charproc_xrefs(dictionary_source)
+        if parse_status != "parsed":
+            return parse_status
     else:
         return "malformed"
     for glyph_xref in glyph_xrefs:
@@ -259,13 +254,19 @@ def write_type3_pdf(path, *, charprocs_kind="indirect-dict", direct_font=False):
     glyph = DecodedStreamObject()
     glyph.set_data(b"500 0 0 0 500 700 d1 0 0 500 700 re f")
     glyph_ref = writer._add_object(glyph)
-    valid_charprocs = DictionaryObject({NameObject("/A"): glyph_ref})
+    glyph_name = NameObject(
+        "/A/B" if charprocs_kind in {"direct-escaped-name", "indirect-escaped-name"}
+        else "/A"
+    )
+    valid_charprocs = DictionaryObject({glyph_name: glyph_ref})
     if charprocs_kind == "indirect-dict":
+        charprocs = writer._add_object(valid_charprocs)
+    elif charprocs_kind == "indirect-escaped-name":
         charprocs = writer._add_object(valid_charprocs)
     elif charprocs_kind == "direct-dict":
         charprocs = valid_charprocs
     elif charprocs_kind == "direct-escaped-name":
-        charprocs = DictionaryObject({NameObject("/A#20B"): glyph_ref})
+        charprocs = valid_charprocs
     elif charprocs_kind == "empty-direct":
         charprocs = DictionaryObject()
     elif charprocs_kind == "direct-number-entry":
@@ -286,7 +287,7 @@ def write_type3_pdf(path, *, charprocs_kind="indirect-dict", direct_font=False):
     encoding = DictionaryObject({
         NameObject("/Type"): NameObject("/Encoding"),
         NameObject("/Differences"): ArrayObject([
-            NumberObject(65), NameObject("/A"),
+            NumberObject(65), glyph_name,
         ]),
     })
     font = DictionaryObject({
@@ -358,11 +359,41 @@ check("direct nonempty Type3 CharProcs with stream glyphs verifies",
 write_type3_pdf(
     "type3-escaped-charproc-name.pdf", charprocs_kind="direct-escaped-name",
 )
-_, escaped_charproc_record = type3_fixture_record("type3-escaped-charproc-name.pdf")
+escaped_charproc_doc, escaped_charproc_record = type3_fixture_record(
+    "type3-escaped-charproc-name.pdf"
+)
 check("escaped PDF names in direct Type3 CharProcs remain verifiable",
       escaped_charproc_record["charprocs_status"] == "verified"
-      and escaped_charproc_record["embedded"] is True,
+      and escaped_charproc_record["embedded"] is True
+      and escaped_charproc_doc[0].get_text().strip() == "A",
       escaped_charproc_record)
+
+write_type3_pdf(
+    "type3-indirect-escaped-charproc-name.pdf",
+    charprocs_kind="indirect-escaped-name",
+)
+indirect_escaped_doc, indirect_escaped_record = type3_fixture_record(
+    "type3-indirect-escaped-charproc-name.pdf"
+)
+indirect_escaped_xref = next(
+    entry[0] for entry in indirect_escaped_doc[0].get_fonts(full=True)
+    if entry[2].replace(" ", "").casefold() == "type3"
+)
+indirect_charprocs_type, indirect_charprocs_value = indirect_escaped_doc.xref_get_key(
+    indirect_escaped_xref, "CharProcs"
+)
+indirect_charprocs_xref = indirect_xref(indirect_charprocs_value)
+indirect_charprocs_source = indirect_escaped_doc.xref_object(
+    indirect_charprocs_xref, compressed=True
+)
+check("escaped slash name survives in the raw indirect CharProcs dictionary",
+      indirect_charprocs_type == "xref" and "#2F" in indirect_charprocs_source.upper(),
+      indirect_charprocs_source)
+check("escaped slash name in indirect Type3 CharProcs remains verified",
+      indirect_escaped_record["charprocs_status"] == "verified"
+      and indirect_escaped_record["embedded"] is True
+      and indirect_escaped_doc[0].get_text().strip() == "A",
+      indirect_escaped_record)
 
 write_type3_pdf(
     "type3-direct-font.pdf", charprocs_kind="direct-dict", direct_font=True,
