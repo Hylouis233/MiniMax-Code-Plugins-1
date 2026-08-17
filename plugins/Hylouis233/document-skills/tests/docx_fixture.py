@@ -6,6 +6,7 @@
 #   python xlsx_fixture.py  (deps: openpyxl)
 #   python docx_fixture.py  (deps: python-docx, pymupdf, soffice on PATH)
 import copy
+import os
 import subprocess
 import sys
 import zipfile
@@ -961,8 +962,38 @@ plain_doc.add_paragraph("second document")
 plain_doc.save("repack-without-media.docx")
 
 
+def validate_docx_archive_bounds(archive):
+    require(os.fstat(archive.fp.fileno()).st_size <= MAX_ARCHIVE_BYTES,
+            "compressed DOCX file size above limit")
+    infos = archive.infolist()
+    require(len(infos) <= MAX_MEMBERS, "archive member count above limit")
+    names = {info.filename for info in infos}
+    require(len(names) == len(infos), "duplicate archive member names are unsafe")
+    require("[Content_Types].xml" in names and "word/document.xml" in names,
+            "required DOCX package parts are missing")
+    require(sum(info.file_size for info in infos) <= MAX_TOTAL_UNCOMPRESSED,
+            "declared archive size exceeds the edit limit")
+    actual_total = 0
+    for info in infos:
+        require(info.file_size <= MAX_ENTRY, f"oversized part: {info.filename}")
+        require(info.file_size / max(info.compress_size, 1) <= MAX_COMPRESSION_RATIO,
+                f"suspicious compression ratio: {info.filename}")
+        if info.filename.endswith((".xml", ".rels")):
+            require(info.file_size <= MAX_XML_PART, f"oversized XML part: {info.filename}")
+        actual_size = 0
+        with archive.open(info) as stream:
+            while chunk := stream.read(64 * 1024):
+                actual_size += len(chunk)
+                actual_total += len(chunk)
+                require(actual_size <= MAX_ENTRY, f"part exceeded read limit: {info.filename}")
+                require(actual_total <= MAX_TOTAL_UNCOMPRESSED,
+                        "archive exceeded total read limit")
+        require(actual_size == info.file_size, f"size mismatch: {info.filename}")
+
+
 def repack_tree(source, output, extraction_root):
     with zipfile.ZipFile(source) as archive:
+        validate_docx_archive_bounds(archive)
         archive.extractall(extraction_root)
     content_types = Path(extraction_root) / "[Content_Types].xml"
     files = sorted(
@@ -975,6 +1006,32 @@ def repack_tree(source, output, extraction_root):
         for path in files:
             archive.write(path, path.relative_to(extraction_root).as_posix())
 
+
+bomb_extract_root = Path("bomb-extract")
+bomb_extract_root.mkdir()
+try:
+    repack_tree("compressed-bomb.docx", "bomb-output.docx", bomb_extract_root)
+    edit_bomb_rejected_before_extract = False
+except ValueError as error:
+    edit_bomb_rejected_before_extract = (
+        str(error) == "suspicious compression ratio: word/document.xml"
+        and
+        not any(bomb_extract_root.iterdir()) and not Path("bomb-output.docx").exists()
+    )
+check("Tier 2 edit rejects an archive bomb before extracting any member",
+      edit_bomb_rejected_before_extract)
+check("Tier 2 pre-extract bounds remain active under optimized Python",
+      __debug__ or edit_bomb_rejected_before_extract)
+
+with zipfile.ZipFile("malformed-for-repair.docx", "w", zipfile.ZIP_STORED) as archive:
+    archive.writestr("[Content_Types].xml", "<Types/>")
+    archive.writestr("word/document.xml", "<w:document")
+with TemporaryDirectory(prefix="docx-malformed-repair-") as scratch:
+    malformed_root = Path(scratch)
+    repack_tree("malformed-for-repair.docx", "malformed-repacked.docx", malformed_root)
+    malformed_extracted = (malformed_root / "word" / "document.xml").is_file()
+check("archive bounds allow Tier 2 to extract bounded malformed XML for repair",
+      malformed_extracted)
 
 reused_root = Path("reused-docx-work")
 reused_root.mkdir()

@@ -58,6 +58,7 @@ file is not.
 
 ```python
 import os
+import fitz
 import pypdf
 
 output_path = "output.pdf"
@@ -82,16 +83,73 @@ require(
     page_count == expected_page_count,
     f"expected {expected_page_count} pages, got {page_count}",
 )
+render_doc = fitz.open(output_path)
+if render_doc.needs_pass and render_doc.authenticate("") <= 0:
+    if not password:
+        raise RuntimeError("set PDF_PASSWORD so encrypted widgets can be rendered")
+    if render_doc.authenticate(password) <= 0:
+        raise RuntimeError("PDF_PASSWORD could not decrypt the output for widget rendering")
 page_texts = {
     number: (page.extract_text() or "").strip()
     for number, page in enumerate(r.pages, start=1)
 }
 
-def widget_count(page):
-    # Interactive-only pages (pure AcroForm screens) extract no text yet are valid output.
+def normalized_box(box):
+    x0, y0, x1, y1 = (float(value) for value in box)
+    left, right = sorted((x0, x1))
+    bottom, top = sorted((y0, y1))
+    return left, bottom, right, top
+
+def normalized_size(box):
+    left, bottom, right, top = normalized_box(box)
+    return right - left, top - bottom
+
+def widget_count(page, rendered_page):
+    # Interactive-only pages can be valid, but hidden metadata widgets are not visible content.
+    non_viewable_flags = 1 | 2 | 32  # Invisible, Hidden, NoView annotation flags
     count = 0
     for ref in page.get("/Annots") or []:
-        if ref.get_object().get("/Subtype") == "/Widget":
+        widget = ref.get_object()
+        if widget.get("/Subtype") != "/Widget":
+            continue
+        flags = int(widget.get("/F", 0))
+        rectangle = widget.get("/Rect")
+        if flags & non_viewable_flags or rectangle is None:
+            continue
+        left, bottom, right, top = normalized_box(rectangle)
+        crop_left, crop_bottom, crop_right, crop_top = normalized_box(page.cropbox)
+        media_left, media_bottom, media_right, media_top = normalized_box(page.mediabox)
+        visible_left = max(crop_left, media_left)
+        visible_bottom = max(crop_bottom, media_bottom)
+        visible_right = min(crop_right, media_right)
+        visible_top = min(crop_top, media_top)
+        intersects_visible_page = (
+            min(right, visible_right) > max(left, visible_left)
+            and min(top, visible_top) > max(bottom, visible_bottom)
+        )
+        if right <= left or top <= bottom or not intersects_visible_page:
+            continue
+        # Do not require /AP: viewers may synthesize it from field defaults. Instead,
+        # render annotations on and off and require this widget region to change visibly.
+        xref = getattr(ref, "idnum", None)
+        if xref is None:
+            continue
+        try:
+            rendered_widget = rendered_page.load_widget(xref)
+            clip = (
+                rendered_widget.rect * rendered_page.rotation_matrix
+            ) & rendered_page.rect
+            if clip.is_empty:
+                continue
+            with_widget = rendered_page.get_pixmap(
+                matrix=fitz.Matrix(2, 2), clip=clip, alpha=False, annots=True,
+            )
+            without_widgets = rendered_page.get_pixmap(
+                matrix=fitz.Matrix(2, 2), clip=clip, alpha=False, annots=False,
+            )
+        except (RuntimeError, ValueError):
+            continue
+        if with_widget.samples != without_widgets.samples:
             count += 1
     return count
 
@@ -100,7 +158,7 @@ missing_text_pages = [
     number for number, text in page_texts.items()
     if number not in intentionally_raster_only_pages
     and not text
-    and widget_count(r.pages[number - 1]) == 0
+    and widget_count(r.pages[number - 1], render_doc[number - 1]) == 0
 ]
 require(not missing_text_pages, f"pages without extractable text: {missing_text_pages}")
 # Add task-specific checks when exact copy matters, for example
@@ -114,8 +172,7 @@ for page_number, expected_strings in expected_strings_by_page.items():
 expected_page_size = (595.2756, 841.8898)  # replace for Letter or a task-specific size
 page_size_tolerance = 0.5
 page_sizes = [
-    (float(page.mediabox.width), float(page.mediabox.height))
-    for page in r.pages
+    normalized_size(page.mediabox) for page in r.pages
 ]
 size_mismatches = [
     (number, actual)
@@ -129,20 +186,14 @@ require(not size_mismatches, f"unexpected page sizes: {size_mismatches}")
 # past the page box are clipped even though every check above still passes. Plain
 # text extraction silently drops fully off-page text, so use an enlarged clip for
 # text and inspect the placement boxes reported for every image and drawing.
-import fitz
-
-overflow_doc = fitz.open(output_path)
-if overflow_doc.needs_pass and overflow_doc.authenticate("") <= 0:
-    if not password:
-        raise RuntimeError("set PDF_PASSWORD so the encrypted output can be overflow-checked")
-    if overflow_doc.authenticate(password) <= 0:
-        raise RuntimeError("PDF_PASSWORD could not decrypt the output for overflow checking")
+overflow_doc = render_doc
 overflow_pages = []
 for page in overflow_doc:
     # These APIs report unrotated coordinates even when /Rotate is 90/270;
     # page.rect uses rotated dimensions. Compare against an unrotated crop-box
     # extent so valid high-y portrait content is not flagged on a rotated page.
-    page_box = fitz.Rect(0, 0, page.cropbox.width, page.cropbox.height)
+    crop_left, crop_bottom, crop_right, crop_top = normalized_box(page.cropbox)
+    page_box = fitz.Rect(0, 0, crop_right - crop_left, crop_top - crop_bottom)
     clip = fitz.Rect(
         page_box.x0 - 2000, page_box.y0 - 2000,
         page_box.x1 + 2000, page_box.y1 + 2000,

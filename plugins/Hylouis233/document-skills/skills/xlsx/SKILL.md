@@ -101,18 +101,19 @@ if any(expected_formulas.values()):
     )
 for ws in wb.worksheets:
     print(f"{ws.title} dims:", ws.dimensions)
-    formulas = [
-        (c.coordinate, formula_text(c.value))
-        for row in ws.iter_rows() for c in row if c.data_type == "f"
-    ]
-    print(f"{ws.title} formula cells:", formulas[:10])
-    actual_formulas = dict(formulas)
+    # `expected_formulas` is the task contract, so verify those coordinates directly.
+    # Never call unbounded iter_rows(): one styled extreme cell can make the rectangle huge.
+    actual_formulas = {}
     for coordinate, expected_formula in expected_formulas.get(ws.title, {}).items():
+        cell = ws[coordinate]
+        actual_formula = formula_text(cell.value) if cell.data_type == "f" else None
+        actual_formulas[coordinate] = actual_formula
         require(
-            actual_formulas.get(coordinate) == expected_formula,
+            actual_formula == expected_formula,
             f"{ws.title}!{coordinate}: expected formula {expected_formula!r}, "
-            f"got {actual_formulas.get(coordinate)!r}",
+            f"got {actual_formula!r}",
         )
+    print(f"{ws.title} expected formula cells:", list(actual_formulas.items())[:10])
     for coordinate, expected_format in expected_number_formats.get(ws.title, {}).items():
         actual_format = ws[coordinate].number_format
         require(actual_format == expected_format, (

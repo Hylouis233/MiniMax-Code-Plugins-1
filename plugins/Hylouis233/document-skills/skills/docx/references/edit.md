@@ -122,26 +122,78 @@ For field codes, sectPr surgery, tracked changes, or parts python-docx does not 
 Rules that keep the archive valid:
 
 1. Operate on a **copy** of the file.
-2. Extract into a **new empty temporary directory for every input**. Never reuse a fixed `work/`
-   directory: members absent from the next DOCX would remain there and be repacked as stale or
-   confidential content.
+2. Run the bounded package validator below **before extracting anything**, then extract into a
+   **new empty temporary directory for every input**. Never reuse a fixed `work/` directory:
+   members absent from the next DOCX would remain there and be repacked as stale or confidential
+   content.
 3. Parse XML with `lxml`/`xml.etree` - never string replace. Text lives in `w:t` inside runs
    (`w:r`) inside paragraphs (`w:p`); a logical sentence can span several runs.
 4. Repack with `[Content_Types].xml` first and stored/deflated entries only:
 
 ```python
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from zipfile import ZIP_DEFLATED, ZipFile
+from lxml import etree
+
+MAX_ARCHIVE_BYTES = 200 * 1024 * 1024
+MAX_MEMBERS = 10_000
+MAX_XML_PART = 20 * 1024 * 1024
+MAX_ENTRY = 100 * 1024 * 1024
+MAX_TOTAL_UNCOMPRESSED = 500 * 1024 * 1024
+MAX_COMPRESSION_RATIO = 200
+
+def require(condition, message):
+    if not condition:                       # remains active under python -O
+        raise ValueError(message)
+
+safe_xml_parser = etree.XMLParser(
+    load_dtd=False, resolve_entities=False, no_network=True,
+    huge_tree=False, recover=False,
+)
+
+def validate_docx_archive(archive):
+    """Enforce archive bounds and CRC before this same handle is extracted."""
+    require(os.fstat(archive.fp.fileno()).st_size <= MAX_ARCHIVE_BYTES,
+            "compressed DOCX file size above limit")
+    infos = archive.infolist()
+    require(len(infos) <= MAX_MEMBERS, "archive member count above limit")
+    names = {info.filename for info in infos}
+    require(len(names) == len(infos), "duplicate archive member names are unsafe")
+    require("[Content_Types].xml" in names and "word/document.xml" in names,
+            "required DOCX package parts are missing")
+    require(sum(info.file_size for info in infos) <= MAX_TOTAL_UNCOMPRESSED,
+            "declared archive size exceeds the edit limit")
+    actual_total = 0
+    for info in infos:
+        require(info.file_size <= MAX_ENTRY, f"oversized part: {info.filename}")
+        require(
+            info.file_size / max(info.compress_size, 1) <= MAX_COMPRESSION_RATIO,
+            f"suspicious compression ratio: {info.filename}",
+        )
+        if info.filename.endswith((".xml", ".rels")):
+            require(info.file_size <= MAX_XML_PART, f"oversized XML part: {info.filename}")
+        actual_size = 0
+        with archive.open(info) as stream:  # streams data and verifies its CRC
+            while chunk := stream.read(64 * 1024):
+                actual_size += len(chunk)
+                actual_total += len(chunk)
+                require(actual_size <= MAX_ENTRY, f"part exceeded read limit: {info.filename}")
+                require(actual_total <= MAX_TOTAL_UNCOMPRESSED,
+                        "archive exceeded total read limit")
+        require(actual_size == info.file_size, f"size mismatch: {info.filename}")
 
 input_path = Path("input.docx")
 output_path = Path("output.docx").resolve()  # keep output outside the temporary tree
 with TemporaryDirectory(prefix="docx-edit-") as scratch:
     src = Path(scratch)
     with ZipFile(input_path) as archive:
+        validate_docx_archive(archive)         # same open handle; prevents validate/extract swap
         archive.extractall(src)
 
-    # Apply the required XML edits under `src` here, using an XML parser.
+    # Apply the required XML edits under `src` here with `safe_xml_parser`.
+    # Archive bounds are a safety gate, not a semantic XML-validity gate: Tier 2 may repair XML.
     content_types = src / "[Content_Types].xml"
     if not content_types.is_file():
         raise FileNotFoundError(content_types)

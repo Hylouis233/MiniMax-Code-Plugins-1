@@ -231,27 +231,194 @@ check("widget-only form page exposes a widget", len(widgets) == 1, len(widgets))
 check("widget-aware blank-page predicate keeps form page", not blank)
 
 # ---- SKILL.md postcheck: interactive-only pages are exempt from the text gate ---
-def widget_count(page):
+def normalized_box(box):
+    x0, y0, x1, y1 = (float(value) for value in box)
+    left, right = sorted((x0, x1))
+    bottom, top = sorted((y0, y1))
+    return left, bottom, right, top
+
+
+def normalized_size(box):
+    left, bottom, right, top = normalized_box(box)
+    return right - left, top - bottom
+
+
+def widget_count(page, rendered_page):
+    non_viewable_flags = 1 | 2 | 32
     count = 0
     for ref in page.get("/Annots") or []:
-        if ref.get_object().get("/Subtype") == "/Widget":
+        widget = ref.get_object()
+        if widget.get("/Subtype") != "/Widget":
+            continue
+        flags = int(widget.get("/F", 0))
+        rectangle = widget.get("/Rect")
+        if flags & non_viewable_flags or rectangle is None:
+            continue
+        left, bottom, right, top = normalized_box(rectangle)
+        crop_left, crop_bottom, crop_right, crop_top = normalized_box(page.cropbox)
+        media_left, media_bottom, media_right, media_top = normalized_box(page.mediabox)
+        visible_left = max(crop_left, media_left)
+        visible_bottom = max(crop_bottom, media_bottom)
+        visible_right = min(crop_right, media_right)
+        visible_top = min(crop_top, media_top)
+        intersects_visible_page = (
+            min(right, visible_right) > max(left, visible_left)
+            and min(top, visible_top) > max(bottom, visible_bottom)
+        )
+        if right <= left or top <= bottom or not intersects_visible_page:
+            continue
+        xref = getattr(ref, "idnum", None)
+        if xref is None:
+            continue
+        try:
+            rendered_widget = rendered_page.load_widget(xref)
+            clip = (
+                rendered_widget.rect * rendered_page.rotation_matrix
+            ) & rendered_page.rect
+            if clip.is_empty:
+                continue
+            with_widget = rendered_page.get_pixmap(
+                matrix=fitz.Matrix(2, 2), clip=clip, alpha=False, annots=True,
+            )
+            without_widgets = rendered_page.get_pixmap(
+                matrix=fitz.Matrix(2, 2), clip=clip, alpha=False, annots=False,
+            )
+        except (RuntimeError, ValueError):
+            continue
+        if with_widget.samples != without_widgets.samples:
             count += 1
     return count
 
 widget_postcheck = pypdf.PdfReader("widget-only.pdf")
+widget_render = fitz.open("widget-only.pdf")
 widget_text = (widget_postcheck.pages[0].extract_text() or "").strip()
 check("widget-only page extracts no text", widget_text == "", repr(widget_text))
-check("postcheck counts the widget annotation", widget_count(widget_postcheck.pages[0]) == 1)
+check("postcheck counts the visibly rendered widget annotation",
+      widget_count(widget_postcheck.pages[0], widget_render[0]) == 1)
 check("widget-only page passes the text postcheck via the widget exemption",
-      bool(widget_text) or widget_count(widget_postcheck.pages[0]) > 0)
+      bool(widget_text) or widget_count(widget_postcheck.pages[0], widget_render[0]) > 0)
+
+from pypdf.generic import ArrayObject, FloatObject, NameObject, NumberObject
+
+for label, flag in (("invisible", 1), ("hidden", 2), ("no-view", 32)):
+    hidden_writer = pypdf.PdfWriter()
+    hidden_writer.append(widget_postcheck)
+    hidden_widget = hidden_writer.pages[0]["/Annots"][0].get_object()
+    hidden_widget[NameObject("/F")] = NumberObject(flag)
+    hidden_path = f"widget-{label}.pdf"
+    with open(hidden_path, "wb") as output:
+        hidden_writer.write(output)
+    hidden_page = pypdf.PdfReader(hidden_path).pages[0]
+    hidden_render = fitz.open(hidden_path)
+    check(f"{label} widget does not exempt an otherwise blank page",
+          widget_count(hidden_page, hidden_render[0]) == 0
+          and not bool((hidden_page.extract_text() or "").strip()))
+
+appearance_writer = pypdf.PdfWriter()
+appearance_writer.append(widget_postcheck)
+appearance_widget = appearance_writer.pages[0]["/Annots"][0].get_object()
+del appearance_widget[NameObject("/AP")]
+with open("widget-no-appearance.pdf", "wb") as output:
+    appearance_writer.write(output)
+appearance_page = pypdf.PdfReader("widget-no-appearance.pdf").pages[0]
+appearance_render = fitz.open("widget-no-appearance.pdf")
+check("visible widget without /AP can still be viewer-generated and render visibly",
+      widget_count(appearance_page, appearance_render[0]) == 1)
+
+blank_appearance_writer = pypdf.PdfWriter()
+blank_appearance_writer.append(widget_postcheck)
+blank_appearance_widget = blank_appearance_writer.pages[0]["/Annots"][0].get_object()
+for key in ("/AP", "/MK", "/BS", "/DA", "/V", "/DV"):
+    blank_appearance_widget.pop(NameObject(key), None)
+blank_acroform = blank_appearance_writer._root_object["/AcroForm"].get_object()
+for key in ("/DA", "/DR", "/NeedAppearances"):
+    blank_acroform.pop(NameObject(key), None)
+with open("widget-blank-appearance.pdf", "wb") as output:
+    blank_appearance_writer.write(output)
+blank_appearance_page = pypdf.PdfReader("widget-blank-appearance.pdf").pages[0]
+blank_appearance_render = fitz.open("widget-blank-appearance.pdf")
+check("widget with no renderable appearance does not exempt a white page",
+      widget_count(blank_appearance_page, blank_appearance_render[0]) == 0
+      and not any(value != 255 for value in
+                  blank_appearance_render[0].get_pixmap(alpha=False).samples))
+
+for label, rectangle in (
+    ("zero-area", [72, 740, 72, 760]),
+    ("off-page", [1000, 1000, 1100, 1100]),
+):
+    geometry_writer = pypdf.PdfWriter()
+    geometry_writer.append(widget_postcheck)
+    geometry_widget = geometry_writer.pages[0]["/Annots"][0].get_object()
+    geometry_widget[NameObject("/Rect")] = ArrayObject([
+        FloatObject(value) for value in rectangle
+    ])
+    geometry_path = f"widget-{label}.pdf"
+    with open(geometry_path, "wb") as output:
+        geometry_writer.write(output)
+    geometry_page = pypdf.PdfReader(geometry_path).pages[0]
+    geometry_render = fitz.open(geometry_path)
+    check(f"{label} widget does not exempt an otherwise blank page",
+          widget_count(geometry_page, geometry_render[0]) == 0)
+
+reversed_writer = pypdf.PdfWriter()
+reversed_writer.append(widget_postcheck)
+reversed_page = reversed_writer.pages[0]
+reversed_widget = reversed_page["/Annots"][0].get_object()
+reversed_widget[NameObject("/Rect")] = ArrayObject([
+    FloatObject(332), FloatObject(760), FloatObject(72), FloatObject(740),
+])
+with open("widget-reversed-rect.pdf", "wb") as output:
+    reversed_writer.write(output)
+reversed_reader_page = pypdf.PdfReader("widget-reversed-rect.pdf").pages[0]
+reversed_render = fitz.open("widget-reversed-rect.pdf")
+check("legal reversed widget rectangle is normalized and remains visible",
+      widget_count(reversed_reader_page, reversed_render[0]) == 1)
+
+reversed_boxes_writer = pypdf.PdfWriter()
+reversed_boxes_writer.append(widget_postcheck)
+reversed_boxes_page = reversed_boxes_writer.pages[0]
+reversed_page_box = ArrayObject([
+    FloatObject(A4[0]), FloatObject(A4[1]), FloatObject(0), FloatObject(0),
+])
+reversed_boxes_page[NameObject("/MediaBox")] = reversed_page_box
+reversed_boxes_page[NameObject("/CropBox")] = ArrayObject(reversed_page_box)
+with open("widget-reversed-page-boxes.pdf", "wb") as output:
+    reversed_boxes_writer.write(output)
+reversed_boxes_reader_page = pypdf.PdfReader("widget-reversed-page-boxes.pdf").pages[0]
+reversed_boxes_render = fitz.open("widget-reversed-page-boxes.pdf")
+check("legal reversed page boxes are normalized before widget intersection",
+      widget_count(reversed_boxes_reader_page, reversed_boxes_render[0]) == 1
+      and all(
+          abs(actual - expected) < A4_TOLERANCE
+          for actual, expected in zip(
+              normalized_size(reversed_boxes_reader_page.mediabox), A4,
+          )
+      ))
+
+rotated_widget_writer = pypdf.PdfWriter()
+rotated_widget_writer.append(widget_postcheck)
+rotated_widget_page = rotated_widget_writer.pages[0]
+rotated_widget_page.rotate(90)
+rotated_widget = rotated_widget_page["/Annots"][0].get_object()
+rotated_widget[NameObject("/Rect")] = ArrayObject([
+    FloatObject(72), FloatObject(72), FloatObject(332), FloatObject(92),
+])
+with open("widget-rotated.pdf", "wb") as output:
+    rotated_widget_writer.write(output)
+rotated_widget_reader_page = pypdf.PdfReader("widget-rotated.pdf").pages[0]
+rotated_widget_render = fitz.open("widget-rotated.pdf")
+check("visible widget on a rotated page is clipped in rotated coordinates",
+      widget_count(rotated_widget_reader_page, rotated_widget_render[0]) == 1)
 
 blank_writer = pypdf.PdfWriter()
 blank_writer.add_blank_page(width=200, height=300)
 with open("blank.pdf", "wb") as f:
     blank_writer.write(f)
 blank_r = pypdf.PdfReader("blank.pdf")
+blank_render = fitz.open("blank.pdf")
 check("a truly blank page still fails the text postcheck",
-      not (bool((blank_r.pages[0].extract_text() or "").strip()) or widget_count(blank_r.pages[0]) > 0))
+      not (bool((blank_r.pages[0].extract_text() or "").strip())
+           or widget_count(blank_r.pages[0], blank_render[0]) > 0))
 
 # ---- transform.md AcroForm snippet: clone into writer, fill on writer pages ----
 from pypdf import PdfReader, PdfWriter
@@ -978,7 +1145,8 @@ def overflow_pages(path, password=None):
     pages = []
     for page in doc:
         # Plain block extraction drops fully off-page text; enlarge the clip.
-        page_box = fitz.Rect(0, 0, page.cropbox.width, page.cropbox.height)
+        crop_left, crop_bottom, crop_right, crop_top = normalized_box(page.cropbox)
+        page_box = fitz.Rect(0, 0, crop_right - crop_left, crop_top - crop_bottom)
         clip = fitz.Rect(
             page_box.x0 - 2000, page_box.y0 - 2000,
             page_box.x1 + 2000, page_box.y1 + 2000,
@@ -1003,6 +1171,8 @@ def overflow_pages(path, password=None):
 check("in-bounds PDF reports no overflow pages", overflow_pages("overflow.pdf") == [])
 check("blank-user-password encrypted PDF passes the independent overflow check",
       overflow_pages("blank-user-password.pdf") == [])
+check("reversed page boxes remain valid through the overflow postcheck",
+      overflow_pages("widget-reversed-page-boxes.pdf") == [])
 check("off-page text is detected by the overflow check (negative control)",
       overflow_pages("overflow-bad.pdf") == [1])
 check("in-bounds image and vector drawing pass the overflow check",

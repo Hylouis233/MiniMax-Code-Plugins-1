@@ -418,23 +418,48 @@ def cached_category_labels(plot):
     return [[str(level) for level in label] for label in plot.categories.flattened_labels]
 
 
+def series_name_content(series):
+    titles = series._element.xpath("./c:tx")
+    if not titles:
+        return {"name": ""}
+    literal = titles[0].find(qn("c:v"))
+    if literal is not None:
+        return {"name": literal.text or ""}
+    reference = titles[0].find(qn("c:strRef"))
+    if reference is None:
+        return {"name": None, "name_cache_status": "unavailable"}
+    cache = reference.find(qn("c:strCache"))
+    if cache is None:
+        return {"name": None, "name_cache_status": "unavailable"}
+    point_count = cache.find(qn("c:ptCount"))
+    points = cache.findall(qn("c:pt"))
+    if (point_count is None or point_count.get("val") != "1"
+            or len(points) != 1 or points[0].get("idx") != "0"):
+        return {"name": None, "name_cache_status": "unavailable"}
+    value = points[0].find(qn("c:v"))
+    if value is None:
+        return {"name": None, "name_cache_status": "unavailable"}
+    return {"name": value.text or ""}
+
+
 def series_content(series):
+    name_content = series_name_content(series)
     x_source = getattr(series._element, "xVal", None)
     if x_source is None:
         value_source = getattr(series._element, "val", None)
         if cached_numeric_points(value_source) is None:
-            return {"name": series.name, "values": None, "cache_status": "unavailable"}
-        return {"name": series.name, "values": list(series.values)}
+            return {**name_content, "values": None, "cache_status": "unavailable"}
+        return {**name_content, "values": list(series.values)}
     x_points = cached_numeric_points(x_source)
     y_points = cached_numeric_points(getattr(series._element, "yVal", None))
     if x_points is None or y_points is None:
-        return {"name": series.name, "points": None, "cache_status": "unavailable"}
-    content = {"name": series.name, "x_points": x_points, "y_points": y_points}
+        return {**name_content, "points": None, "cache_status": "unavailable"}
+    content = {**name_content, "x_points": x_points, "y_points": y_points}
     size_source = getattr(series._element, "bubbleSize", None)
     if size_source is not None:
         bubble_points = cached_numeric_points(size_source)
         if bubble_points is None:
-            return {"name": series.name, "points": None, "cache_status": "unavailable"}
+            return {**name_content, "points": None, "cache_status": "unavailable"}
         content["bubble_points"] = bubble_points
     return content
 
@@ -563,6 +588,89 @@ category_slide.shapes.add_chart(
     Inches(0.5), Inches(0.5), Inches(6), Inches(4), category_data,
 )
 category_prs.save("category-cache-source.pptx")
+
+series_name_mutated = Presentation("category-cache-source.pptx")
+series_name_chart = next(
+    shape.chart for shape in series_name_mutated.slides[0].shapes if shape.has_chart
+)
+series_name_ref = list(series_name_chart.plots[0].series)[0]._element.xpath(
+    "./c:tx/c:strRef"
+)[0]
+series_name_formula = series_name_ref.find(qn("c:f")).text
+series_name_ref.remove(series_name_ref.find(qn("c:strCache")))
+series_name_mutated.save("series-name-cacheless.pptx")
+series_name_reopened = Presentation("series-name-cacheless.pptx")
+series_name_chart = next(
+    shape.chart for shape in series_name_reopened.slides[0].shapes if shape.has_chart
+)
+series_name_series = list(series_name_chart.plots[0].series)[0]
+series_name_result = series_content(series_name_series)
+check("cacheless series title retains its worksheet formula",
+      series_name_series._element.xpath("./c:tx/c:strRef/c:f")[0].text
+      == series_name_formula)
+check("cacheless series title is unavailable without aborting value inventory",
+      series_name_result == {
+          "name": None, "name_cache_status": "unavailable", "values": [1.0, 2.0],
+      }, series_name_result)
+series_name_inventory = extract_slide_content(series_name_reopened.slides[0])
+series_name_inventory_items = series_name_inventory["charts"][0]["plots"][0]["series"]
+check("deck inventory continues through cached siblings after an unavailable series title",
+      series_name_inventory_items[0] == series_name_result
+      and series_name_inventory_items[1]
+      == {"name": "Cached series", "values": [3.0, 4.0]},
+      series_name_inventory_items)
+
+
+class RaisingNameSeries:
+    def __init__(self, element, values):
+        self._element = element
+        self.values = values
+
+    @property
+    def name(self):
+        raise RuntimeError("series.name must not be accessed")
+
+
+raising_name_result = series_content(RaisingNameSeries(
+    series_name_series._element, list(series_name_series.values),
+))
+check("cacheless name path never touches the python-pptx name property",
+      raising_name_result == series_name_result, raising_name_result)
+
+source_name_series = list(series_name_chart.plots[0].series)[1]
+malformed_name_element = copy.deepcopy(source_name_series._element)
+malformed_cache = malformed_name_element.find(qn("c:tx")).find(
+    qn("c:strRef")
+).find(qn("c:strCache"))
+for point in malformed_cache.findall(qn("c:pt")):
+    malformed_cache.remove(point)
+malformed_name_result = series_content(RaisingNameSeries(
+    malformed_name_element, list(source_name_series.values),
+))
+check("incomplete series-name cache is unavailable while values remain readable",
+      malformed_name_result == {
+          "name": None, "name_cache_status": "unavailable", "values": [3.0, 4.0],
+      }, malformed_name_result)
+
+literal_name_element = copy.deepcopy(source_name_series._element)
+literal_tx = literal_name_element.find(qn("c:tx"))
+literal_tx.remove(literal_tx.find(qn("c:strRef")))
+literal_value = OxmlElement("c:v")
+literal_value.text = "Literal series"
+literal_tx.append(literal_value)
+literal_name_result = series_content(RaisingNameSeries(
+    literal_name_element, list(source_name_series.values),
+))
+check("literal series title is read directly without the name property",
+      literal_name_result["name"] == "Literal series", literal_name_result)
+
+untitled_element = copy.deepcopy(source_name_series._element)
+untitled_element.remove(untitled_element.find(qn("c:tx")))
+untitled_result = series_content(RaisingNameSeries(
+    untitled_element, list(source_name_series.values),
+))
+check("series without a title remains a readable unnamed series",
+      untitled_result["name"] == "", untitled_result)
 
 category_mutated = Presentation("category-cache-source.pptx")
 category_chart = next(

@@ -75,23 +75,48 @@ def cached_category_labels(plot):
         return None
     return [[str(level) for level in label] for label in plot.categories.flattened_labels]
 
+def series_name_content(series):
+    """Return a cached/literal title, or mark a worksheet-backed title unavailable."""
+    titles = series._element.xpath("./c:tx")
+    if not titles:
+        return {"name": ""}
+    literal = titles[0].find(qn("c:v"))
+    if literal is not None:
+        return {"name": literal.text or ""}
+    reference = titles[0].find(qn("c:strRef"))
+    if reference is None:
+        return {"name": None, "name_cache_status": "unavailable"}
+    cache = reference.find(qn("c:strCache"))
+    if cache is None:
+        return {"name": None, "name_cache_status": "unavailable"}
+    point_count = cache.find(qn("c:ptCount"))
+    points = cache.findall(qn("c:pt"))
+    if (point_count is None or point_count.get("val") != "1"
+            or len(points) != 1 or points[0].get("idx") != "0"):
+        return {"name": None, "name_cache_status": "unavailable"}
+    value = points[0].find(qn("c:v"))
+    if value is None:
+        return {"name": None, "name_cache_status": "unavailable"}
+    return {"name": value.text or ""}
+
 def series_content(series):
+    name_content = series_name_content(series)
     x_source = getattr(series._element, "xVal", None)
     if x_source is None:                    # category/value chart
         value_source = getattr(series._element, "val", None)
         if cached_numeric_points(value_source) is None:
-            return {"name": series.name, "values": None, "cache_status": "unavailable"}
-        return {"name": series.name, "values": list(series.values)}
+            return {**name_content, "values": None, "cache_status": "unavailable"}
+        return {**name_content, "values": list(series.values)}
     x_points = cached_numeric_points(x_source)
     y_points = cached_numeric_points(getattr(series._element, "yVal", None))
     if x_points is None or y_points is None:
-        return {"name": series.name, "points": None, "cache_status": "unavailable"}
-    content = {"name": series.name, "x_points": x_points, "y_points": y_points}
+        return {**name_content, "points": None, "cache_status": "unavailable"}
+    content = {**name_content, "x_points": x_points, "y_points": y_points}
     size_source = getattr(series._element, "bubbleSize", None)
     if size_source is not None:
         bubble_points = cached_numeric_points(size_source)
         if bubble_points is None:
-            return {"name": series.name, "points": None, "cache_status": "unavailable"}
+            return {**name_content, "points": None, "cache_status": "unavailable"}
         content["bubble_points"] = bubble_points
     return content
 

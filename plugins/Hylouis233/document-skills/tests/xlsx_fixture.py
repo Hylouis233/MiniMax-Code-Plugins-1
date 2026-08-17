@@ -1053,6 +1053,44 @@ check("reloaded formula cell still holds the formula string",
       calc_reopened.active["A3"].value == "=SUM(A1:A2)", calc_reopened.active["A3"].value)
 calc_reopened.close()
 
+# ---- SKILL.md postcheck: formula inventory stays sparse at worksheet limits ----
+formula_bound_wb = openpyxl.Workbook()
+formula_bound_ws = formula_bound_wb.active
+formula_bound_ws["D2"] = "=1+1"
+formula_bound_ws["XFD1048576"].number_format = "0.00"  # styled but empty extreme cell
+formula_bound_wb.save("formula-bound.xlsx")
+formula_bound_reopened = openpyxl.load_workbook("formula-bound.xlsx", data_only=False)
+formula_bound_ws = formula_bound_reopened.active
+
+
+def expected_formula_inventory(sheet, expected):
+    actual = {}
+    for coordinate, expected_formula in expected.items():
+        cell = sheet[coordinate]
+        actual_formula = formula_text(cell.value) if cell.data_type == "f" else None
+        if actual_formula != expected_formula:
+            raise ValueError(
+                f"{coordinate}: expected {expected_formula!r}, got {actual_formula!r}"
+            )
+        actual[coordinate] = actual_formula
+    return actual
+
+
+check("extreme styled cell inflates the rectangular worksheet bounds (negative control)",
+      formula_bound_ws.max_row == 1_048_576 and formula_bound_ws.max_column == 16_384,
+      (formula_bound_ws.max_row, formula_bound_ws.max_column))
+original_iter_rows = formula_bound_ws.iter_rows
+formula_bound_ws.iter_rows = lambda *args, **kwargs: (_ for _ in ()).throw(
+    RuntimeError("unbounded iter_rows must not run")
+)
+try:
+    bounded_formulas = expected_formula_inventory(formula_bound_ws, {"D2": "=1+1"})
+finally:
+    formula_bound_ws.iter_rows = original_iter_rows
+check("formula postcheck uses bounded public coordinate lookups",
+      bounded_formulas == {"D2": "=1+1"}, bounded_formulas)
+formula_bound_reopened.close()
+
 
 # ---- edit.md snippet: extension detection is prefix-independent ------------------
 X14_URI = b"http://schemas.microsoft.com/office/spreadsheetml/2009/9/main"
