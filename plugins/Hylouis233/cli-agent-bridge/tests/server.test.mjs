@@ -18,7 +18,8 @@ import {
   trustedGitExecutable,
 } from "../git-executable.mjs";
 import {
-  backendConfigurationReaderEnvironment, backendEntryFromProbe, backendGitProvenanceEnvironment,
+  backendConfigurationControlEnvironment, backendConfigurationReaderEnvironment,
+  backendEntryFromProbe, backendGitProvenanceEnvironment,
   closestExistingBase, committedDelta,
   gitCommonDirectory, gitWorktreeRoot, loadBackends, markWorkspaceQuarantined,
   populateCommitishCache, readBackendGitProvenance, readWorkspaceQuarantine, runCommand, runGitCommand,
@@ -1247,7 +1248,7 @@ test("explicit backend configuration overrides fail closed atomically", async (c
   }
 });
 
-test("backend configuration helper control environment excludes inherited injection", () => {
+test("backend configuration helper control environment excludes inherited injection", async () => {
   const env = backendConfigurationReaderEnvironment({
     SystemRoot: "C:\\Windows",
     PATH: "trusted-path",
@@ -1263,9 +1264,90 @@ test("backend configuration helper control environment excludes inherited inject
   assert.deepEqual(env, {
     LANG: "C.UTF-8",
     LC_ALL: "C.UTF-8",
-    ...(process.platform === "win32" ? { PATHEXT: ".COM;.EXE;.BAT;.CMD" } : {}),
+    ...(process.platform === "win32" ? {
+      PATHEXT: ".COM;.EXE;.BAT;.CMD",
+      PATH: "",
+      PSModulePath: "",
+      HOMEDRIVE: "",
+      HOMEPATH: "",
+      LOGONSERVER: "",
+      SYSTEMDRIVE: "",
+      USERDOMAIN: "",
+      USERNAME: "",
+      USERPROFILE: "",
+    } : {}),
     SystemRoot: "C:\\Windows",
   });
+  if (process.platform === "win32") {
+    const result = await runCommand(process.execPath, [
+      "-e", "process.stdout.write(JSON.stringify(process.env))",
+    ], {
+      env: backendConfigurationControlEnvironment({
+        ...process.env,
+        PATH: "C:\\attacker-path",
+        GH_TOKEN: "secret-token",
+        SSH_AUTH_SOCK: "secret-agent",
+        NODE_OPTIONS: "--require=attacker.cjs",
+        PSModulePath: "attacker-modules",
+      }),
+      exactEnvironment: env,
+      forwardExactEnvironment: true,
+      manageProcessTree: true,
+      timeoutMs: 5_000,
+    });
+    assert.equal(result.treeTerminated, true, JSON.stringify(result));
+    assert.equal(result.exitCode, 0, JSON.stringify(result));
+    const actual = JSON.parse(result.stdout);
+    for (const forbidden of [
+      "PATH", "PSMODULEPATH", "USERPROFILE", "USERNAME", "GH_TOKEN", "SSH_AUTH_SOCK",
+      "NODE_OPTIONS", "GIT_DIR",
+    ]) {
+      const actualName = Object.keys(actual).find((name) => name.toUpperCase() === forbidden);
+      assert.equal(actualName === undefined ? "" : actual[actualName], "",
+        forbidden + " leaked a non-empty value into the actual managed helper");
+    }
+  }
+});
+
+test("backend configuration cleanup uncertainty outranks cancellation", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "cli-agent-config-cleanup-test-"));
+  const config = path.join(root, "backends.json");
+  await writeFile(config, JSON.stringify({
+    backends: { fixture: { command: process.execPath, buildArgs: ["<task>"] } },
+  }));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const saved = {
+    nodeEnv: process.env.NODE_ENV,
+    override: process.env.CLI_AGENT_BRIDGE_BACKENDS,
+    stall: process.env.CLI_AGENT_BRIDGE_TEST_BACKEND_CONFIG_READ_STALL_FILE,
+  };
+  process.env.NODE_ENV = "test";
+  process.env.CLI_AGENT_BRIDGE_BACKENDS = config;
+  process.env.CLI_AGENT_BRIDGE_TEST_BACKEND_CONFIG_READ_STALL_FILE = path.join(root, "unused");
+  context.after(() => {
+    if (saved.nodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = saved.nodeEnv;
+    if (saved.override === undefined) delete process.env.CLI_AGENT_BRIDGE_BACKENDS;
+    else process.env.CLI_AGENT_BRIDGE_BACKENDS = saved.override;
+    if (saved.stall === undefined) delete process.env.CLI_AGENT_BRIDGE_TEST_BACKEND_CONFIG_READ_STALL_FILE;
+    else process.env.CLI_AGENT_BRIDGE_TEST_BACKEND_CONFIG_READ_STALL_FILE = saved.stall;
+  });
+  const cancel = testCancellation();
+  await assert.rejects(loadBackends({
+    cancel,
+    commandRunner: async () => {
+      cancel.cancel();
+      return {
+        treeTerminated: false,
+        terminationError: "fixture cleanup uncertainty",
+        timedOut: false,
+        exitCode: 0,
+        stderr: "",
+        stdout: "{}",
+        stdoutTruncated: false,
+      };
+    },
+  }), /cleanup could not be confirmed.*fixture cleanup uncertainty/iu);
 });
 
 test("an unset backend override still loads the bundled configuration", async (context) => {
@@ -1348,6 +1430,18 @@ test("Windows config reader termination closes real named-pipe I/O", {
   const nextConnection = () => queued.length > 0
     ? Promise.resolve(queued.shift())
     : new Promise((resolve) => waiters.push(resolve));
+  const waitForSocketClose = async (socket, label) => {
+    if (!socket.destroyed) {
+      let timer;
+      await Promise.race([
+        new Promise((resolve) => socket.once("close", resolve)),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error(label + " pipe socket stayed open")), 1_500);
+        }),
+      ]).finally(() => clearTimeout(timer));
+    }
+    assert.equal(sockets.has(socket), false, label + " must close the helper's pipe handle");
+  };
   context.after(() => {
     for (const socket of sockets) socket.destroy();
     pipeServer.close();
@@ -1359,27 +1453,48 @@ test("Windows config reader termination closes real named-pipe I/O", {
   const listing = cancelledClient.request("tools/call", {
     name: "list_backends", arguments: {},
   }, 50_201);
-  await nextConnection();
+  const cancelledSocket = await nextConnection();
   const cancelledAt = Date.now();
   cancelledClient.notify("notifications/cancelled", { requestId: 50_201 });
   const cancelled = await listing;
   assert.deepEqual(cancelled.result.structuredContent.backends, []);
   assert.ok(Date.now() - cancelledAt < 1_500,
     "cancelling a named-pipe config read must terminate its managed helper");
+  await waitForSocketClose(cancelledSocket, "cancelled read");
   await cancelledClient.close();
+
+  const deadlineClient = new McpClient(pipePath);
+  await deadlineClient.initialize();
+  context.after(() => { if (deadlineClient.child.exitCode === null) deadlineClient.child.kill(); });
+  const deadlineRequest = deadlineClient.request("tools/call", {
+    name: "delegate_task",
+    arguments: {
+      backend: "codex",
+      task: "must not start",
+      workspacePath: process.cwd(),
+      timeoutMs: 5_000,
+    },
+  }, 50_202);
+  const deadlineSocket = await nextConnection();
+  const deadlineResponse = await deadlineRequest;
+  assert.equal(deadlineResponse.result.structuredContent.timedOut, true,
+    JSON.stringify(deadlineResponse));
+  await waitForSocketClose(deadlineSocket, "deadline read");
+  await deadlineClient.close();
 
   const shutdownClient = new McpClient(pipePath);
   await shutdownClient.initialize();
   context.after(() => { if (shutdownClient.child.exitCode === null) shutdownClient.child.kill(); });
   const pending = shutdownClient.request("tools/call", {
     name: "list_backends", arguments: {},
-  }, 50_202);
+  }, 50_203);
   void pending.catch(() => {});
-  await nextConnection();
+  const shutdownSocket = await nextConnection();
   const shutdownAt = Date.now();
   await shutdownClient.disconnectInput();
   assert.ok(Date.now() - shutdownAt < 3_000,
     "stdin shutdown must kill a helper blocked in real named-pipe readFile I/O");
+  await waitForSocketClose(shutdownSocket, "shutdown read");
 });
 
 test("explicit invalid delegation timeouts are rejected before side effects", async (context) => {

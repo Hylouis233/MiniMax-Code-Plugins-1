@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, execFileSync } from "node:child_process";
-import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -286,7 +286,7 @@ test("a recovery-authorization failure cannot prevent exact owner deletion", asy
   await second.lease.release();
 });
 
-test("double release failure is recoverable only by the same module's exact owner record", async (context) => {
+test("local recovery records remain isolated across stale owner retries", async (context) => {
   const repo = await makeRepo(context);
   const key = "git-worktree:" + repo;
   const first = await tryAcquireGitWorkspaceLock({ cwd: repo, key, heartbeatMs: 60_000 });
@@ -323,7 +323,41 @@ test("double release failure is recoverable only by the same module's exact owne
   const recovered = await tryAcquireGitWorkspaceLock({ cwd: repo, key, heartbeatMs: 60_000 });
   assert.equal(recovered.acquired, true,
     "the same FIFO domain may retry the exact abandoned OID and token");
-  await recovered.lease.release();
+  const recoveredOid = await git(repo, ["rev-parse", recovered.lease.ref]);
+  const recoveredRecoveryRefPath = path.join(
+    gitDirectory, ...workspaceRecoveryRef(recovered.lease.ref, recoveredOid).split("/"),
+  );
+  await mkdir(path.dirname(recoveredRecoveryRefPath), { recursive: true });
+  const recoveredRecoveryBlocker = recoveredRecoveryRefPath + ".lock";
+  context.after(() => rm(recoveredRecoveryBlocker, { force: true }));
+  await writeFile(ownerBlocker, "block replacement exact delete\n");
+  await writeFile(recoveredRecoveryBlocker, "block replacement recovery publication\n");
+  await assert.rejects(
+    recovered.lease.release(),
+    /cannot persist recovery authorization or delete the workspace lock ref/iu,
+  );
+
+  await rm(ownerBlocker, { force: true });
+  await rm(recoveredRecoveryBlocker, { force: true });
+  // Make the store briefly unavailable so the stale first lease cannot read
+  // back the replacement OID after either Git operation fails. Its local
+  // record must not overwrite the replacement owner's separately keyed entry.
+  const unavailableRepo = repo + "-unavailable";
+  await rename(repo, unavailableRepo);
+  await assert.rejects(
+    first.lease.release(),
+    /cannot persist recovery authorization or delete the workspace lock ref/iu,
+  );
+  await rename(unavailableRepo, repo);
+
+  const stillOutside = await otherModule.tryAcquireGitWorkspaceLock({
+    cwd: repo, key, heartbeatMs: 60_000,
+  });
+  assert.deepEqual(stillOutside, { acquired: false, reason: "held" });
+  const third = await tryAcquireGitWorkspaceLock({ cwd: repo, key, heartbeatMs: 60_000 });
+  assert.equal(third.acquired, true,
+    "the current exact local record must survive a stale owner's later failure");
+  await third.lease.release();
 });
 
 test("owner-sharded recovery survives a stale prior holder retry", async (context) => {
@@ -563,6 +597,61 @@ test("post-CAS deadline reconciliation deletes the exact committed owner", async
   delete process.env.CLI_AGENT_BRIDGE_TEST_WORKSPACE_CAS_RESULT_STARTED_FILE;
   delete process.env.CLI_AGENT_BRIDGE_TEST_WORKSPACE_CAS_RESULT_RELEASE_FILE;
   const recovered = await tryAcquireGitWorkspaceLock({ cwd: repo, key, heartbeatMs: 60_000 });
+  assert.equal(recovered.acquired, true);
+  await recovered.lease.release();
+});
+
+test("interrupted state CAS cleanup covers both exact commit outcomes", async (context) => {
+  const repo = await makeRepo(context);
+  const key = "git-worktree:" + repo;
+  const ref = workspaceLockRef(key);
+  const result = await tryAcquireGitWorkspaceLock({ cwd: repo, key, heartbeatMs: 60_000 });
+  assert.equal(result.acquired, true);
+  const previousOid = await git(repo, ["rev-parse", ref]);
+  const startedFile = path.join(path.dirname(repo), "state-cas-result-started");
+  const releaseFile = path.join(path.dirname(repo), "state-cas-result-release");
+  const saved = {
+    nodeEnv: process.env.NODE_ENV,
+    started: process.env.CLI_AGENT_BRIDGE_TEST_WORKSPACE_CAS_RESULT_STARTED_FILE,
+    release: process.env.CLI_AGENT_BRIDGE_TEST_WORKSPACE_CAS_RESULT_RELEASE_FILE,
+    readFailures: process.env.CLI_AGENT_BRIDGE_TEST_WORKSPACE_RELEASE_READBACK_FAILURES,
+  };
+  process.env.NODE_ENV = "test";
+  process.env.CLI_AGENT_BRIDGE_TEST_WORKSPACE_CAS_RESULT_STARTED_FILE = startedFile;
+  process.env.CLI_AGENT_BRIDGE_TEST_WORKSPACE_CAS_RESULT_RELEASE_FILE = releaseFile;
+  context.after(() => {
+    if (saved.nodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = saved.nodeEnv;
+    if (saved.started === undefined) delete process.env.CLI_AGENT_BRIDGE_TEST_WORKSPACE_CAS_RESULT_STARTED_FILE;
+    else process.env.CLI_AGENT_BRIDGE_TEST_WORKSPACE_CAS_RESULT_STARTED_FILE = saved.started;
+    if (saved.release === undefined) delete process.env.CLI_AGENT_BRIDGE_TEST_WORKSPACE_CAS_RESULT_RELEASE_FILE;
+    else process.env.CLI_AGENT_BRIDGE_TEST_WORKSPACE_CAS_RESULT_RELEASE_FILE = saved.release;
+    if (saved.readFailures === undefined) {
+      delete process.env.CLI_AGENT_BRIDGE_TEST_WORKSPACE_RELEASE_READBACK_FAILURES;
+    } else {
+      process.env.CLI_AGENT_BRIDGE_TEST_WORKSPACE_RELEASE_READBACK_FAILURES = saved.readFailures;
+    }
+  });
+  const cancel = cancellationToken();
+  const update = result.lease.markWorkerStarting({ cancel });
+  await waitForFile(startedFile);
+  const candidateOid = await git(repo, ["rev-parse", ref]);
+  assert.notEqual(candidateOid, previousOid, "the real state CAS must commit its candidate OID");
+  cancel.cancel();
+  await writeFile(releaseFile, "release\n");
+  await assert.rejects(update, WorkspaceLockCancelledError);
+  delete process.env.CLI_AGENT_BRIDGE_TEST_WORKSPACE_CAS_RESULT_STARTED_FILE;
+  delete process.env.CLI_AGENT_BRIDGE_TEST_WORKSPACE_CAS_RESULT_RELEASE_FILE;
+  process.env.CLI_AGENT_BRIDGE_TEST_WORKSPACE_RELEASE_READBACK_FAILURES = "1";
+
+  await result.lease.release();
+  await assert.rejects(
+    execFileAsync("git", ["rev-parse", "--verify", ref], { cwd: repo }), /Command failed/u,
+  );
+  const otherModule = await import("../workspace-lock.mjs?state-cas-recovery=" + Date.now());
+  const recovered = await otherModule.tryAcquireGitWorkspaceLock({
+    cwd: repo, key, heartbeatMs: 60_000,
+  });
   assert.equal(recovered.acquired, true);
   await recovered.lease.release();
 });

@@ -9,6 +9,9 @@ import path from "node:path";
 let payloadText = "";
 let activeWorker = null;
 const LINUX_EXIT_TRACKING_GRACE_MS = 150;
+function workerEnvironment(payload) {
+  return payload.environment ?? process.env;
+}
 function recordWorkerExit(worker, code) {
   if (activeWorker === worker) activeWorker = null;
   const publishExit = () => {
@@ -116,7 +119,7 @@ function launchWindowsCmd(commandFile, payload) {
   let worker;
   try {
     worker = spawn(commandProcessor, ["/d", "/s", "/c", `"${shellCommand}"`], {
-      cwd: process.cwd(), env: process.env, windowsHide: true,
+      cwd: process.cwd(), env: workerEnvironment(payload), windowsHide: true,
       windowsVerbatimArguments: true,
       stdio: [payload.stdinText === undefined ? "ignore" : "pipe", "inherit", "inherit"],
     });
@@ -136,7 +139,7 @@ function launchWindowsNpmShim(entry, payload) {
   let worker;
   try {
     worker = spawn(process.execPath, [entry, ...payload.args], {
-      cwd: process.cwd(), env: process.env, windowsHide: true,
+      cwd: process.cwd(), env: workerEnvironment(payload), windowsHide: true,
       stdio: [payload.stdinText === undefined ? "ignore" : "pipe", "inherit", "inherit"],
     });
   } catch (error) {
@@ -164,7 +167,7 @@ function launchWindowsPowerShell(payload) {
     worker = spawn(powershell, [
       "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", runner,
     ], {
-      cwd: process.cwd(), env: process.env, windowsHide: true,
+      cwd: process.cwd(), env: workerEnvironment(payload), windowsHide: true,
       stdio: ["pipe", "inherit", "inherit"],
     });
   } catch (error) {
@@ -232,7 +235,7 @@ process.stdin.on("end", () => {
     try {
       worker = spawn(command, args, {
         cwd: process.cwd(),
-        env: process.env,
+        env: workerEnvironment(payload),
         windowsHide: true,
         stdio: [payload.stdinText === undefined ? "ignore" : "pipe", "inherit", "inherit"],
       });
@@ -270,7 +273,11 @@ process.stdin.on("end", () => {
 
   if (typeof payload.command !== "string" || !Array.isArray(payload.args) ||
       payload.command.includes("\0") || payload.args.some((argument) =>
-        typeof argument !== "string" || argument.includes("\0"))) {
+        typeof argument !== "string" || argument.includes("\0")) ||
+      (payload.environment !== undefined &&
+       (!payload.environment || Array.isArray(payload.environment) ||
+        typeof payload.environment !== "object" ||
+        Object.values(payload.environment).some((value) => typeof value !== "string")))) {
     process.stderr.write("invalid process-tree runner command\n");
     process.exitCode = 127;
     return;

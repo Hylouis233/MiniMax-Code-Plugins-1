@@ -238,7 +238,16 @@ export function backendConfigurationReaderEnvironment(source = process.env) {
   // Node's Windows spawn path requires PATHEXT even for the absolute .exe
   // handed to the Job runner. Use a fixed native-only value, never caller
   // input that could add script shims.
-  if (process.platform === "win32") env.PATHEXT = ".COM;.EXE;.BAT;.CMD";
+  if (process.platform === "win32") {
+    env.PATHEXT = ".COM;.EXE;.BAT;.CMD";
+    // Node/libuv restores several omitted Windows environment variables from
+    // the parent. Explicit empty tombstones prevent ambient search paths and
+    // account metadata from reappearing in the managed reader process.
+    for (const name of [
+      "PATH", "PSModulePath", "HOMEDRIVE", "HOMEPATH", "LOGONSERVER", "SYSTEMDRIVE",
+      "USERDOMAIN", "USERNAME", "USERPROFILE",
+    ]) env[name] = "";
+  }
   const entries = Object.entries(source);
   for (const canonicalName of ["SystemRoot", "WINDIR", "TEMP", "TMP"]) {
     const entry = entries.find(([name, value]) =>
@@ -259,6 +268,23 @@ export function backendConfigurationReaderEnvironment(source = process.env) {
   return env;
 }
 
+export function backendConfigurationControlEnvironment(source = process.env) {
+  const env = backendConfigurationReaderEnvironment(source);
+  if (process.platform !== "win32") return env;
+  const windowsRoot = env.SystemRoot ?? env.WINDIR;
+  if (typeof windowsRoot === "string" && path.win32.isAbsolute(windowsRoot)) {
+    env.PSModulePath = path.win32.join(
+      windowsRoot, "System32", "WindowsPowerShell", "v1.0", "Modules",
+    );
+  }
+  const profile = Object.entries(source).find(([name, value]) =>
+    name.toLowerCase() === "userprofile" && typeof value === "string" &&
+    path.win32.isAbsolute(value),
+  );
+  if (profile) env.USERPROFILE = profile[1];
+  return env;
+}
+
 async function readBackendConfiguration(file, options = {}) {
   let raw;
   if (options.readFile) {
@@ -273,10 +299,14 @@ async function readBackendConfiguration(file, options = {}) {
       : options.deadline - Date.now();
     if (remaining <= 0) throw new DeadlineExceededError("delegation deadline exceeded");
     let controller = null;
-    const result = await runCommand(process.execPath, [
+    const commandRunner = options.commandRunner ?? runCommand;
+    const readerEnvironment = backendConfigurationReaderEnvironment();
+    const result = await commandRunner(process.execPath, [
       path.join(path.dirname(fileURLToPath(import.meta.url)), "config-reader.mjs"), file,
     ], {
-      env: backendConfigurationReaderEnvironment(),
+      env: backendConfigurationControlEnvironment(),
+      exactEnvironment: readerEnvironment,
+      forwardExactEnvironment: true,
       timeoutMs: Math.min(BACKEND_CONFIG_READ_TIMEOUT_MS, remaining),
       manageProcessTree: true,
       shouldCancel: () => Boolean(options.cancel?.cancelled),
@@ -286,18 +316,18 @@ async function readBackendConfiguration(file, options = {}) {
       },
     });
     if (options.cancel?.controller === controller) options.cancel.controller = null;
+    if (result.treeTerminated !== true) {
+      throw new Error(
+        "backend configuration reader cleanup could not be confirmed: " +
+        (result.terminationError || "process tree termination was unconfirmed"),
+      );
+    }
     if (options.cancel?.cancelled) {
       throw new OperationCancelledError("operation cancelled by client");
     }
     if (options.deadline !== null && options.deadline !== undefined &&
         Date.now() >= options.deadline) {
       throw new DeadlineExceededError("delegation deadline exceeded");
-    }
-    if (result.treeTerminated !== true) {
-      throw new Error(
-        "backend configuration reader cleanup could not be confirmed: " +
-        (result.terminationError || "process tree termination was unconfirmed"),
-      );
     }
     if (result.timedOut) throw new Error("backend configuration read timed out");
     if (result.exitCode !== 0) {
@@ -389,11 +419,6 @@ export async function runCommand(command, args, options = {}) {
       options.processTreeTestMode !== true;
     const useProcessTreeRunner = manageProcessTree && process.platform !== "win32" && !shellArgs;
     const trackProcessTree = manageProcessTree && !useWindowsJobRunner;
-    const processTreeRunnerPayload = (useWindowsJobRunner || useProcessTreeRunner) ? JSON.stringify({
-      command,
-      args: argv,
-      ...(options.stdinText === undefined ? {} : { stdinText: options.stdinText }),
-    }) : "";
     const linuxRunMarker = manageProcessTree && process.platform === "linux"
       ? randomUUID()
       : null;
@@ -401,6 +426,14 @@ export async function runCommand(command, args, options = {}) {
     const childEnvironment = linuxRunMarker
       ? { ...baseEnvironment, CLI_AGENT_BRIDGE_RUN_ID: linuxRunMarker }
       : baseEnvironment;
+    const processTreeRunnerPayload = (useWindowsJobRunner || useProcessTreeRunner) ? JSON.stringify({
+      command,
+      args: argv,
+      ...(options.stdinText === undefined ? {} : { stdinText: options.stdinText }),
+      ...(options.forwardExactEnvironment === true
+        ? { environment: options.exactEnvironment ?? childEnvironment }
+        : {}),
+    }) : "";
     const child = useWindowsJobRunner
       ? spawn(trustedWindowsPowerShell(), [
           "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File",
