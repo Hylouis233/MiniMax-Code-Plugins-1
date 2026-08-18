@@ -24,6 +24,7 @@ MAX_XML_PART = 20 * 1024 * 1024
 MAX_ENTRY = 100 * 1024 * 1024
 MAX_TOTAL_UNCOMPRESSED = 500 * 1024 * 1024
 MAX_COMPRESSION_RATIO = 200
+CONTENT_TYPES_NAMESPACE = "http://schemas.openxmlformats.org/package/2006/content-types"
 
 # Security limits must survive `python -O` (which strips assert statements),
 # so every check raises explicitly instead of asserting.
@@ -38,6 +39,46 @@ safe_xml_parser = etree.XMLParser(
     huge_tree=False,
     recover=False,
 )
+
+def xml_content_type(value):
+    media_type = (value or "").split(";", 1)[0].strip().casefold()
+    return media_type in {"application/xml", "text/xml"} or media_type.endswith("+xml")
+
+def declared_xml_parts(archive, infos):
+    """Classify XML from OPC declarations plus conventional suffixes."""
+    by_name = {info.filename: info for info in infos}
+    content_types_info = by_name.get("[Content_Types].xml")
+    require(content_types_info is not None, "missing [Content_Types].xml")
+    require(content_types_info.file_size <= MAX_XML_PART,
+            "oversized XML part: [Content_Types].xml")
+    with archive.open(content_types_info) as stream:
+        content_types_blob = stream.read(MAX_XML_PART + 1)
+    require(len(content_types_blob) <= MAX_XML_PART,
+            "oversized XML part: [Content_Types].xml")
+    root = etree.fromstring(content_types_blob, parser=safe_xml_parser)
+    require(root.tag == f"{{{CONTENT_TYPES_NAMESPACE}}}Types",
+            "invalid [Content_Types].xml root")
+    defaults = {}
+    overrides = {}
+    for child in root:
+        if child.tag == f"{{{CONTENT_TYPES_NAMESPACE}}}Default":
+            extension = (child.get("Extension") or "").casefold()
+            require(extension and extension not in defaults,
+                    "invalid duplicate content-type default")
+            defaults[extension] = child.get("ContentType") or ""
+        elif child.tag == f"{{{CONTENT_TYPES_NAMESPACE}}}Override":
+            part_name = child.get("PartName") or ""
+            require(part_name.startswith("/") and part_name[1:] not in overrides,
+                    "invalid duplicate content-type override")
+            overrides[part_name[1:]] = child.get("ContentType") or ""
+    xml_names = {"[Content_Types].xml"}
+    for info in infos:
+        suffix = info.filename.rsplit(".", 1)[1].casefold() if "." in info.filename else ""
+        content_type = overrides.get(info.filename, defaults.get(suffix, ""))
+        if (info.filename.casefold().endswith((".xml", ".rels"))
+                or xml_content_type(content_type)):
+            xml_names.add(info.filename)
+    return xml_names
 # Check the package itself before ZipFile materializes its central directory.
 require(Path(path).stat().st_size <= MAX_ARCHIVE_BYTES,
         "compressed DOCX file size above limit")
@@ -51,12 +92,13 @@ with zipfile.ZipFile(path) as z:
             "missing required OPC members")
     require(sum(info.file_size for info in infos) <= MAX_TOTAL_UNCOMPRESSED,
             "declared total uncompressed size above limit")
+    xml_names = declared_xml_parts(z, infos)
     actual_total = 0
     for info in infos:
         require(info.file_size <= MAX_ENTRY, f"oversized part: {info.filename}")
         ratio = info.file_size / max(info.compress_size, 1)
         require(ratio <= MAX_COMPRESSION_RATIO, f"suspicious compression ratio: {info.filename}")
-        is_xml = info.filename.endswith((".xml", ".rels"))
+        is_xml = info.filename in xml_names
         if is_xml:
             require(info.file_size <= MAX_XML_PART, f"oversized XML part: {info.filename}")
         chunks = []

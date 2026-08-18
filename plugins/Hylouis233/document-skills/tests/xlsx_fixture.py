@@ -14,6 +14,8 @@ from pathlib import Path
 from tempfile import TemporaryFile, mkstemp
 
 import openpyxl
+from openpyxl.cell.rich_text import CellRichText, TextBlock
+from openpyxl.cell.text import InlineFont
 
 failures = []
 
@@ -537,6 +539,9 @@ def stripped_extension_records(before, after, common_names):
 def load_with_round_trip_audit_from_source(source, **load_options):
     require(not load_options.get("read_only"),
             "round-trip audit requires a normal writable Workbook")
+    require(load_options.get("rich_text", True) is True,
+            "round-trip audit must preserve rich-text cell runs")
+    load_options["rich_text"] = True
     source.seek(0)
     before_names, before_extensions = archive_inventory(source)
     source.seek(0)
@@ -574,6 +579,37 @@ check("clean workbook reports nothing", (clean_dropped, clean_stripped) == ([], 
 check("round-trip audit returns the actual editable workbook identity",
       audited_plain["Data"]["A2"].value == "EU")
 audited_plain.close()
+
+rich_input = openpyxl.Workbook()
+rich_input.active.title = "Rich"
+rich_input.active["A1"] = CellRichText(
+    TextBlock(InlineFont(b=True), "Bold"), " and plain"
+)
+rich_input.save("rich-roundtrip.xlsx")
+rich_editable, rich_dropped, rich_stripped = load_with_round_trip_audit(
+    "rich-roundtrip.xlsx"
+)
+rich_editable["Rich"]["B1"] = "edited"
+rich_editable.save("rich-roundtrip-edited.xlsx")
+rich_editable.close()
+rich_reopened = openpyxl.load_workbook("rich-roundtrip-edited.xlsx", rich_text=True)
+rich_value = rich_reopened["Rich"]["A1"].value
+check(
+    "round-trip audit preserves rich-text runs while editing another cell",
+    rich_dropped == [] and rich_stripped == []
+    and isinstance(rich_value, CellRichText)
+    and isinstance(rich_value[0], TextBlock) and rich_value[0].font.b is True
+    and str(rich_value) == "Bold and plain"
+    and rich_reopened["Rich"]["B1"].value == "edited",
+    (rich_dropped, rich_stripped, type(rich_value), rich_value),
+)
+rich_reopened.close()
+try:
+    load_with_round_trip_audit("plain.xlsx", rich_text=False)
+    rich_text_opt_out_rejected = False
+except ValueError as error:
+    rich_text_opt_out_rejected = "must preserve rich-text" in str(error)
+check("round-trip audit rejects rich-text flattening opt-outs", rich_text_opt_out_rejected)
 
 from openpyxl.drawing.image import Image as AuditImage
 Path("audit-image.png").write_bytes(base64.b64decode(
@@ -1854,6 +1890,33 @@ finally:
     formula_bound_ws.iter_rows = original_iter_rows
 check("formula postcheck uses bounded public coordinate lookups",
       bounded_formulas == {"D2": "=1+1"}, bounded_formulas)
+
+dimension_contract_wb = openpyxl.Workbook()
+dimension_contract_ws = dimension_contract_wb.active
+dimension_contract_ws.title = "Expected"
+dimension_contract_ws["A1"] = "header"
+dimension_contract_ws["C3"] = "tail"
+expected_dimension_contract = {"Expected": "A1:C3"}
+try:
+    require(
+        dimension_contract_ws.dimensions == expected_dimension_contract["Expected"],
+        "unexpected used range",
+    )
+    exact_dimension_passed = True
+except ValueError:
+    exact_dimension_passed = False
+dimension_contract_ws["D4"] = "unintended"
+try:
+    require(
+        dimension_contract_ws.dimensions == expected_dimension_contract["Expected"],
+        "unexpected used range",
+    )
+    stale_dimension_rejected = False
+except ValueError:
+    stale_dimension_rejected = True
+check("postcheck accepts the exact task-declared worksheet range", exact_dimension_passed)
+check("postcheck rejects unintended cells outside the task-declared range",
+      stale_dimension_rejected, dimension_contract_ws.dimensions)
 formula_bound_reopened.close()
 
 

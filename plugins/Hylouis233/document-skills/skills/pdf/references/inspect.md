@@ -163,6 +163,48 @@ MAX_TOTAL_IMAGE_RENDER_PIXELS = 20_000_000
 MAX_DRAWING_PATHS = 1_000
 MAX_DRAWING_RENDER_PIXELS = 4_000_000
 MAX_TOTAL_DRAWING_RENDER_PIXELS = 20_000_000
+MAX_TEXT_SPANS = 10_000
+MAX_TEXT_RENDER_PIXELS = 4_000_000
+MAX_TOTAL_TEXT_RENDER_PIXELS = 20_000_000
+
+def viewable_text(page):
+    """Use text render mode, opacity, clipping, and bounded alpha rendering."""
+    try:
+        spans = page.get_texttrace()
+    except (RuntimeError, ValueError):
+        return [], [], True
+    if len(spans) > MAX_TEXT_SPANS:
+        return spans, [], True
+    visible = []
+    total_render_pixels = 0
+    for span in spans:
+        try:
+            text = "".join(chr(character[0]) for character in span.get("chars", ()))
+            render_type = int(span.get("type"))
+            opacity = float(span.get("opacity"))
+        except (TypeError, ValueError, OverflowError):
+            return spans, visible, True
+        if not text.strip() or render_type > 1 or opacity <= 0:
+            continue
+        if render_type not in (0, 1) or not math.isfinite(opacity):
+            return spans, visible, True
+        clip = visible_clip(page, span.get("bbox"))
+        if clip is None:
+            continue
+        render_pixels = math.ceil(clip.width) * math.ceil(clip.height)
+        total_render_pixels += render_pixels
+        if (render_pixels > MAX_TEXT_RENDER_PIXELS
+                or total_render_pixels > MAX_TOTAL_TEXT_RENDER_PIXELS):
+            return spans, visible, True
+        try:
+            pixmap = page.get_pixmap(clip=clip, alpha=True, annots=False)
+        except (RuntimeError, ValueError):
+            return spans, visible, True
+        if not pixmap.alpha:
+            return spans, visible, True
+        if any(pixmap.samples[pixmap.n - 1::pixmap.n]):
+            visible.append(span)
+    return spans, visible, False
 
 def viewable_images(page):
     """Render bounded placement clips; unknown visibility keeps the page nonblank."""
@@ -338,17 +380,20 @@ for page in doc:
         "crop_size": crop_size,
         "rotation": page.rotation,
     })
+    text_spans, visible_text, text_visibility_unknown = viewable_text(page)
     image_placements, visible_images, image_visibility_unknown = viewable_images(page)
     drawings, visible_drawings, drawing_visibility_unknown = viewable_drawings(page)
     widgets, annotations, links, interaction_visibility_unknown = viewable_interactives(page)
     is_blank = not (
-        page.get_text().strip() or visible_images or visible_drawings
+        visible_text or visible_images or visible_drawings
         or widgets or annotations or links
-        or image_visibility_unknown or drawing_visibility_unknown
+        or text_visibility_unknown or image_visibility_unknown or drawing_visibility_unknown
         or interaction_visibility_unknown
     )
     print(page.number + 1, "media_size:", media_size, "crop_size:", crop_size,
           "rotation:", page.rotation, "text_len:", len(page.get_text()),
+          "text_spans:", len(text_spans), "visible_text_spans:", len(visible_text),
+          "text_visibility_unknown:", text_visibility_unknown,
           "resource_images:", len(page.get_images()),
           "image_placements:", len(image_placements),
           "visible_images:", len(visible_images),
@@ -366,7 +411,7 @@ print("crop_size_consistent:", len({row["crop_size"] for row in page_geometry}) 
 
 ## Checks worth automating
 
-- **Blank page detection**: flag only when text, visible painted image placements and vector paths,
+- **Blank page detection**: flag only when rendered text, visible painted image placements and vector paths,
   and viewable widgets, annotations, and links are all absent. Ignore interactive objects carrying
   invisible, hidden, or no-view flags, as well as empty, off-page, or unrendered appearances.
   `page.get_images()` lists every image XObject resource, including unused resources, and also

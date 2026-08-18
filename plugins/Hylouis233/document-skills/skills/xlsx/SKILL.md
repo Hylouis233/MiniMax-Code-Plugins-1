@@ -78,6 +78,11 @@ expected_number_formats = {
 expected_formulas = {
     # "Sales": {"D2": "=C2*1.08"},
 }
+# Populate every expected sheet with the exact used range required by the task.
+expected_dimensions = {
+    # "Sales": "A1:E20",
+    # "Summary": "A1:C8",
+}
 wb = load_validated_workbook(output_path)
 
 def require(condition, message):
@@ -98,6 +103,10 @@ def formula_text(value):
 print("sheets:", wb.sheetnames)
 missing = set(expected_sheets) - set(wb.sheetnames)
 require(not missing, f"missing expected sheets: {sorted(missing)}")
+require(
+    set(expected_dimensions) == set(expected_sheets),
+    "expected_dimensions must declare the exact used range for every expected sheet",
+)
 calc = wb.calculation
 print("calcMode:", getattr(calc, "calcMode", None),
       "fullCalcOnLoad:", getattr(calc, "fullCalcOnLoad", None))
@@ -109,6 +118,12 @@ if any(expected_formulas.values()):
     )
 for ws in wb.worksheets:
     print(f"{ws.title} dims:", ws.dimensions)
+    if ws.title in expected_dimensions:
+        require(
+            ws.dimensions == expected_dimensions[ws.title],
+            f"{ws.title}: expected used range {expected_dimensions[ws.title]!r}, "
+            f"got {ws.dimensions!r}",
+        )
     # `expected_formulas` is the task contract, so verify those coordinates directly.
     # Never call unbounded iter_rows(): one styled extreme cell can make the rectangle huge.
     actual_formulas = {}

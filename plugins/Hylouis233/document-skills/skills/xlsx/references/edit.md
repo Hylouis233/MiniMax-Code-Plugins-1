@@ -296,6 +296,9 @@ wb.save("input-edited.xlsx")
       """Dry-run one workbook, then return a fresh edit copy from the same source."""
       require(not load_options.get("read_only"),
               "round-trip audit requires a normal writable Workbook")
+      require(load_options.get("rich_text", True) is True,
+              "round-trip audit must preserve rich-text cell runs")
+      load_options["rich_text"] = True
       source.seek(0)
       before_names, before_extensions = archive_inventory(source)
       source.seek(0)

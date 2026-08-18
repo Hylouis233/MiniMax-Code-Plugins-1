@@ -14,11 +14,122 @@ tables). Prefer this when the goal is content, not coordinates.
 ## Structured access (python-docx)
 
 ```python
+from contextlib import contextmanager
+import zipfile
+from pathlib import Path
+from tempfile import TemporaryFile
+
 from docx import Document
 from docx.oxml.ns import qn
 from docx.table import Table
 from docx.text.paragraph import Paragraph
 from docx.text.run import Run
+from lxml import etree
+
+MAX_ARCHIVE_BYTES = 200 * 1024 * 1024
+MAX_MEMBERS = 10_000
+MAX_XML_PART = 20 * 1024 * 1024
+MAX_ENTRY = 100 * 1024 * 1024
+MAX_TOTAL_UNCOMPRESSED = 500 * 1024 * 1024
+MAX_COMPRESSION_RATIO = 200
+CONTENT_TYPES_NAMESPACE = "http://schemas.openxmlformats.org/package/2006/content-types"
+
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+SAFE_XML_PARSER = etree.XMLParser(
+    load_dtd=False, resolve_entities=False, no_network=True,
+    huge_tree=False, recover=False,
+)
+
+def xml_content_type(value):
+    media_type = (value or "").split(";", 1)[0].strip().casefold()
+    return media_type in {"application/xml", "text/xml"} or media_type.endswith("+xml")
+
+def declared_xml_parts(archive, infos):
+    """Classify XML by OPC declarations, not filename spelling alone."""
+    by_name = {info.filename: info for info in infos}
+    content_types_info = by_name.get("[Content_Types].xml")
+    require(content_types_info is not None, "missing [Content_Types].xml")
+    require(content_types_info.file_size <= MAX_XML_PART,
+            "oversized XML part: [Content_Types].xml")
+    with archive.open(content_types_info) as stream:
+        content_types_blob = stream.read(MAX_XML_PART + 1)
+    require(len(content_types_blob) <= MAX_XML_PART,
+            "oversized XML part: [Content_Types].xml")
+    root = etree.fromstring(content_types_blob, parser=SAFE_XML_PARSER)
+    require(root.tag == f"{{{CONTENT_TYPES_NAMESPACE}}}Types",
+            "invalid [Content_Types].xml root")
+    defaults = {}
+    overrides = {}
+    for child in root:
+        if child.tag == f"{{{CONTENT_TYPES_NAMESPACE}}}Default":
+            extension = (child.get("Extension") or "").casefold()
+            require(extension and extension not in defaults,
+                    "invalid duplicate content-type default")
+            defaults[extension] = child.get("ContentType") or ""
+        elif child.tag == f"{{{CONTENT_TYPES_NAMESPACE}}}Override":
+            part_name = child.get("PartName") or ""
+            require(part_name.startswith("/") and part_name[1:] not in overrides,
+                    "invalid duplicate content-type override")
+            overrides[part_name[1:]] = child.get("ContentType") or ""
+    xml_names = {"[Content_Types].xml"}
+    for info in infos:
+        suffix = info.filename.rsplit(".", 1)[1].casefold() if "." in info.filename else ""
+        content_type = overrides.get(info.filename, defaults.get(suffix, ""))
+        if (info.filename.casefold().endswith((".xml", ".rels"))
+                or xml_content_type(content_type)):
+            xml_names.add(info.filename)
+    return xml_names
+
+def validate_docx_archive(archive):
+    infos = archive.infolist()
+    require(len(infos) <= MAX_MEMBERS, "archive member count above limit")
+    names = {info.filename for info in infos}
+    require(len(names) == len(infos), "duplicate archive member names are unsafe")
+    require("[Content_Types].xml" in names and "word/document.xml" in names,
+            "missing required OPC members")
+    require(sum(info.file_size for info in infos) <= MAX_TOTAL_UNCOMPRESSED,
+            "declared total uncompressed size above limit")
+    xml_names = declared_xml_parts(archive, infos)
+    actual_total = 0
+    for info in infos:
+        require(info.file_size <= MAX_ENTRY, f"oversized part: {info.filename}")
+        require(info.file_size / max(info.compress_size, 1) <= MAX_COMPRESSION_RATIO,
+                f"suspicious compression ratio: {info.filename}")
+        is_xml = info.filename in xml_names
+        if is_xml:
+            require(info.file_size <= MAX_XML_PART, f"oversized XML part: {info.filename}")
+        chunks = []
+        actual_size = 0
+        with archive.open(info) as stream:
+            while chunk := stream.read(64 * 1024):
+                actual_size += len(chunk)
+                actual_total += len(chunk)
+                require(actual_size <= MAX_ENTRY, f"part exceeded read limit: {info.filename}")
+                require(actual_total <= MAX_TOTAL_UNCOMPRESSED,
+                        "archive exceeded total read limit")
+                if is_xml:
+                    chunks.append(chunk)
+        require(actual_size == info.file_size, f"size mismatch: {info.filename}")
+        if is_xml:
+            etree.fromstring(b"".join(chunks), parser=SAFE_XML_PARSER)
+
+@contextmanager
+def validated_docx_source(path):
+    """Yield one private, bounded snapshot for both validation and python-docx."""
+    with Path(path).open("rb") as external_source, TemporaryFile() as source:
+        copied = 0
+        while chunk := external_source.read(64 * 1024):
+            copied += len(chunk)
+            require(copied <= MAX_ARCHIVE_BYTES, "compressed DOCX file size above limit")
+            source.write(chunk)
+        source.seek(0)
+        with zipfile.ZipFile(source) as archive:
+            validate_docx_archive(archive)
+        source.seek(0)
+        yield source
 
 MC_NAMESPACE = "http://schemas.openxmlformats.org/markup-compatibility/2006"
 MC_ALTERNATE_CONTENT = f"{{{MC_NAMESPACE}}}AlternateContent"
@@ -227,17 +338,18 @@ def table_content(table):
         })
     return rows
 
-doc = Document("input.docx")
-content_controls = list(doc.element.body.iter(qn("w:sdt")))
-blocks = list(iter_part_blocks(doc.element.body, doc))
-print("content controls:", len(content_controls), "top-level blocks:", len(blocks))
-for kind, block in blocks:
-    if kind == "paragraph":
-        print(block.style.name, "|", paragraph_text(block))
-    elif kind == "table":
-        print("table |", table_content(block))
-    else:
-        print("unreadable |", block)
+with validated_docx_source("input.docx") as source:
+    doc = Document(source)
+    content_controls = list(doc.element.body.iter(qn("w:sdt")))
+    blocks = list(iter_part_blocks(doc.element.body, doc))
+    print("content controls:", len(content_controls), "top-level blocks:", len(blocks))
+    for kind, block in blocks:
+        if kind == "paragraph":
+            print(block.style.name, "|", paragraph_text(block))
+        elif kind == "table":
+            print("table |", table_content(block))
+        else:
+            print("unreadable |", block)
 ```
 
 Notes:

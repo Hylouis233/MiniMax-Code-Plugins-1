@@ -540,6 +540,48 @@ MAX_TOTAL_IMAGE_RENDER_PIXELS = 20_000_000
 MAX_DRAWING_PATHS = 1_000
 MAX_DRAWING_RENDER_PIXELS = 4_000_000
 MAX_TOTAL_DRAWING_RENDER_PIXELS = 20_000_000
+MAX_TEXT_SPANS = 10_000
+MAX_TEXT_RENDER_PIXELS = 4_000_000
+MAX_TOTAL_TEXT_RENDER_PIXELS = 20_000_000
+
+
+def viewable_text(page):
+    try:
+        spans = page.get_texttrace()
+    except (RuntimeError, ValueError):
+        return [], [], True
+    if len(spans) > MAX_TEXT_SPANS:
+        return spans, [], True
+    visible = []
+    total_render_pixels = 0
+    for span in spans:
+        try:
+            text = "".join(chr(character[0]) for character in span.get("chars", ()))
+            render_type = int(span.get("type"))
+            opacity = float(span.get("opacity"))
+        except (TypeError, ValueError, OverflowError):
+            return spans, visible, True
+        if not text.strip() or render_type > 1 or opacity <= 0:
+            continue
+        if render_type not in (0, 1) or not math.isfinite(opacity):
+            return spans, visible, True
+        clip = visible_clip(page, span.get("bbox"))
+        if clip is None:
+            continue
+        render_pixels = math.ceil(clip.width) * math.ceil(clip.height)
+        total_render_pixels += render_pixels
+        if (render_pixels > MAX_TEXT_RENDER_PIXELS
+                or total_render_pixels > MAX_TOTAL_TEXT_RENDER_PIXELS):
+            return spans, visible, True
+        try:
+            pixmap = page.get_pixmap(clip=clip, alpha=True, annots=False)
+        except (RuntimeError, ValueError):
+            return spans, visible, True
+        if not pixmap.alpha:
+            return spans, visible, True
+        if any(pixmap.samples[pixmap.n - 1::pixmap.n]):
+            visible.append(span)
+    return spans, visible, False
 
 
 def viewable_images(page):
@@ -736,7 +778,7 @@ _, visible_widget_drawings, widget_drawing_visibility_unknown = viewable_drawing
     widget_page
 )
 blank = (
-    not widget_page.get_text().strip()
+    not viewable_text(widget_page)[1] and not viewable_text(widget_page)[2]
     and not widget_page.get_images()
     and not visible_widget_drawings and not widget_drawing_visibility_unknown
     and not widgets and not annotations and not links and not interaction_visibility_unknown
@@ -1251,19 +1293,84 @@ form_only_annotations = list(form_only_page.annots() or ())
 
 
 def inspected_page_is_blank(page):
+    _, visible_text, text_visibility_unknown = viewable_text(page)
     _, visible_images, image_visibility_unknown = viewable_images(page)
     _, visible_drawings, drawing_visibility_unknown = viewable_drawings(page)
+    widgets, annotations, links, interaction_visibility_unknown = viewable_interactives(page)
     return not (
-        page.get_text().strip() or visible_images
-        or visible_drawings or list(page.widgets() or ())
-        or list(page.annots() or ()) or page.get_links()
-        or image_visibility_unknown or drawing_visibility_unknown
+        visible_text or visible_images or visible_drawings
+        or widgets or annotations or links
+        or text_visibility_unknown or image_visibility_unknown
+        or drawing_visibility_unknown or interaction_visibility_unknown
     )
 
 
 form_only_is_blank = inspected_page_is_blank(form_only_page)
 check("form-only page exposes a widget", len(form_only_widgets) == 1)
 check("form-only page is not classified as blank", not form_only_is_blank)
+
+# Extractable text can still be visually absent because of Tr=3, alpha=0,
+# clipping, or off-page geometry.
+text_visibility_canvas = canvas.Canvas(
+    "text-visibility.pdf", pagesize=(200, 200), pageCompression=0,
+)
+text_visibility_canvas.drawString(40, 100, "visible")
+text_visibility_canvas.showPage()
+invisible_text = text_visibility_canvas.beginText(40, 100)
+invisible_text.setTextRenderMode(3)
+invisible_text.textOut("render-mode-hidden")
+text_visibility_canvas.drawText(invisible_text)
+text_visibility_canvas.showPage()
+text_visibility_canvas.saveState()
+text_visibility_canvas.setFillAlpha(0)
+text_visibility_canvas.drawString(40, 100, "zero-opacity")
+text_visibility_canvas.restoreState()
+text_visibility_canvas.showPage()
+text_clip = text_visibility_canvas.beginPath()
+text_clip.rect(0, 0, 10, 10)
+text_visibility_canvas.saveState()
+text_visibility_canvas.clipPath(text_clip, stroke=0, fill=0)
+text_visibility_canvas.drawString(40, 100, "clipped")
+text_visibility_canvas.restoreState()
+text_visibility_canvas.showPage()
+text_visibility_canvas.drawString(250, 100, "off-page")
+text_visibility_canvas.showPage()
+text_visibility_canvas.save()
+
+text_visibility_doc = fitz.open("text-visibility.pdf")
+text_visibility_results = []
+for text_page in text_visibility_doc:
+    text_spans, visible_text_spans, text_visibility_unknown = viewable_text(text_page)
+    text_visibility_results.append((
+        len(text_spans), len(visible_text_spans), text_visibility_unknown,
+        inspected_page_is_blank(text_page),
+    ))
+check("blank-page text detection uses rendered visibility",
+      text_visibility_results == [
+          (1, 1, False, False),
+          (1, 0, False, True),
+          (1, 0, False, True),
+          (1, 0, False, True),
+          (1, 0, False, True),
+      ], text_visibility_results)
+
+text_budget_results = {}
+for budget_name in (
+    "MAX_TEXT_SPANS", "MAX_TEXT_RENDER_PIXELS", "MAX_TOTAL_TEXT_RENDER_PIXELS",
+):
+    original_budget = globals()[budget_name]
+    globals()[budget_name] = 0
+    try:
+        spans, visible_spans, visibility_unknown = viewable_text(text_visibility_doc[0])
+        page_is_blank = inspected_page_is_blank(text_visibility_doc[0])
+    finally:
+        globals()[budget_name] = original_budget
+    text_budget_results[budget_name] = (
+        len(spans), len(visible_spans), visibility_unknown, page_is_blank,
+    )
+check("every text count/render budget fails closed as visibility unknown",
+      all(result == (1, 0, True, False) for result in text_budget_results.values()),
+      text_budget_results)
 
 # PyMuPDF inventories invoked paths even when page geometry, clipping, or opacity
 # prevents them from contributing a rendered pixel.
