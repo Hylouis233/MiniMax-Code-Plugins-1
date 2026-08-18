@@ -23,8 +23,9 @@ import {
   backendEntryFromProbe, backendGitProvenanceEnvironment,
   closestExistingBase, committedDelta,
   gitCommonDirectory, gitWorktreeRoot, loadBackends, markWorkspaceQuarantined,
-  populateCommitishCache, readBackendGitProvenance, readRepositoryLockActivity,
-  readWorkspaceQuarantine, runCommand, runGitCommand, startStdioServer,
+  populateCommitishCache, readBackendGitProvenance, readBoundedRegularFile,
+  readRepositoryLockActivity, readWorkspaceQuarantine, repositoryLockKey,
+  runCommand, runGitCommand, startStdioServer,
 } from "../server.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -876,6 +877,19 @@ test("Windows Job runner contains launch and preserves backend streams and exit 
   assert.deepEqual(JSON.parse(shimExact.stdout), exactArguments,
     "the final Node process behind an npm-style .cmd shim must receive exact argv values");
 
+  const adjacentNode = path.join(root, "node.exe");
+  await copyFile(process.execPath, adjacentNode);
+  await writeFile(argvFixture, "process.stdout.write(process.execPath);\n");
+  const adjacentRuntime = await runCommand(cmdShim, [], {
+    cwd: root, manageProcessTree: true, timeoutMs: 5_000,
+  });
+  assert.equal(adjacentRuntime.exitCode, 0, JSON.stringify(adjacentRuntime));
+  assert.equal(
+    path.normalize(adjacentRuntime.stdout).toLowerCase(),
+    path.normalize(await realpath(adjacentNode)).toLowerCase(),
+    "a standard npm shim must honor its adjacent node.exe runtime",
+  );
+
   const customCmd = await runCommand(backend, [exactArgument], {
     cwd: root, manageProcessTree: true, timeoutMs: 5_000,
   });
@@ -1020,13 +1034,10 @@ async function repositoryIdFromStore(store) {
 }
 
 async function repositoryKey(canonicalGitCommonDir) {
-  if (process.platform === "linux") {
-    const repositoryId = await repositoryIdFromStore(path.join(
-      canonicalGitCommonDir, "cli-agent-bridge-lock-store.git",
-    ));
-    return "git-common-dir-id:" + repositoryId;
-  }
-  return "git-common-dir:" + path.normalize(canonicalGitCommonDir);
+  const repositoryId = await repositoryIdFromStore(path.join(
+    canonicalGitCommonDir, "cli-agent-bridge-lock-store.git",
+  ));
+  return "git-common-dir-id:" + repositoryId;
 }
 
 async function repositoryStatePaths(canonicalGitCommonDir) {
@@ -1547,6 +1558,24 @@ test("explicit invalid delegation timeouts are rejected before side effects", as
     );
   }
   assert.deepEqual(await events(eventFile), [], "an invalid timeout must not launch a worker");
+});
+
+test("malformed delegation arguments return JSON-RPC invalid params", async (context) => {
+  const { tempRoot, workspace, client } = await makeHarness(context);
+  const eventFile = path.join(tempRoot, "invalid-arguments-events.jsonl");
+  const cases = [
+    { task: "valid task", workspacePath: workspace },
+    { backend: "missing-backend", task: "valid task", workspacePath: workspace },
+    { backend: "fake", task: "", workspacePath: workspace },
+    { backend: "fake", task: JSON.stringify({ eventFile }), workspacePath: "" },
+  ];
+  for (const arguments_ of cases) {
+    const response = await client.request("tools/call", {
+      name: "delegate_task", arguments: arguments_,
+    });
+    assert.equal(response.error?.code, -32602, JSON.stringify(response));
+  }
+  assert.deepEqual(await events(eventFile), [], "invalid arguments must not launch a worker");
 });
 
 test("Git executable resolution obeys request cancellation, deadline, and shutdown", async (context) => {
@@ -3776,6 +3805,14 @@ test("repository renames cannot create a second cross-process lease", {
   }
 });
 
+test("persistent repository IDs keep lock keys stable across path and case changes", () => {
+  const repositoryId = "2a0e75f4-2f4e-4a78-9f03-2be3c9851fe5";
+  const before = path.join("C:\\", "Work", "Repository", ".git");
+  const after = path.join("D:\\", "moved", "repository", ".git");
+  assert.equal(repositoryLockKey(before, repositoryId), repositoryLockKey(after, repositoryId));
+  assert.notEqual(repositoryLockKey(before), repositoryLockKey(after));
+});
+
 
 test("a commit on the checked-out branch is reported exactly once", async (context) => {
   const { workspace, client } = await makeHarness(context);
@@ -3893,6 +3930,58 @@ test("provenance reads stay bound to the originally opened regular file", async 
     readBackendGitProvenance(fixture, pluginRoot),
     /no longer identifies the original regular file/iu,
   );
+});
+
+test("bounded regular-file reads reject oversized FETCH_HEAD-style input", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "cli-agent-bounded-fetch-head-test-"));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const file = path.join(root, "FETCH_HEAD");
+  await writeFile(file, "12345678");
+  assert.equal(await readBoundedRegularFile(file, 8), "12345678");
+  await writeFile(file, "123456789");
+  await assert.rejects(readBoundedRegularFile(file, 8), /capture limit/iu);
+});
+
+test("bounded FETCH_HEAD-style reads reject FIFO and device symlinks without hanging", {
+  skip: process.platform !== "linux",
+}, async () => {
+  const source = [
+    "import {execFileSync} from 'node:child_process'",
+    "import {mkdtemp,rm,symlink} from 'node:fs/promises'",
+    "import os from 'node:os'",
+    "import path from 'node:path'",
+    `import {readBoundedRegularFile} from ${JSON.stringify(pathToFileURL(serverPath).href)}`,
+    "const mode=process.argv[1]",
+    "const root=await mkdtemp(path.join(os.tmpdir(),'fetch-head-replacement-child-'))",
+    "const file=path.join(root,'FETCH_HEAD')",
+    "if(mode==='fifo')execFileSync('mkfifo',[file]);else await symlink('/dev/zero',file)",
+    "let rejected=false",
+    "try{await readBoundedRegularFile(file,8)}catch{rejected=true}",
+    "await rm(root,{recursive:true,force:true})",
+    "if(!rejected)process.exit(3)",
+  ].join(";");
+  for (const mode of ["fifo", "device"]) {
+    await execFileAsync(process.execPath, [
+      "--max-old-space-size=32", "--input-type=module", "-e", source, mode,
+    ], { timeout: 3_000, maxBuffer: 1_000_000 });
+  }
+});
+
+test("Windows Trace2 worktree matching preserves case-sensitive path identity", {
+  skip: process.platform !== "win32",
+}, async (context) => {
+  const fixture = await makeTraceFixture(context);
+  const target = path.join(fixture.root, "CaseSensitiveRepository");
+  const sibling = path.join(fixture.root, "casesensitiverepository");
+  const trace = [
+    { event: "start", sid: "case-session", argv: ["git", "fetch"] },
+    { event: "def_repo", sid: "case-session", worktree: sibling },
+    { event: "exit", sid: "case-session", code: 0 },
+  ].map((event) => JSON.stringify(event)).join("\n") + "\n";
+  await fixture.handle.write(Buffer.from(trace), 0, Buffer.byteLength(trace), 0);
+  assert.deepEqual(await readBackendGitProvenance(fixture, target), {
+    uncertain: false, sawFetch: false,
+  });
 });
 
 test("provenance reads reject FIFO and device symlink replacements without hanging", {

@@ -93,7 +93,12 @@ function parseStandardNpmCmdShim(commandFile) {
     : shimDirectory;
   const relativeEntry = path.relative(allowedRoot, entry);
   if (!relativeEntry || relativeEntry.startsWith("..") || path.isAbsolute(relativeEntry)) return null;
-  return isFile(entry) ? entry : null;
+  if (!isFile(entry)) return null;
+  const adjacentNode = path.join(shimDirectory, "node.exe");
+  return {
+    entry,
+    nodeExecutable: isFile(adjacentNode) ? adjacentNode : process.execPath,
+  };
 }
 
 function monitorWorker(worker) {
@@ -135,10 +140,10 @@ function launchWindowsCmd(commandFile, payload) {
   }
 }
 
-function launchWindowsNpmShim(entry, payload) {
+function launchWindowsNpmShim(shim, payload) {
   let worker;
   try {
-    worker = spawn(process.execPath, [entry, ...payload.args], {
+    worker = spawn(shim.nodeExecutable, [shim.entry, ...payload.args], {
       cwd: process.cwd(), env: workerEnvironment(payload), windowsHide: true,
       stdio: [payload.stdinText === undefined ? "ignore" : "pipe", "inherit", "inherit"],
     });

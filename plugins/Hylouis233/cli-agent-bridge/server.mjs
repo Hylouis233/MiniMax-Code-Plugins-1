@@ -8,6 +8,7 @@
 
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
 import { chmod, lstat, mkdir, mkdtemp, open, readFile, realpath, rename, rm, rmdir, stat, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
@@ -881,7 +882,7 @@ function resolveTrustedGitExecutable(options = {}) {
 
 async function validateWorkspace(workspacePath, options = {}) {
   if (typeof workspacePath !== "string" || !workspacePath.trim()) {
-    throw new Error("workspacePath must be a non-empty string");
+    throw new InvalidArgumentsError("workspacePath must be a non-empty string");
   }
   const resolved = path.resolve(workspacePath);
   let stats;
@@ -897,9 +898,11 @@ async function validateWorkspace(workspacePath, options = {}) {
     stats = await interruptibleFilesystemOperation(stat(resolved), options);
   } catch (error) {
     if (error instanceof OperationCancelledError || error instanceof DeadlineExceededError) throw error;
-    throw new Error("workspacePath does not exist: " + resolved);
+    throw new InvalidArgumentsError("workspacePath does not exist: " + resolved);
   }
-  if (!stats.isDirectory()) throw new Error("workspacePath must be a directory: " + resolved);
+  if (!stats.isDirectory()) {
+    throw new InvalidArgumentsError("workspacePath must be a directory: " + resolved);
+  }
   try {
     // Keep the execution directory bound to the directory validated here. A
     // symlink supplied by the caller may be retargeted while the request waits
@@ -907,7 +910,7 @@ async function validateWorkspace(workspacePath, options = {}) {
     return await interruptibleFilesystemOperation(realpath(resolved), options);
   } catch (error) {
     if (error instanceof OperationCancelledError || error instanceof DeadlineExceededError) throw error;
-    throw new Error("cannot canonicalize workspacePath: " + error.message);
+    throw new InvalidArgumentsError("cannot canonicalize workspacePath: " + error.message);
   }
 }
 
@@ -960,8 +963,8 @@ export async function gitCommonDirectory(workspacePath, options = {}) {
   }
 }
 
-function repositoryLockKey(gitCommonDir, repositoryId = null) {
-  if (process.platform === "linux" && repositoryId) {
+export function repositoryLockKey(gitCommonDir, repositoryId = null) {
+  if (repositoryId) {
     return "git-common-dir-id:" + repositoryId;
   }
   const normalized = path.normalize(gitCommonDir);
@@ -1450,7 +1453,11 @@ function sameTraceSnapshot(left, right) {
 }
 
 async function readBoundedTrace(handle, options = {}) {
-  const captured = Buffer.allocUnsafe(MAX_CAPTURE_CHARS + 1);
+  return await readBoundedFileHandle(handle, MAX_CAPTURE_CHARS, options);
+}
+
+async function readBoundedFileHandle(handle, limit, options = {}) {
+  const captured = Buffer.allocUnsafe(limit + 1);
   let offset = 0;
   while (offset < captured.length) {
     checkTraceInterruption(options);
@@ -1461,10 +1468,47 @@ async function readBoundedTrace(handle, options = {}) {
     if (bytesRead === 0) break;
     offset += bytesRead;
   }
-  if (offset > MAX_CAPTURE_CHARS) {
-    throw new Error("Git fetch provenance trace exceeded the capture limit");
+  if (offset > limit) {
+    throw new Error("bounded file exceeded the capture limit");
   }
   return new TextDecoder("utf-8", { fatal: true }).decode(captured.subarray(0, offset));
+}
+
+export async function readBoundedRegularFile(filePath, limit, options = {}) {
+  const flags = fsConstants.O_RDONLY |
+    (fsConstants.O_NONBLOCK ?? 0) |
+    (process.platform === "win32" ? 0 : (fsConstants.O_NOFOLLOW ?? 0));
+  const opening = open(filePath, flags);
+  let handle;
+  try {
+    handle = await interruptibleFilesystemOperation(opening, options);
+  } catch (error) {
+    void opening.then((lateHandle) => lateHandle.close()).catch(() => {});
+    throw error;
+  }
+  try {
+    const [before, pathBefore] = await Promise.all([
+      interruptibleFilesystemOperation(handle.stat({ bigint: true }), options),
+      interruptibleFilesystemOperation(lstat(filePath, { bigint: true }), options),
+    ]);
+    if (!before.isFile() || !pathBefore.isFile() ||
+        !sameTraceIdentity(before, pathBefore)) {
+      throw new Error("path is not the opened regular file");
+    }
+    if (before.size > BigInt(limit)) throw new Error("file exceeded the capture limit");
+    const value = await readBoundedFileHandle(handle, limit, options);
+    const [after, pathAfter] = await Promise.all([
+      interruptibleFilesystemOperation(handle.stat({ bigint: true }), options),
+      interruptibleFilesystemOperation(lstat(filePath, { bigint: true }), options),
+    ]);
+    if (!pathAfter.isFile() || !sameTraceSnapshot(before, after) ||
+        !sameTraceIdentity(after, pathAfter)) {
+      throw new Error("regular file changed while it was being read");
+    }
+    return value;
+  } finally {
+    await handle.close().catch(() => {});
+  }
 }
 
 function checkTraceInterruption({ cancel = null, deadline = null } = {}) {
@@ -1502,8 +1546,7 @@ export async function readBackendGitProvenance(provenance, worktreeRoot, options
   }
   const sessions = new Map();
   const normalizeWorktree = (value) => {
-    const normalized = path.resolve(String(value ?? ""));
-    return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+    return path.resolve(String(value ?? ""));
   };
   const targetWorktree = normalizeWorktree(worktreeRoot);
   let offset = 0;
@@ -1793,7 +1836,7 @@ async function gitSnapshot(worktreeRoot, options = {}) {
     worktreeRoot, String(out.fetchHeadPath ?? "").replace(/\r?\n$/u, ""),
   );
   try {
-    const rawFetchHead = await interruptibleFilesystemOperation(readFile(fetchHeadPath, "utf8"), options);
+    const rawFetchHead = await readBoundedRegularFile(fetchHeadPath, MAX_CAPTURE_CHARS, options);
     for (const line of rawFetchHead.split(/\r?\n/u)) {
       if (!line) continue;
       const oid = line.split("\t", 1)[0];
@@ -2753,15 +2796,17 @@ async function delegateTask(rawArgs, cancel) {
     throw error;
   }
   if (!rawArgs || typeof rawArgs.backend !== "string" || !rawArgs.backend.trim()) {
-    throw new Error("backend must be a non-empty string");
+    throw new InvalidArgumentsError("backend must be a non-empty string");
   }
   const backend = rawArgs.backend.trim();
   const spec = backends[backend];
   if (!spec || typeof spec.command !== "string") {
-    throw new Error("unknown backend \"" + backend + "\"; use list_backends to see configured backends");
+    throw new InvalidArgumentsError(
+      "unknown backend \"" + backend + "\"; use list_backends to see configured backends",
+    );
   }
   if (typeof rawArgs.task !== "string" || !rawArgs.task.trim()) {
-    throw new Error("task must be a non-empty string");
+    throw new InvalidArgumentsError("task must be a non-empty string");
   }
   let backendCommand;
   try {
