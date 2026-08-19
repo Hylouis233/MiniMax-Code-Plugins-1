@@ -8,6 +8,7 @@ a traceback, so the calling agent can record it in a search manifest.
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
@@ -17,7 +18,9 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 
-CONTACT_EMAIL = "you@example.com"  # TODO: replace with a real contact email
+# Set PAPER_SEARCH_CONTACT to your email; it is sent in the politeness
+# User-Agent header. Default is an RFC 2606 example address.
+CONTACT_EMAIL = os.environ.get("PAPER_SEARCH_CONTACT", "you@example.com")
 USER_AGENT = "science-literature-paper-search/1.0 (mailto:%s)" % CONTACT_EMAIL
 REQUEST_TIMEOUT = 30   # seconds per HTTP request
 MIN_INTERVAL = 0.5     # seconds between requests (politeness)
