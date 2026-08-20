@@ -83,7 +83,7 @@ and uncertainty handling. All three run fully offline.
   repository:
 
   ```bash
-  pip install "openbinder @ git+https://github.com/Hylouis233/open-protein-binder-design@v0.1.0"
+  pip install "openbinder @ git+https://github.com/Hylouis233/open-protein-binder-design@v0.1.1"
   ```
 
   (or follow the install instructions in the
@@ -95,6 +95,9 @@ and uncertainty handling. All three run fully offline.
   provider is unavailable; to enable it, set the `OPENBINDER_LLM_*`
   environment variables described in the source repository and check the
   configuration with `openbinder provider doctor --provider minimax` first.
+  **MiniMax Code gateway users:** the agent gateway serves the Anthropic-style
+  messages API only, so also set `OPENBINDER_LLM_API_STYLE=anthropic`
+  (the doctor detects this automatically and prints the same hint).
 - `openbinder source inspect/lock/download` and the `--source` modes of
   replay/audit need network access to Hugging Face; everything else is
   offline.
@@ -144,7 +147,7 @@ and uncertainty handling. All three run fully offline.
 
 - This package is the MiniMax Code port of
   [github.com/Hylouis233/open-protein-binder-design](https://github.com/Hylouis233/open-protein-binder-design)
-  (`plugins/science-protein`, v0.1.0).
+  (`plugins/science-protein`, v0.1.1).
 - The upstream agents (`binder-planner`, `binder-reviewer`) are not included —
   MiniMax Code Agent Plugins do not load them. Their definitions are available
   in the source repository under `plugins/science-protein/agents/`; the
