@@ -49,34 +49,43 @@ jobs:
           except ValueError as exc:
               raise SystemExit('could not locate the reusable hardening script') from exc
           script = textwrap.dedent('\n'.join(lines[start:])) + '\n'
+          sp = lambda count: ' ' * count
 
-          old_before = """'''  if (value && typeof value === \"object\") {
-              return Object.fromEntries(
-                Object.entries(value).map(([name, item]) => [name, redactSecrets(item, secrets, depth + 1)]),
-              );
-            }'''"""
-          new_before = """'''  if (value && typeof value === \"object\") {
-            return Object.fromEntries(
-              Object.entries(value).map(([name, item]) => [name, redactSecrets(item, secrets, depth + 1)]),
-            );
-          }'''"""
+          old_before = '\n'.join([
+              "'''  if (value && typeof value === \"object\") {",
+              sp(6) + 'return Object.fromEntries(',
+              sp(8) + 'Object.entries(value).map(([name, item]) => [name, redactSecrets(item, secrets, depth + 1)]),',
+              sp(6) + ');',
+              sp(4) + "}'''",
+          ])
+          new_before = '\n'.join([
+              "'''  if (value && typeof value === \"object\") {",
+              sp(4) + 'return Object.fromEntries(',
+              sp(6) + 'Object.entries(value).map(([name, item]) => [name, redactSecrets(item, secrets, depth + 1)]),',
+              sp(4) + ');',
+              sp(2) + "}'''",
+          ])
 
-          old_after = """'''  if (value && typeof value === \"object\") {
-              return Object.fromEntries(
-                Object.entries(value).map(([name, item]) => [
-                  redactSecrets(name, secrets, depth + 1),
-                  redactSecrets(item, secrets, depth + 1),
-                ]),
-              );
-            }'''"""
-          new_after = """'''  if (value && typeof value === \"object\") {
-            return Object.fromEntries(
-              Object.entries(value).map(([name, item]) => [
-                redactSecrets(name, secrets, depth + 1),
-                redactSecrets(item, secrets, depth + 1),
-              ]),
-            );
-          }'''"""
+          old_after = '\n'.join([
+              "'''  if (value && typeof value === \"object\") {",
+              sp(6) + 'return Object.fromEntries(',
+              sp(8) + 'Object.entries(value).map(([name, item]) => [',
+              sp(10) + 'redactSecrets(name, secrets, depth + 1),',
+              sp(10) + 'redactSecrets(item, secrets, depth + 1),',
+              sp(8) + ']),',
+              sp(6) + ');',
+              sp(4) + "}'''",
+          ])
+          new_after = '\n'.join([
+              "'''  if (value && typeof value === \"object\") {",
+              sp(4) + 'return Object.fromEntries(',
+              sp(6) + 'Object.entries(value).map(([name, item]) => [',
+              sp(8) + 'redactSecrets(name, secrets, depth + 1),',
+              sp(8) + 'redactSecrets(item, secrets, depth + 1),',
+              sp(6) + ']),',
+              sp(4) + ');',
+              sp(2) + "}'''",
+          ])
 
           for label, old, new in (
               ('redaction source', old_before, new_before),
