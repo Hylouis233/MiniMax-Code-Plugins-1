@@ -27,34 +27,43 @@ jobs:
 
           path = Path('.github/workflows/one-shot-minimax-token-plan-hardening.yml')
           text = path.read_text(encoding='utf-8')
+          sp = lambda count: ' ' * count
 
-          old_before = """'''  if (value && typeof value === \"object\") {
-                return Object.fromEntries(
-                  Object.entries(value).map(([name, item]) => [name, redactSecrets(item, secrets, depth + 1)]),
-                );
-              }'''"""
-          new_before = """'''  if (value && typeof value === \"object\") {
-            return Object.fromEntries(
-              Object.entries(value).map(([name, item]) => [name, redactSecrets(item, secrets, depth + 1)]),
-            );
-          }'''"""
+          old_before = '\n'.join([
+              "'''  if (value && typeof value === \"object\") {",
+              sp(16) + 'return Object.fromEntries(',
+              sp(18) + 'Object.entries(value).map(([name, item]) => [name, redactSecrets(item, secrets, depth + 1)]),',
+              sp(16) + ');',
+              sp(14) + "}'''",
+          ])
+          new_before = '\n'.join([
+              "'''  if (value && typeof value === \"object\") {",
+              sp(14) + 'return Object.fromEntries(',
+              sp(16) + 'Object.entries(value).map(([name, item]) => [name, redactSecrets(item, secrets, depth + 1)]),',
+              sp(14) + ');',
+              sp(12) + "}'''",
+          ])
 
-          old_after = """'''  if (value && typeof value === \"object\") {
-                return Object.fromEntries(
-                  Object.entries(value).map(([name, item]) => [
-                    redactSecrets(name, secrets, depth + 1),
-                    redactSecrets(item, secrets, depth + 1),
-                  ]),
-                );
-              }'''"""
-          new_after = """'''  if (value && typeof value === \"object\") {
-            return Object.fromEntries(
-              Object.entries(value).map(([name, item]) => [
-                redactSecrets(name, secrets, depth + 1),
-                redactSecrets(item, secrets, depth + 1),
-              ]),
-            );
-          }'''"""
+          old_after = '\n'.join([
+              "'''  if (value && typeof value === \"object\") {",
+              sp(16) + 'return Object.fromEntries(',
+              sp(18) + 'Object.entries(value).map(([name, item]) => [',
+              sp(20) + 'redactSecrets(name, secrets, depth + 1),',
+              sp(20) + 'redactSecrets(item, secrets, depth + 1),',
+              sp(18) + ']),',
+              sp(16) + ');',
+              sp(14) + "}'''",
+          ])
+          new_after = '\n'.join([
+              "'''  if (value && typeof value === \"object\") {",
+              sp(14) + 'return Object.fromEntries(',
+              sp(16) + 'Object.entries(value).map(([name, item]) => [',
+              sp(18) + 'redactSecrets(name, secrets, depth + 1),',
+              sp(18) + 'redactSecrets(item, secrets, depth + 1),',
+              sp(16) + ']),',
+              sp(14) + ');',
+              sp(12) + "}'''",
+          ])
 
           for label, old, new in (
               ('redaction source', old_before, new_before),
