@@ -492,15 +492,14 @@ function success(tool, result, warning = null) {
 }
 
 function failure(tool, error) {
-  const structuredContent = {
-    ok: false,
-    tool,
+  const errorResult = {
     error: {
       type: error instanceof ToolInputError ? "invalid_arguments" : "api_error",
       message: String(error?.message || error),
       ...(error instanceof MiniMaxApiError ? error.details : {}),
     },
   };
+  const structuredContent = { ok: false, tool, result: errorResult, warning: null };
   return {
     content: [{ type: "text", text: JSON.stringify(structuredContent, null, 2) }],
     structuredContent,
