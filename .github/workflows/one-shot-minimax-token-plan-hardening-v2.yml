@@ -96,6 +96,50 @@ jobs:
                   raise SystemExit(f'{label}: expected one extracted-script match, found {count}')
               script = script.replace(old, new, 1)
 
+          old_helper = '\n'.join([
+              'def replace_once(text, old, new, label):',
+              sp(4) + 'count = text.count(old)',
+              sp(4) + 'if count != 1:',
+              sp(8) + "raise SystemExit(f'{label}: expected one match, found {count}')",
+              sp(4) + 'return text.replace(old, new, 1)',
+          ])
+          new_helper = '\n'.join([
+              'def replace_once(text, old, new, label):',
+              sp(4) + 'def shift_following_lines(value, amount):',
+              sp(8) + 'parts = value.splitlines()',
+              sp(8) + 'if len(parts) < 2:',
+              sp(12) + 'return value',
+              sp(8) + "return '\\n'.join([parts[0], *[",
+              sp(12) + "line[amount:] if line.startswith(' ' * amount) else line",
+              sp(12) + 'for line in parts[1:]',
+              sp(8) + ']])',
+              '',
+              sp(4) + 'candidates = [(old, new)]',
+              sp(4) + 'if len(old.splitlines()) > 1:',
+              sp(8) + 'candidates.extend(',
+              sp(12) + '(shift_following_lines(old, amount), shift_following_lines(new, amount))',
+              sp(12) + 'for amount in range(1, 13)',
+              sp(8) + ')',
+              sp(4) + 'for candidate_old, candidate_new in candidates:',
+              sp(8) + 'count = text.count(candidate_old)',
+              sp(8) + 'if count == 1:',
+              sp(12) + 'return text.replace(candidate_old, candidate_new, 1)',
+              sp(8) + 'if count > 1:',
+              sp(12) + "raise SystemExit(f'{label}: matcher is ambiguous ({count} matches)')",
+              sp(4) + "raise SystemExit(f'{label}: no exact or indentation-normalized match')",
+          ])
+          count = script.count(old_helper)
+          if count != 1:
+              raise SystemExit(f'replace_once helper: expected one match, found {count}')
+          script = script.replace(old_helper, new_helper, 1)
+
+          old_marker = "marker = '\\n          test(\"H3 video creation and query use only the paygo key\", async (context) => {'"
+          new_marker = "marker = '\\ntest(\"H3 video creation and query use only the paygo key\", async (context) => {'"
+          count = script.count(old_marker)
+          if count != 1:
+              raise SystemExit(f'media insertion marker assignment: expected one match, found {count}')
+          script = script.replace(old_marker, new_marker, 1)
+
           path = Path('/tmp/minimax-token-plan-hardening.sh')
           path.write_text(script, encoding='utf-8', newline='\n')
           PY
