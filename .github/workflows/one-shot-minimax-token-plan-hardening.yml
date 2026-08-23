@@ -1,0 +1,539 @@
+name: One-shot minimax-token-plan input hardening
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - .github/minimax-token-plan-hardening-trigger.md
+
+permissions:
+  contents: write
+
+jobs:
+  harden:
+    if: github.repository == 'Hylouis233/MiniMax-Code-Plugins-1'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout contribution branch
+        uses: actions/checkout@v5
+        with:
+          ref: agent/minimax-token-plan-suite
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Align media contracts and harden response keys
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          server_path = Path('plugins/Hylouis233/minimax-token-plan/server.mjs')
+          test_path = Path('plugins/Hylouis233/minimax-token-plan/test/server.test.mjs')
+          readme_path = Path('plugins/Hylouis233/minimax-token-plan/README.md')
+          skill_path = Path('plugins/Hylouis233/minimax-token-plan/skills/minimax-token-plan/SKILL.md')
+
+          server = server_path.read_text(encoding='utf-8')
+          tests = test_path.read_text(encoding='utf-8')
+          readme = readme_path.read_text(encoding='utf-8')
+          skill = skill_path.read_text(encoding='utf-8')
+
+          def replace_once(text, old, new, label):
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'{label}: expected one match, found {count}')
+              return text.replace(old, new, 1)
+
+          server = replace_once(
+              server,
+              '''const MAX_LINE_CHARS = 1_000_000;
+          const MAX_RESPONSE_BYTES = 5 * 1024 * 1024;''',
+              '''const MAX_LINE_CHARS = 1_000_000;
+          const MAX_INLINE_IMAGE_CHARS = 900_000;
+          const MAX_VIDEO_FRAME_IMAGE_CHARS = 430_000;
+          const MAX_REMOTE_URL_CHARS = 4096;
+          const MAX_OUTPUT_KEY_CHARS = 512;
+          const MAX_RESPONSE_BYTES = 5 * 1024 * 1024;''',
+              'safety constants',
+          )
+
+          schema_helpers = '''
+          const HTTPS_URL_SCHEMA = {
+            type: "string",
+            minLength: 1,
+            maxLength: MAX_REMOTE_URL_CHARS,
+            pattern: "^[Hh][Tt][Tt][Pp][Ss]://",
+          };
+
+          function mediaSourceSchema(maxInline, description) {
+            return {
+              oneOf: [
+                { ...HTTPS_URL_SCHEMA },
+                {
+                  type: "string",
+                  minLength: 1,
+                  maxLength: maxInline,
+                  pattern: "^data:image/(?:jpeg|png|webp);base64,[A-Za-z0-9+/=]+$",
+                },
+              ],
+              description,
+            };
+          }
+          '''
+          server = replace_once(
+              server,
+              '''const CONFIRM_USAGE = {
+            type: "boolean",
+            const: true,
+            description: "Must be true after the user explicitly confirms quota, Credits, or balance use.",
+          };
+
+          const TOOL_DEFINITIONS = [''',
+              '''const CONFIRM_USAGE = {
+            type: "boolean",
+            const: true,
+            description: "Must be true after the user explicitly confirms quota, Credits, or balance use.",
+          };
+          ''' + schema_helpers + '''
+          const TOOL_DEFINITIONS = [''',
+              'schema helpers',
+          )
+
+          schema_replacements = [
+              (
+                  'image_source: { type: "string", minLength: 1, maxLength: 14_000_000, description: "HTTPS URL or data:image/jpeg|png|webp;base64 URL." },',
+                  'image_source: mediaSourceSchema(MAX_INLINE_IMAGE_CHARS, "HTTPS URL or bounded data:image/jpeg|png|webp;base64 URL."),',
+                  'vision image schema',
+              ),
+              (
+                  'subject_reference_url: { type: "string", minLength: 1, maxLength: 14_000_000, description: "Optional HTTPS or data-image character reference." },',
+                  'subject_reference_url: mediaSourceSchema(MAX_INLINE_IMAGE_CHARS, "Optional HTTPS or bounded data-image character reference."),',
+                  'image reference schema',
+              ),
+              (
+                  'first_frame_url: { type: "string", minLength: 1, maxLength: 14_000_000 },',
+                  'first_frame_url: mediaSourceSchema(MAX_VIDEO_FRAME_IMAGE_CHARS, "HTTPS URL or bounded inline first-frame image."),',
+                  'first-frame schema',
+              ),
+              (
+                  'last_frame_url: { type: "string", minLength: 1, maxLength: 14_000_000 },',
+                  'last_frame_url: mediaSourceSchema(MAX_VIDEO_FRAME_IMAGE_CHARS, "HTTPS URL or bounded inline last-frame image."),',
+                  'last-frame schema',
+              ),
+              (
+                  'reference_image_urls: { type: "array", maxItems: 9, items: { type: "string", minLength: 1, maxLength: 14_000_000 } },',
+                  'reference_image_urls: { type: "array", maxItems: 9, items: { ...HTTPS_URL_SCHEMA }, description: "HTTPS reference-image URLs; inline data images are intentionally excluded from collections." },',
+                  'video reference-image schema',
+              ),
+              (
+                  'reference_video_urls: { type: "array", maxItems: 3, items: { type: "string", minLength: 1, maxLength: 4096 } },',
+                  'reference_video_urls: { type: "array", maxItems: 3, items: { ...HTTPS_URL_SCHEMA } },',
+                  'video reference-video schema',
+              ),
+              (
+                  'reference_audio_urls: { type: "array", maxItems: 3, items: { type: "string", minLength: 1, maxLength: 4096 } },',
+                  'reference_audio_urls: { type: "array", maxItems: 3, items: { ...HTTPS_URL_SCHEMA } },',
+                  'video reference-audio schema',
+              ),
+          ]
+          for old, new, label in schema_replacements:
+              server = replace_once(server, old, new, label)
+
+          # Both music tools accept only bounded HTTPS audio URLs.
+          audio_schema = 'audio_url: { type: "string", minLength: 1, maxLength: 4096 },'
+          audio_count = server.count(audio_schema)
+          if audio_count != 2:
+              raise SystemExit(f'audio URL schemas: expected two matches, found {audio_count}')
+          server = server.replace(audio_schema, 'audio_url: { ...HTTPS_URL_SCHEMA },')
+
+          server = replace_once(
+              server,
+              '''    description:
+                "Create a MiniMax-H3 V2 video task with an explicit pay-as-you-go key. H3 is not a Token Plan entitlement. Returns a task ID and never polls automatically.",''',
+              '''    description:
+                "Create a MiniMax-H3 V2 video task with an explicit pay-as-you-go key. H3 is not a Token Plan entitlement. Frame inputs accept HTTPS or bounded inline images; reference collections require HTTPS. Returns a task ID and never polls automatically.",''',
+              'video tool description',
+          )
+
+          old_media_helpers = r'''function mediaSource(value, name = "media source") {
+            if (value.startsWith("data:image/")) {
+              if (!/^data:image\/(?:jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/u.test(value)) {
+                throw new ToolInputError(name + " must be a JPEG, PNG, or WebP base64 data URL");
+              }
+              if (value.length > 14_000_000) throw new ToolInputError(name + " exceeds the bounded data URL limit");
+              return value;
+            }
+            return httpsUrl(value, name);
+          }
+
+          function httpsUrl(value, name = "URL") {
+            let parsed;
+            try {
+              parsed = new URL(value);
+            } catch {
+              throw new ToolInputError(name + " must be a valid HTTPS URL");
+            }
+            if (parsed.protocol !== "https:" || parsed.username || parsed.password) {
+              throw new ToolInputError(name + " must be an HTTPS URL without embedded credentials");
+            }
+            return parsed.toString();
+          }'''
+          new_media_helpers = r'''function mediaSource(value, name = "media source", { maxInline = MAX_INLINE_IMAGE_CHARS } = {}) {
+            if (typeof value !== "string" || value.length === 0) {
+              throw new ToolInputError(name + " must be a non-empty string");
+            }
+            if (value.startsWith("data:image/")) {
+              if (!/^data:image\/(?:jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/u.test(value)) {
+                throw new ToolInputError(name + " must be a JPEG, PNG, or WebP base64 data URL");
+              }
+              if (value.length > maxInline) {
+                throw new ToolInputError(name + ` exceeds the ${maxInline.toLocaleString("en-US")} character inline-image limit; use HTTPS for larger media`);
+              }
+              return value;
+            }
+            return httpsUrl(value, name);
+          }
+
+          function httpsUrl(value, name = "URL", max = MAX_REMOTE_URL_CHARS) {
+            if (typeof value !== "string" || value.length < 1 || value.length > max) {
+              throw new ToolInputError(`${name} length must be between 1 and ${max}`);
+            }
+            let parsed;
+            try {
+              parsed = new URL(value);
+            } catch {
+              throw new ToolInputError(name + " must be a valid HTTPS URL");
+            }
+            if (parsed.protocol !== "https:" || parsed.username || parsed.password) {
+              throw new ToolInputError(name + " must be an HTTPS URL without embedded credentials");
+            }
+            return parsed.toString();
+          }'''
+          server = replace_once(server, old_media_helpers, new_media_helpers, 'media validation helpers')
+
+          server = replace_once(
+              server,
+              '''  if (value && typeof value === "object") {
+                return Object.fromEntries(
+                  Object.entries(value).map(([name, item]) => [name, redactSecrets(item, secrets, depth + 1)]),
+                );
+              }''',
+              '''  if (value && typeof value === "object") {
+                return Object.fromEntries(
+                  Object.entries(value).map(([name, item]) => [
+                    redactSecrets(name, secrets, depth + 1),
+                    redactSecrets(item, secrets, depth + 1),
+                  ]),
+                );
+              }''',
+              'response-key redaction',
+          )
+
+          server = replace_once(
+              server,
+              '''function sanitize(value, depth = 0) {
+            if (depth > 8) return "<maximum nesting omitted>";
+            if (typeof value === "string") {
+              if (value.length <= 12_000) return value;
+              return value.slice(0, 1_000) + `<${value.length - 1_000} characters omitted>`;
+            }
+            if (Array.isArray(value)) return value.slice(0, 100).map((item) => sanitize(item, depth + 1));
+            if (value && typeof value === "object") {
+              return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, sanitize(item, depth + 1)]));
+            }
+            return value;
+          }''',
+              '''function sanitizeKey(value) {
+            const key = String(value);
+            if (key.length <= MAX_OUTPUT_KEY_CHARS) return key;
+            const kept = 256;
+            return key.slice(0, kept) + `<${key.length - kept} key characters omitted>`;
+          }
+
+          function sanitize(value, depth = 0) {
+            if (depth > 8) return "<maximum nesting omitted>";
+            if (typeof value === "string") {
+              if (value.length <= 12_000) return value;
+              return value.slice(0, 1_000) + `<${value.length - 1_000} characters omitted>`;
+            }
+            if (Array.isArray(value)) return value.slice(0, 100).map((item) => sanitize(item, depth + 1));
+            if (value && typeof value === "object") {
+              return Object.fromEntries(
+                Object.entries(value).map(([key, item]) => [sanitizeKey(key), sanitize(item, depth + 1)]),
+              );
+            }
+            return value;
+          }''',
+              'response-key truncation',
+          )
+
+          execute_replacements = [
+              (
+                  'const imageSource = mediaSource(stringArg(args, "image_source", { required: true, min: 1, max: 14_000_000 }), "image_source");',
+                  'const imageSource = mediaSource(stringArg(args, "image_source", { required: true, min: 1, max: MAX_INLINE_IMAGE_CHARS }), "image_source");',
+                  'vision runtime bound',
+              ),
+              (
+                  'const reference = stringArg(args, "subject_reference_url");',
+                  'const reference = stringArg(args, "subject_reference_url", { max: MAX_INLINE_IMAGE_CHARS });',
+                  'subject-reference runtime bound',
+              ),
+              (
+                  'const first = stringArg(args, "first_frame_url");',
+                  'const first = stringArg(args, "first_frame_url", { max: MAX_VIDEO_FRAME_IMAGE_CHARS });',
+                  'first-frame runtime bound',
+              ),
+              (
+                  'const last = stringArg(args, "last_frame_url");',
+                  'const last = stringArg(args, "last_frame_url", { max: MAX_VIDEO_FRAME_IMAGE_CHARS });',
+                  'last-frame runtime bound',
+              ),
+              (
+                  'mediaSource(first, "first_frame_url")',
+                  'mediaSource(first, "first_frame_url", { maxInline: MAX_VIDEO_FRAME_IMAGE_CHARS })',
+                  'first-frame media validation',
+              ),
+              (
+                  'mediaSource(last, "last_frame_url")',
+                  'mediaSource(last, "last_frame_url", { maxInline: MAX_VIDEO_FRAME_IMAGE_CHARS })',
+                  'last-frame media validation',
+              ),
+              (
+                  'mediaSource(item, "reference_image_urls item")',
+                  'httpsUrl(item, "reference_image_urls item")',
+                  'reference-image HTTPS validation',
+              ),
+              (
+                  'const audioUrl = stringArg(args, "audio_url");',
+                  'const audioUrl = stringArg(args, "audio_url", { max: MAX_REMOTE_URL_CHARS });',
+                  'music audio runtime bound',
+              ),
+              (
+                  'stringArg(args, "audio_url", { required: true, min: 1, max: 4096 })',
+                  'stringArg(args, "audio_url", { required: true, min: 1, max: MAX_REMOTE_URL_CHARS })',
+                  'music-cover audio runtime bound',
+              ),
+          ]
+          for old, new, label in execute_replacements:
+              server = replace_once(server, old, new, label)
+
+          if '14_000_000' in server:
+              raise SystemExit('obsolete 14,000,000-character limits remain')
+
+          tests = replace_once(
+              tests,
+              '''    if (body?.q === "echo-secret") {
+                response.end(JSON.stringify({
+                  echoed: request.headers.authorization,
+                  base_resp: { status_code: 0, status_msg: "success" },
+                }));
+                return;
+              }''',
+              '''    if (body?.q === "echo-secret") {
+                response.end(JSON.stringify({
+                  echoed: request.headers.authorization,
+                  base_resp: { status_code: 0, status_msg: "success" },
+                }));
+                return;
+              }
+              if (body?.q === "echo-secret-key") {
+                response.end(JSON.stringify({
+                  [request.headers.authorization]: "secret appeared in an object key",
+                  ["k".repeat(20_000)]: "oversized object key",
+                  base_resp: { status_code: 0, status_msg: "success" },
+                }));
+                return;
+              }''',
+              'mock secret-key response',
+          )
+
+          tests = replace_once(
+              tests,
+              '''test("upstream responses cannot echo configured API keys into MCP context", async (context) => {
+            const api = await mockApi(context);
+            const response = await executeTool("minimax_web_search", {
+              query: "echo-secret", confirm_usage: true,
+            }, apiOptions(api));
+            assert.equal(response.echoed, "Bearer <redacted-api-key>");
+            assert.doesNotMatch(JSON.stringify(response), /token-secret|paygo-secret/u);
+          });''',
+              '''test("upstream responses cannot echo configured API keys into MCP context", async (context) => {
+            const api = await mockApi(context);
+            const response = await executeTool("minimax_web_search", {
+              query: "echo-secret", confirm_usage: true,
+            }, apiOptions(api));
+            assert.equal(response.echoed, "Bearer <redacted-api-key>");
+            assert.doesNotMatch(JSON.stringify(response), /token-secret|paygo-secret/u);
+          });
+
+          test("upstream object keys are redacted and bounded before entering MCP context", async (context) => {
+            const api = await mockApi(context);
+            const message = await handleMessage({
+              jsonrpc: "2.0", id: 77, method: "tools/call",
+              params: { name: "minimax_web_search", arguments: {
+                query: "echo-secret-key", confirm_usage: true,
+              } },
+            }, apiOptions(api));
+            const result = message.result.structuredContent.result;
+            const keys = Object.keys(result);
+            assert.ok(keys.includes("Bearer <redacted-api-key>"));
+            assert.ok(keys.some((key) => key.includes("key characters omitted")));
+            assert.ok(keys.every((key) => key.length < 600));
+            assert.doesNotMatch(JSON.stringify(message), /token-secret|paygo-secret|k{1000}/u);
+          });''',
+              'object-key regression test',
+          )
+
+          media_tests = r'''
+
+          test("media schemas fit the stdio frame and reference collections remain HTTPS-only", async (context) => {
+            const api = await mockApi(context);
+            const vision = TOOL_DEFINITIONS.find((tool) => tool.name === "minimax_understand_image");
+            const image = TOOL_DEFINITIONS.find((tool) => tool.name === "minimax_generate_image");
+            const video = TOOL_DEFINITIONS.find((tool) => tool.name === "minimax_create_video");
+            const visionSource = vision.inputSchema.properties.image_source;
+            const subjectSource = image.inputSchema.properties.subject_reference_url;
+            const videoProps = video.inputSchema.properties;
+            const inlineMax = (schema) => Math.max(...schema.oneOf.map((entry) => entry.maxLength));
+            assert.equal(inlineMax(visionSource), 900_000);
+            assert.equal(inlineMax(subjectSource), 900_000);
+            assert.equal(inlineMax(videoProps.first_frame_url), 430_000);
+            assert.equal(inlineMax(videoProps.last_frame_url), 430_000);
+            assert.equal(videoProps.reference_image_urls.items.maxLength, 4096);
+
+            const dataUrl = (length) => {
+              const prefix = "data:image/png;base64,";
+              return prefix + "A".repeat(length - prefix.length);
+            };
+            const https = (length) => {
+              const prefix = "https://example.com/";
+              return prefix + "a".repeat(length - prefix.length);
+            };
+            const worstCase = JSON.stringify({
+              jsonrpc: "2.0", id: 1, method: "tools/call",
+              params: { name: "minimax_create_video", arguments: {
+                prompt: "p".repeat(2000),
+                first_frame_url: dataUrl(430_000),
+                last_frame_url: dataUrl(430_000),
+                reference_image_urls: Array.from({ length: 9 }, () => https(4096)),
+                reference_video_urls: Array.from({ length: 3 }, () => https(4096)),
+                reference_audio_urls: Array.from({ length: 3 }, () => https(4096)),
+                confirm_usage: true,
+              } },
+            });
+            assert.ok(worstCase.length < 1_000_000);
+
+            await assert.rejects(executeTool("minimax_create_video", {
+              prompt: "inline collection fixture",
+              reference_image_urls: ["data:image/png;base64,AA=="],
+              confirm_usage: true,
+            }, apiOptions(api)), /HTTPS URL/u);
+            await assert.rejects(executeTool("minimax_create_video", {
+              prompt: "overlong URL fixture",
+              reference_video_urls: [https(4097)],
+              confirm_usage: true,
+            }, apiOptions(api)), /length must be between 1 and 4096/u);
+            await assert.rejects(executeTool("minimax_create_video", {
+              prompt: "overlong frame fixture",
+              first_frame_url: dataUrl(430_001),
+              confirm_usage: true,
+            }, apiOptions(api)), /length must be between 0 and 430000/u);
+            assert.equal(api.requests.length, 0);
+          });
+          '''
+          marker = '\n          test("H3 video creation and query use only the paygo key", async (context) => {'
+          if marker not in tests:
+              raise SystemExit('media test insertion marker not found')
+          tests = tests.replace(marker, media_tests + marker, 1)
+
+          readme = replace_once(
+              readme,
+              '| `minimax_understand_image` | Token Plan | Official `/v1/coding_plan/vlm`; HTTPS or data-image sources only. |',
+              '| `minimax_understand_image` | Token Plan | Official `/v1/coding_plan/vlm`; HTTPS or bounded inline data-image sources only. |',
+              'README vision row',
+          )
+          readme = replace_once(
+              readme,
+              '''- Local file paths are not accepted for vision/reference media. Use an HTTPS URL or a bounded data
+            image URL to prevent accidental local-file exfiltration.''',
+              '''- Local file paths are not accepted for vision/reference media. Single-image tools accept HTTPS or
+            inline JPEG/PNG/WebP data URLs below 900,000 characters. Video reference collections require HTTPS;
+            optional first/last-frame data images are capped at 430,000 characters each so every schema-valid
+            request remains below the 1,000,000-character stdio frame limit.''',
+              'README media safety',
+          )
+          readme = replace_once(
+              readme,
+              '''- Submitted data: prompts, search queries, text for speech, image/video/audio URLs, bounded data
+            image URLs, and generation settings are sent only when the corresponding tool is called.''',
+              '''- Submitted data: prompts, search queries, text for speech, bounded single-image data URLs,
+            HTTPS image/video/audio references, and generation settings are sent only when the corresponding tool
+            is called.''',
+              'README submitted-data disclosure',
+          )
+          readme = replace_once(
+              readme,
+              '''## Validation evidence
+
+          ```text
+          node --test plugins/Hylouis233/minimax-token-plan/test/server.test.mjs
+          16 tests passed
+          ```
+
+          The fixture uses a local mock API and verifies key routing, explicit usage confirmation, host/media
+          validation, bounded responses, quota errors, video task separation, music lifecycle warnings, and
+          the complete stdio initialize/list/call handshake without consuming real MiniMax resources.''',
+              '''## Validation evidence
+
+          ```text
+          npm run check
+          ```
+
+          The repository check runs all plugin tests plus manifest, schema, output-schema, and secret scans. The
+          local MiniMax fixture verifies key routing, explicit usage confirmation, schema/transport media bounds,
+          HTTPS-only reference collections, response-key redaction and truncation, bounded responses, quota errors,
+          video task separation, music lifecycle warnings, and the complete stdio initialize/list/call handshake
+          without consuming real MiniMax resources.''',
+              'README validation evidence',
+          )
+
+          skill = replace_once(
+              skill,
+              '''- Vision accepts HTTPS URLs or `data:image/jpeg|png|webp;base64,...`; never pass arbitrary local
+            paths.
+          - Prefer URL output to keep large binary payloads out of MCP context.''',
+              '''- Vision and single subject-reference inputs accept HTTPS URLs or bounded
+            `data:image/jpeg|png|webp;base64,...` values; never pass arbitrary local paths.
+          - Video reference-image, video, and audio collections require HTTPS URLs. First/last-frame inline data
+            images are deliberately smaller so the complete JSON-RPC request stays within the stdio safety limit.
+          - Prefer URL output to keep large binary payloads out of MCP context.''',
+              'skill media rules',
+          )
+
+          server_path.write_text(server, encoding='utf-8', newline='\n')
+          test_path.write_text(tests, encoding='utf-8', newline='\n')
+          readme_path.write_text(readme, encoding='utf-8', newline='\n')
+          skill_path.write_text(skill, encoding='utf-8', newline='\n')
+          PY
+
+          npm ci
+          npm run check
+          git diff --check
+          if git grep -n '14_000_000' -- plugins/Hylouis233/minimax-token-plan; then
+            echo 'obsolete media limit remains' >&2
+            exit 1
+          fi
+
+          git add plugins/Hylouis233/minimax-token-plan
+          git diff --cached --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'fix: align media bounds and redact response keys'
+          git push origin HEAD:agent/minimax-token-plan-suite
