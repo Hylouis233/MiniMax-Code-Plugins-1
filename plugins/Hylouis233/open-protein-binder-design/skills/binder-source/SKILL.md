@@ -5,7 +5,7 @@ description: >-
 argument-hint: '[list|inspect <source_id>|lock <source_id>|download <source_id> <path>]'
 metadata:
   domains: [protein-binder, data-source, provenance]
-  last_reviewed: '2026-08-20'
+  last_reviewed: '2026-08-23'
 ---
 
 # binder-source：数据源登记与白名单下载
@@ -16,7 +16,7 @@ binder campaign 的一切分析都从"数据从哪来、锁在哪个版本、哪
 
 ## 前置检查
 
-1. 确认本仓库已安装：`pip install -e ".[dev]"`，`openbinder --help` 可用（或 `python -m openbinder`）。
+1. 确认 `openbinder` CLI 已按本插件 README 的 pinned release 安装：`pip install "openbinder @ git+https://github.com/Hylouis233/open-protein-binder-design@v0.1.1"`，随后确认 `openbinder --help` 可用（或 `python -m openbinder`）。不要在 MiniMax Plugin 目录执行 `pip install -e ".[dev]"`；该目录不是 `openbinder` 的 Python source checkout。
 2. 确认源已登记：`openbinder source list` 应列出目标 source_id（当前为 `anthropic-claude-binder-v1`）。未登记的源不能靠猜名字使用。
 3. `inspect` / `lock` / `download` 需要网络访问 Hugging Face；离线环境下它们会以结构化错误失败（exit 2），这不是 bug，不得把失败当成"源不存在"。只有 `source list` 是纯本地的。
 4. 产物落盘目录遵循 `output/binder-source/<slug>/<timestamp>/`；slug 由项目名确定，timestamp 每次运行一个。
