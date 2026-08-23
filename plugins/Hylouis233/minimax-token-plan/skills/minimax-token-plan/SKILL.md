@@ -23,8 +23,10 @@ Hailuo/H3 video, MiniMax Music, lyrics generation, or the MiniMax multimodal API
 
 ## Media rules
 
-- Vision accepts HTTPS URLs or `data:image/jpeg|png|webp;base64,...`; never pass arbitrary local
-  paths.
+- Vision and single subject-reference inputs accept HTTPS URLs or bounded
+  `data:image/jpeg|png|webp;base64,...` values; never pass arbitrary local paths.
+- Video reference-image, video, and audio collections require HTTPS URLs. First/last-frame inline data
+  images are deliberately smaller so the complete JSON-RPC request stays within the stdio safety limit.
 - Prefer URL output to keep large binary payloads out of MCP context.
 - Generated URLs can expire; tell the user to persist desired outputs promptly.
 - Never echo API keys, authorization headers, or full data-URI media.

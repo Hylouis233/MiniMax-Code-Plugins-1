@@ -52,7 +52,7 @@ placed in prompts.
 |---|---|---|
 | `minimax_get_capabilities` | none | Reports configured key classes and documented coverage; no network call. |
 | `minimax_web_search` | Token Plan | Official `/v1/coding_plan/search`. |
-| `minimax_understand_image` | Token Plan | Official `/v1/coding_plan/vlm`; HTTPS or data-image sources only. |
+| `minimax_understand_image` | Token Plan | Official `/v1/coding_plan/vlm`; HTTPS or bounded inline data-image sources only. |
 | `minimax_generate_image` | Token Plan, fallback paygo | Text-to-image and one subject reference. |
 | `minimax_list_voices` | Token Plan, fallback paygo | Read-only voice inventory. |
 | `minimax_text_to_speech` | Token Plan, fallback paygo | Defaults to `speech-2.8-hd` and URL output. |
@@ -95,8 +95,10 @@ returns once with a task ID; a later query returns the task status and output UR
 - Generated URL results may expire. Download them promptly using a trusted client if persistence is
   required.
 - The server accepts only the official Global/Mainland HTTPS API hosts in production.
-- Local file paths are not accepted for vision/reference media. Use an HTTPS URL or a bounded data
-  image URL to prevent accidental local-file exfiltration.
+- Local file paths are not accepted for vision/reference media. Single-image tools accept HTTPS or
+  inline JPEG/PNG/WebP data URLs below 900,000 characters. Video reference collections require HTTPS;
+  optional first/last-frame data images are capped at 430,000 characters each so every schema-valid
+  request remains below the 1,000,000-character stdio frame limit.
 
 ## Official references
 
@@ -120,8 +122,9 @@ returns once with a task ID; a later query returns the task status and output UR
 
 - Destinations: `https://api.minimax.io` (Global) or `https://api.minimaxi.com` (Mainland), selected
   by `MINIMAX_API_HOST`. Production mode rejects every other host.
-- Submitted data: prompts, search queries, text for speech, image/video/audio URLs, bounded data
-  image URLs, and generation settings are sent only when the corresponding tool is called.
+- Submitted data: prompts, search queries, text for speech, bounded single-image data URLs,
+  HTTPS image/video/audio references, and generation settings are sent only when the corresponding tool
+  is called.
 - Returned data: structured API metadata and expiring output URLs. Unexpected large binary strings
   are truncated before entering MCP context; responses above 5 MiB are rejected.
 - Local data: no credentials, prompts, media, or outputs are persisted. Arbitrary local media paths
@@ -131,10 +134,11 @@ returns once with a task ID; a later query returns the task status and output UR
 ## Validation evidence
 
 ```text
-node --test plugins/Hylouis233/minimax-token-plan/test/server.test.mjs
-16 tests passed
+npm run check
 ```
 
-The fixture uses a local mock API and verifies key routing, explicit usage confirmation, host/media
-validation, bounded responses, quota errors, video task separation, music lifecycle warnings, and
-the complete stdio initialize/list/call handshake without consuming real MiniMax resources.
+The repository check runs all plugin tests plus manifest, schema, output-schema, and secret scans. The
+local MiniMax fixture verifies key routing, explicit usage confirmation, schema/transport media bounds,
+HTTPS-only reference collections, response-key redaction and truncation, bounded responses, quota errors,
+video task separation, music lifecycle warnings, and the complete stdio initialize/list/call handshake
+without consuming real MiniMax resources.

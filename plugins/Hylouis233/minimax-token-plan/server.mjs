@@ -6,6 +6,10 @@ const PROTOCOL_VERSION = "2024-11-05";
 const SERVER_NAME = "minimax-token-plan-mcp-server";
 const SERVER_VERSION = "0.1.0";
 const MAX_LINE_CHARS = 1_000_000;
+const MAX_INLINE_IMAGE_CHARS = 900_000;
+const MAX_VIDEO_FRAME_IMAGE_CHARS = 430_000;
+const MAX_REMOTE_URL_CHARS = 4096;
+const MAX_OUTPUT_KEY_CHARS = 512;
 const MAX_RESPONSE_BYTES = 5 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 120_000;
 const OFFICIAL_HOSTS = new Set([
@@ -33,6 +37,28 @@ const CONFIRM_USAGE = {
   const: true,
   description: "Must be true after the user explicitly confirms quota, Credits, or balance use.",
 };
+
+const HTTPS_URL_SCHEMA = {
+  type: "string",
+  minLength: 1,
+  maxLength: MAX_REMOTE_URL_CHARS,
+  pattern: "^[Hh][Tt][Tt][Pp][Ss]://",
+};
+
+function mediaSourceSchema(maxInline, description) {
+  return {
+    oneOf: [
+      { ...HTTPS_URL_SCHEMA },
+      {
+        type: "string",
+        minLength: 1,
+        maxLength: maxInline,
+        pattern: "^data:image/(?:jpeg|png|webp);base64,[A-Za-z0-9+/=]+$",
+      },
+    ],
+    description,
+  };
+}
 
 const TOOL_DEFINITIONS = [
   {
@@ -67,7 +93,7 @@ const TOOL_DEFINITIONS = [
       type: "object",
       properties: {
         prompt: { type: "string", minLength: 1, maxLength: 2000, description: "Question or extraction instruction." },
-        image_source: { type: "string", minLength: 1, maxLength: 14_000_000, description: "HTTPS URL or data:image/jpeg|png|webp;base64 URL." },
+        image_source: mediaSourceSchema(MAX_INLINE_IMAGE_CHARS, "HTTPS URL or bounded data:image/jpeg|png|webp;base64 URL."),
         confirm_usage: CONFIRM_USAGE,
       },
       required: ["prompt", "image_source", "confirm_usage"],
@@ -88,7 +114,7 @@ const TOOL_DEFINITIONS = [
         aspect_ratio: { type: "string", enum: ["1:1", "16:9", "4:3", "3:2", "2:3", "3:4", "9:16", "21:9"], default: "1:1" },
         n: { type: "integer", minimum: 1, maximum: 9, default: 1 },
         prompt_optimizer: { type: "boolean", default: true },
-        subject_reference_url: { type: "string", minLength: 1, maxLength: 14_000_000, description: "Optional HTTPS or data-image character reference." },
+        subject_reference_url: mediaSourceSchema(MAX_INLINE_IMAGE_CHARS, "Optional HTTPS or bounded data-image character reference."),
         confirm_usage: CONFIRM_USAGE,
       },
       required: ["prompt", "confirm_usage"],
@@ -139,7 +165,7 @@ const TOOL_DEFINITIONS = [
   {
     name: "minimax_create_video",
     description:
-      "Create a MiniMax-H3 V2 video task with an explicit pay-as-you-go key. H3 is not a Token Plan entitlement. Returns a task ID and never polls automatically.",
+      "Create a MiniMax-H3 V2 video task with an explicit pay-as-you-go key. H3 is not a Token Plan entitlement. Frame inputs accept HTTPS or bounded inline images; reference collections require HTTPS. Returns a task ID and never polls automatically.",
     inputSchema: {
       type: "object",
       properties: {
@@ -147,11 +173,11 @@ const TOOL_DEFINITIONS = [
         resolution: { type: "string", enum: ["768P", "2K"], default: "2K" },
         duration: { type: "integer", minimum: 4, maximum: 15, default: 5 },
         ratio: { type: "string", enum: ["adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"] },
-        first_frame_url: { type: "string", minLength: 1, maxLength: 14_000_000 },
-        last_frame_url: { type: "string", minLength: 1, maxLength: 14_000_000 },
-        reference_image_urls: { type: "array", maxItems: 9, items: { type: "string", minLength: 1, maxLength: 14_000_000 } },
-        reference_video_urls: { type: "array", maxItems: 3, items: { type: "string", minLength: 1, maxLength: 4096 } },
-        reference_audio_urls: { type: "array", maxItems: 3, items: { type: "string", minLength: 1, maxLength: 4096 } },
+        first_frame_url: mediaSourceSchema(MAX_VIDEO_FRAME_IMAGE_CHARS, "HTTPS URL or bounded inline first-frame image."),
+        last_frame_url: mediaSourceSchema(MAX_VIDEO_FRAME_IMAGE_CHARS, "HTTPS URL or bounded inline last-frame image."),
+        reference_image_urls: { type: "array", maxItems: 9, items: { ...HTTPS_URL_SCHEMA }, description: "HTTPS reference-image URLs; inline data images are intentionally excluded from collections." },
+        reference_video_urls: { type: "array", maxItems: 3, items: { ...HTTPS_URL_SCHEMA } },
+        reference_audio_urls: { type: "array", maxItems: 3, items: { ...HTTPS_URL_SCHEMA } },
         confirm_usage: CONFIRM_USAGE,
       },
       required: ["prompt", "confirm_usage"],
@@ -203,7 +229,7 @@ const TOOL_DEFINITIONS = [
         lyrics: { type: "string", maxLength: 3500 },
         lyrics_optimizer: { type: "boolean", default: false },
         is_instrumental: { type: "boolean", default: false },
-        audio_url: { type: "string", minLength: 1, maxLength: 4096 },
+        audio_url: { ...HTTPS_URL_SCHEMA },
         cover_feature_id: { type: "string", minLength: 1, maxLength: 256 },
         sample_rate: { type: "integer", enum: [16000, 24000, 32000, 44100], default: 44100 },
         bitrate: { type: "integer", enum: [32000, 64000, 128000, 256000], default: 256000 },
@@ -223,7 +249,7 @@ const TOOL_DEFINITIONS = [
     inputSchema: {
       type: "object",
       properties: {
-        audio_url: { type: "string", minLength: 1, maxLength: 4096 },
+        audio_url: { ...HTTPS_URL_SCHEMA },
         confirm_usage: CONFIRM_USAGE,
       },
       required: ["audio_url", "confirm_usage"],
@@ -319,18 +345,26 @@ function confirmed(args) {
   }
 }
 
-function mediaSource(value, name = "media source") {
+function mediaSource(value, name = "media source", { maxInline = MAX_INLINE_IMAGE_CHARS } = {}) {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new ToolInputError(name + " must be a non-empty string");
+  }
   if (value.startsWith("data:image/")) {
     if (!/^data:image\/(?:jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/u.test(value)) {
       throw new ToolInputError(name + " must be a JPEG, PNG, or WebP base64 data URL");
     }
-    if (value.length > 14_000_000) throw new ToolInputError(name + " exceeds the bounded data URL limit");
+    if (value.length > maxInline) {
+      throw new ToolInputError(name + ` exceeds the ${maxInline.toLocaleString("en-US")} character inline-image limit; use HTTPS for larger media`);
+    }
     return value;
   }
   return httpsUrl(value, name);
 }
 
-function httpsUrl(value, name = "URL") {
+function httpsUrl(value, name = "URL", max = MAX_REMOTE_URL_CHARS) {
+  if (typeof value !== "string" || value.length < 1 || value.length > max) {
+    throw new ToolInputError(`${name} length must be between 1 and ${max}`);
+  }
   let parsed;
   try {
     parsed = new URL(value);
@@ -420,7 +454,10 @@ function redactSecrets(value, secrets, depth = 0) {
   if (Array.isArray(value)) return value.map((item) => redactSecrets(item, secrets, depth + 1));
   if (value && typeof value === "object") {
     return Object.fromEntries(
-      Object.entries(value).map(([name, item]) => [name, redactSecrets(item, secrets, depth + 1)]),
+      Object.entries(value).map(([name, item]) => [
+        redactSecrets(name, secrets, depth + 1),
+        redactSecrets(item, secrets, depth + 1),
+      ]),
     );
   }
   return value;
@@ -469,6 +506,13 @@ async function apiRequest(path, { method = "POST", body = undefined, keyKind = "
   return payload;
 }
 
+function sanitizeKey(value) {
+  const key = String(value);
+  if (key.length <= MAX_OUTPUT_KEY_CHARS) return key;
+  const kept = 256;
+  return key.slice(0, kept) + `<${key.length - kept} key characters omitted>`;
+}
+
 function sanitize(value, depth = 0) {
   if (depth > 8) return "<maximum nesting omitted>";
   if (typeof value === "string") {
@@ -477,7 +521,9 @@ function sanitize(value, depth = 0) {
   }
   if (Array.isArray(value)) return value.slice(0, 100).map((item) => sanitize(item, depth + 1));
   if (value && typeof value === "object") {
-    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, sanitize(item, depth + 1)]));
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [sanitizeKey(key), sanitize(item, depth + 1)]),
+    );
   }
   return value;
 }
@@ -560,7 +606,7 @@ export async function executeTool(name, rawArgs = {}, options = {}) {
   if (name === "minimax_understand_image") {
     only(args, ["prompt", "image_source", "confirm_usage"]); confirmed(args);
     const prompt = stringArg(args, "prompt", { required: true, min: 1, max: 2000 });
-    const imageSource = mediaSource(stringArg(args, "image_source", { required: true, min: 1, max: 14_000_000 }), "image_source");
+    const imageSource = mediaSource(stringArg(args, "image_source", { required: true, min: 1, max: MAX_INLINE_IMAGE_CHARS }), "image_source");
     return await apiRequest("/v1/coding_plan/vlm", { body: { prompt, image_url: imageSource }, keyKind: "token", env, fetchImpl, apiHostOverride });
   }
   if (name === "minimax_generate_image") {
@@ -573,7 +619,7 @@ export async function executeTool(name, rawArgs = {}, options = {}) {
       prompt_optimizer: booleanArg(args, "prompt_optimizer", true),
       response_format: "url",
     };
-    const reference = stringArg(args, "subject_reference_url");
+    const reference = stringArg(args, "subject_reference_url", { max: MAX_INLINE_IMAGE_CHARS });
     if (reference) body.subject_reference = [{ type: "character", image_file: mediaSource(reference, "subject_reference_url") }];
     return await apiRequest("/v1/image_generation", { body, keyKind: "eligible", env, fetchImpl, apiHostOverride });
   }
@@ -608,8 +654,8 @@ export async function executeTool(name, rawArgs = {}, options = {}) {
   if (name === "minimax_create_video") {
     only(args, ["prompt", "resolution", "duration", "ratio", "first_frame_url", "last_frame_url", "reference_image_urls", "reference_video_urls", "reference_audio_urls", "confirm_usage"]); confirmed(args);
     const content = [{ type: "text", text: stringArg(args, "prompt", { required: true, min: 1, max: 2000 }) }];
-    const first = stringArg(args, "first_frame_url");
-    const last = stringArg(args, "last_frame_url");
+    const first = stringArg(args, "first_frame_url", { max: MAX_VIDEO_FRAME_IMAGE_CHARS });
+    const last = stringArg(args, "last_frame_url", { max: MAX_VIDEO_FRAME_IMAGE_CHARS });
     const referenceImages = args.reference_image_urls ?? [];
     if (!Array.isArray(referenceImages) || referenceImages.length > 9 || referenceImages.some((item) => typeof item !== "string")) {
       throw new ToolInputError("reference_image_urls must be an array of at most nine strings");
@@ -625,10 +671,10 @@ export async function executeTool(name, rawArgs = {}, options = {}) {
     if ((first || last) && (referenceImages.length || referenceVideos.length || referenceAudios.length)) {
       throw new ToolInputError("first/last-frame inputs cannot be mixed with reference media inputs");
     }
-    if (first) content.push({ type: "image_url", image_url: { url: mediaSource(first, "first_frame_url") }, role: "first_frame" });
-    if (last) content.push({ type: "image_url", image_url: { url: mediaSource(last, "last_frame_url") }, role: "last_frame" });
+    if (first) content.push({ type: "image_url", image_url: { url: mediaSource(first, "first_frame_url", { maxInline: MAX_VIDEO_FRAME_IMAGE_CHARS }) }, role: "first_frame" });
+    if (last) content.push({ type: "image_url", image_url: { url: mediaSource(last, "last_frame_url", { maxInline: MAX_VIDEO_FRAME_IMAGE_CHARS }) }, role: "last_frame" });
     for (const item of referenceImages) {
-      content.push({ type: "image_url", image_url: { url: mediaSource(item, "reference_image_urls item") }, role: "reference_image" });
+      content.push({ type: "image_url", image_url: { url: httpsUrl(item, "reference_image_urls item") }, role: "reference_image" });
     }
     for (const item of referenceVideos) {
       content.push({ type: "video_url", video_url: { url: httpsUrl(item, "reference_video_urls item") }, role: "reference_video" });
@@ -686,7 +732,7 @@ export async function executeTool(name, rawArgs = {}, options = {}) {
     const lyrics = stringArg(args, "lyrics", { max: 3500 });
     const optimizer = booleanArg(args, "lyrics_optimizer", false);
     const instrumental = booleanArg(args, "is_instrumental", false);
-    const audioUrl = stringArg(args, "audio_url");
+    const audioUrl = stringArg(args, "audio_url", { max: MAX_REMOTE_URL_CHARS });
     const coverFeatureId = stringArg(args, "cover_feature_id", { max: 256 });
     if (model === "music-cover") {
       if (Boolean(audioUrl) === Boolean(coverFeatureId)) {
@@ -716,7 +762,7 @@ export async function executeTool(name, rawArgs = {}, options = {}) {
     only(args, ["audio_url", "confirm_usage"]); confirmed(args);
     const body = {
       model: "music-cover",
-      audio_url: httpsUrl(stringArg(args, "audio_url", { required: true, min: 1, max: 4096 }), "audio_url"),
+      audio_url: httpsUrl(stringArg(args, "audio_url", { required: true, min: 1, max: MAX_REMOTE_URL_CHARS }), "audio_url"),
     };
     return await apiRequest("/v1/music_cover_preprocess", { body, keyKind: "eligible", env, fetchImpl, apiHostOverride });
   }

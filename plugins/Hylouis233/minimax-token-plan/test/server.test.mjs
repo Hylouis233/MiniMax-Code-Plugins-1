@@ -49,6 +49,14 @@ async function mockApi(context) {
       }));
       return;
     }
+    if (body?.q === "echo-secret-key") {
+      response.end(JSON.stringify({
+        [request.headers.authorization]: "secret appeared in an object key",
+        ["k".repeat(20_000)]: "oversized object key",
+        base_resp: { status_code: 0, status_msg: "success" },
+      }));
+      return;
+    }
     if (body?.q === "auth-error") {
       response.statusCode = 401;
       response.end(JSON.stringify({
@@ -193,6 +201,62 @@ test("vision rejects local paths and video rejects mixed generation modes", asyn
   assert.equal(api.requests.length, 0);
 });
 
+
+test("media schemas fit the stdio frame and reference collections remain HTTPS-only", async (context) => {
+  const api = await mockApi(context);
+  const vision = TOOL_DEFINITIONS.find((tool) => tool.name === "minimax_understand_image");
+  const image = TOOL_DEFINITIONS.find((tool) => tool.name === "minimax_generate_image");
+  const video = TOOL_DEFINITIONS.find((tool) => tool.name === "minimax_create_video");
+  const visionSource = vision.inputSchema.properties.image_source;
+  const subjectSource = image.inputSchema.properties.subject_reference_url;
+  const videoProps = video.inputSchema.properties;
+  const inlineMax = (schema) => Math.max(...schema.oneOf.map((entry) => entry.maxLength));
+  assert.equal(inlineMax(visionSource), 900_000);
+  assert.equal(inlineMax(subjectSource), 900_000);
+  assert.equal(inlineMax(videoProps.first_frame_url), 430_000);
+  assert.equal(inlineMax(videoProps.last_frame_url), 430_000);
+  assert.equal(videoProps.reference_image_urls.items.maxLength, 4096);
+
+  const dataUrl = (length) => {
+    const prefix = "data:image/png;base64,";
+    return prefix + "A".repeat(length - prefix.length);
+  };
+  const https = (length) => {
+    const prefix = "https://example.com/";
+    return prefix + "a".repeat(length - prefix.length);
+  };
+  const worstCase = JSON.stringify({
+    jsonrpc: "2.0", id: 1, method: "tools/call",
+    params: { name: "minimax_create_video", arguments: {
+      prompt: "p".repeat(2000),
+      first_frame_url: dataUrl(430_000),
+      last_frame_url: dataUrl(430_000),
+      reference_image_urls: Array.from({ length: 9 }, () => https(4096)),
+      reference_video_urls: Array.from({ length: 3 }, () => https(4096)),
+      reference_audio_urls: Array.from({ length: 3 }, () => https(4096)),
+      confirm_usage: true,
+    } },
+  });
+  assert.ok(worstCase.length < 1_000_000);
+
+  await assert.rejects(executeTool("minimax_create_video", {
+    prompt: "inline collection fixture",
+    reference_image_urls: ["data:image/png;base64,AA=="],
+    confirm_usage: true,
+  }, apiOptions(api)), /HTTPS URL/u);
+  await assert.rejects(executeTool("minimax_create_video", {
+    prompt: "overlong URL fixture",
+    reference_video_urls: [https(4097)],
+    confirm_usage: true,
+  }, apiOptions(api)), /length must be between 1 and 4096/u);
+  await assert.rejects(executeTool("minimax_create_video", {
+    prompt: "overlong frame fixture",
+    first_frame_url: dataUrl(430_001),
+    confirm_usage: true,
+  }, apiOptions(api)), /length must be between 0 and 430000/u);
+  assert.equal(api.requests.length, 0);
+});
+
 test("H3 video creation and query use only the paygo key", async (context) => {
   const api = await mockApi(context);
   const created = await executeTool("minimax_create_video", {
@@ -298,6 +362,22 @@ test("upstream responses cannot echo configured API keys into MCP context", asyn
   }, apiOptions(api));
   assert.equal(response.echoed, "Bearer <redacted-api-key>");
   assert.doesNotMatch(JSON.stringify(response), /token-secret|paygo-secret/u);
+});
+
+test("upstream object keys are redacted and bounded before entering MCP context", async (context) => {
+  const api = await mockApi(context);
+  const message = await handleMessage({
+    jsonrpc: "2.0", id: 77, method: "tools/call",
+    params: { name: "minimax_web_search", arguments: {
+      query: "echo-secret-key", confirm_usage: true,
+    } },
+  }, apiOptions(api));
+  const result = message.result.structuredContent.result;
+  const keys = Object.keys(result);
+  assert.ok(keys.includes("Bearer <redacted-api-key>"));
+  assert.ok(keys.some((key) => key.includes("key characters omitted")));
+  assert.ok(keys.every((key) => key.length < 600));
+  assert.doesNotMatch(JSON.stringify(message), /token-secret|paygo-secret|k{1000}/u);
 });
 
 test("authentication errors are actionable and cannot echo the failed key", async (context) => {
