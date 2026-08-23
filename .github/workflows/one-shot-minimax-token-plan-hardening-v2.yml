@@ -1,0 +1,93 @@
+name: One-shot minimax-token-plan input hardening v2
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - .github/minimax-token-plan-hardening-v2-trigger.md
+
+permissions:
+  contents: write
+
+jobs:
+  harden:
+    if: github.repository == 'Hylouis233/MiniMax-Code-Plugins-1'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout contribution branch
+        uses: actions/checkout@v5
+        with:
+          ref: agent/minimax-token-plan-suite
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Extract, repair, and execute the validated hardening script
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          python - <<'PY'
+          from pathlib import Path
+          import subprocess
+          import textwrap
+
+          workflow = subprocess.check_output(
+              ['git', 'show', 'origin/main:.github/workflows/one-shot-minimax-token-plan-hardening.yml'],
+              text=True,
+          )
+          lines = workflow.splitlines()
+          marker = '        run: |'
+          try:
+              start = lines.index(marker) + 1
+          except ValueError as exc:
+              raise SystemExit('could not locate the reusable hardening script') from exc
+          script = textwrap.dedent('\n'.join(lines[start:])) + '\n'
+
+          old_before = """'''  if (value && typeof value === \"object\") {
+              return Object.fromEntries(
+                Object.entries(value).map(([name, item]) => [name, redactSecrets(item, secrets, depth + 1)]),
+              );
+            }'''"""
+          new_before = """'''  if (value && typeof value === \"object\") {
+            return Object.fromEntries(
+              Object.entries(value).map(([name, item]) => [name, redactSecrets(item, secrets, depth + 1)]),
+            );
+          }'''"""
+
+          old_after = """'''  if (value && typeof value === \"object\") {
+              return Object.fromEntries(
+                Object.entries(value).map(([name, item]) => [
+                  redactSecrets(name, secrets, depth + 1),
+                  redactSecrets(item, secrets, depth + 1),
+                ]),
+              );
+            }'''"""
+          new_after = """'''  if (value && typeof value === \"object\") {
+            return Object.fromEntries(
+              Object.entries(value).map(([name, item]) => [
+                redactSecrets(name, secrets, depth + 1),
+                redactSecrets(item, secrets, depth + 1),
+              ]),
+            );
+          }'''"""
+
+          for label, old, new in (
+              ('redaction source', old_before, new_before),
+              ('redaction replacement', old_after, new_after),
+          ):
+              count = script.count(old)
+              if count != 1:
+                  raise SystemExit(f'{label}: expected one extracted-script match, found {count}')
+              script = script.replace(old, new, 1)
+
+          path = Path('/tmp/minimax-token-plan-hardening.sh')
+          path.write_text(script, encoding='utf-8', newline='\n')
+          PY
+          bash /tmp/minimax-token-plan-hardening.sh
