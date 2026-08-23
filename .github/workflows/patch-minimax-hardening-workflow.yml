@@ -1,0 +1,76 @@
+name: Repair minimax-token-plan hardening workflow matcher
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - .github/patch-hardening-workflow-trigger.md
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    if: github.repository == 'Hylouis233/MiniMax-Code-Plugins-1'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+      - name: Repair exact source indentation in one-shot patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('.github/workflows/one-shot-minimax-token-plan-hardening.yml')
+          text = path.read_text(encoding='utf-8')
+
+          old_before = """'''  if (value && typeof value === \"object\") {
+                return Object.fromEntries(
+                  Object.entries(value).map(([name, item]) => [name, redactSecrets(item, secrets, depth + 1)]),
+                );
+              }'''"""
+          new_before = """'''  if (value && typeof value === \"object\") {
+            return Object.fromEntries(
+              Object.entries(value).map(([name, item]) => [name, redactSecrets(item, secrets, depth + 1)]),
+            );
+          }'''"""
+
+          old_after = """'''  if (value && typeof value === \"object\") {
+                return Object.fromEntries(
+                  Object.entries(value).map(([name, item]) => [
+                    redactSecrets(name, secrets, depth + 1),
+                    redactSecrets(item, secrets, depth + 1),
+                  ]),
+                );
+              }'''"""
+          new_after = """'''  if (value && typeof value === \"object\") {
+            return Object.fromEntries(
+              Object.entries(value).map(([name, item]) => [
+                redactSecrets(name, secrets, depth + 1),
+                redactSecrets(item, secrets, depth + 1),
+              ]),
+            );
+          }'''"""
+
+          for label, old, new in (
+              ('redaction source', old_before, new_before),
+              ('redaction replacement', old_after, new_after),
+          ):
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'{label}: expected one match, found {count}')
+              text = text.replace(old, new, 1)
+
+          path.write_text(text, encoding='utf-8', newline='\n')
+          PY
+
+          git diff --check
+          git add .github/workflows/one-shot-minimax-token-plan-hardening.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'chore: repair minimax hardening matcher'
+          git push origin HEAD:main
