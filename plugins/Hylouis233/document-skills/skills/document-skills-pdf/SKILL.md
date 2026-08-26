@@ -1,5 +1,5 @@
 ---
-name: pdf
+name: document-skills-pdf
 description: Create, extract, transform, or analyze PDF documents. Use this Skill whenever a .pdf file is the input or output - generating reports, one-pagers, posters or structured documents as real selectable-text PDFs; extracting text, tables or images from existing PDFs; merging, splitting, rotating, or watermarking pages; filling forms; checking that a produced PDF has the right page count and extractable text.
 ---
 

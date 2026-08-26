@@ -1,5 +1,5 @@
 ---
-name: xlsx
+name: document-skills-xlsx
 description: Read, edit, create, or fix spreadsheet files - .xlsx, .xlsm, .xltx, .csv, .tsv. Use this Skill whenever a spreadsheet is the primary input or output: opening and inspecting workbooks, editing cells or adding sheets, writing real formulas instead of pasted values, cleaning messy data, adding charts and formatting, converting between tabular formats, or diagnosing corrupted or slow-opening files.
 ---
 

@@ -12,7 +12,10 @@ const testsRoot = path.dirname(fileURLToPath(import.meta.url));
 const python = process.env.PYTHON || (process.platform === "win32" ? "python" : "python3");
 
 test("PDF runtime skill refuses unsupported accessibility claims", async () => {
-  const skill = await readFile(path.join(testsRoot, "..", "skills", "pdf", "SKILL.md"), "utf8");
+  const skill = await readFile(
+    path.join(testsRoot, "..", "skills", "document-skills-pdf", "SKILL.md"),
+    "utf8",
+  );
   assert.match(skill, /ReportLab does not produce a tagged PDF\/UA\s+document/);
   assert.match(skill, /do not describe ordinary ReportLab output as accessible or screen-reader-ready/);
   assert.match(skill, /stop and report the limitation/);

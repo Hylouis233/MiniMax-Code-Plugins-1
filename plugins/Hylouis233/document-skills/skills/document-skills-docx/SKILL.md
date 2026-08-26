@@ -1,5 +1,5 @@
 ---
-name: docx
+name: document-skills-docx
 description: Create, read, edit, or review Microsoft Word .docx documents. Use this Skill whenever the task involves a .docx file - generating reports, letters, or structured documents from scratch; extracting or reorganizing content; applying consistent formatting (headings, tables, styles, headers/footers, page numbers); editing an existing document while preserving its layout; or checking that a produced document actually opens and renders.
 ---
 

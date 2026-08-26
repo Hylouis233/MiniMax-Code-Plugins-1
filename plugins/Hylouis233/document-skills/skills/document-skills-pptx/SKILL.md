@@ -1,5 +1,5 @@
 ---
-name: pptx
+name: document-skills-pptx
 description: Create, read, edit, or analyze PowerPoint .pptx presentations. Use this Skill whenever the task involves slides or a deck - building a presentation from an outline or content file; editing text, tables, or charts in an existing deck; extracting slide content for review or repurposing; checking that a produced deck opens, has the right slide count, and nothing overflows its slide.
 ---
 
