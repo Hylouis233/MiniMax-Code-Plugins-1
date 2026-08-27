@@ -1,0 +1,58 @@
+name: One-shot document-skills fixture fix
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/one-shot-document-skills-fixture-fix.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  fix-and-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b18 # v7.0.1
+        with:
+          ref: plugin/document-skills
+          fetch-depth: 0
+          persist-credentials: true
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: plugins/Hylouis233/document-skills/tests/requirements-fixtures.txt
+      - name: Apply exact fixture path repair
+        shell: python
+        run: |
+          from pathlib import Path
+          path = Path('plugins/Hylouis233/document-skills/tests/xlsx_fixture.py')
+          old = 'Path(__file__).resolve().parents[1] / "skills" / "xlsx" / "references" / "package.md"'
+          new = 'Path(__file__).resolve().parents[1] / "skills" / "document-skills-xlsx" / "references" / "package.md"'
+          text = path.read_text(encoding='utf-8')
+          count = text.count(old)
+          if count != 1:
+              raise SystemExit(f'expected exactly one stale path, found {count}')
+          path.write_text(text.replace(old, new), encoding='utf-8', newline='\n')
+      - run: npm ci
+      - run: npm run validate
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libreoffice-writer
+      - run: python -m pip install -r plugins/Hylouis233/document-skills/tests/requirements-fixtures.txt
+      - run: node --test plugins/Hylouis233/document-skills/tests/fixtures.integration.mjs
+      - run: git diff --check
+      - name: Commit validated repair
+        run: |
+          if git diff --quiet; then
+            echo 'No change needed.'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add plugins/Hylouis233/document-skills/tests/xlsx_fixture.py
+          git commit -m 'fix: repair xlsx fixture skill path'
+          git push origin HEAD:plugin/document-skills
