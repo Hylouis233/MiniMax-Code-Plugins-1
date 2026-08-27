@@ -1,0 +1,65 @@
+name: One-shot cli-agent-bridge Windows root cause
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/one-shot-cli-agent-bridge-rootcause.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  provenance-fix-check:
+    runs-on: windows-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b18
+        with:
+          ref: plugin/cli-agent-bridge
+          fetch-depth: 0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Apply provenance identity fix only
+        shell: python
+        run: |
+          from pathlib import Path
+          path = Path('plugins/Hylouis233/cli-agent-bridge/server.mjs')
+          text = path.read_text(encoding='utf-8')
+          old = '''  const normalizeWorktree = (value) => {\n    return path.resolve(String(value ?? ""));\n  };'''
+          new = '''  const normalizeWorktree = (value) => {\n    const resolved = path.resolve(String(value ?? ""));\n    return process.platform === "win32" ? resolved.toLowerCase() : resolved;\n  };'''
+          if text.count(old) != 1:
+              raise SystemExit(f'match count: {text.count(old)}')
+          path.write_text(text.replace(old, new, 1), encoding='utf-8', newline='\n')
+      - run: node --test --test-name-pattern="successive fetches are detected even after FETCH_HEAD is overwritten" plugins/Hylouis233/cli-agent-bridge/tests/server.test.mjs
+      - run: node --test --test-name-pattern="a partially successful nonzero fetch makes provenance uncertain" plugins/Hylouis233/cli-agent-bridge/tests/server.test.mjs
+
+  holder-response-diagnostic:
+    runs-on: windows-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b18
+        with:
+          ref: plugin/cli-agent-bridge
+          fetch-depth: 0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Instrument holder response without changing production code
+        shell: python
+        run: |
+          from pathlib import Path
+          path = Path('plugins/Hylouis233/cli-agent-bridge/tests/server.test.mjs')
+          text = path.read_text(encoding='utf-8')
+          old = '''    await waitFor(async () => (await events(eventFile)).some(\n      (item) => item.name === "deadline-holder" && item.event === "start",\n    ));\n    const startedAt = Date.now();'''
+          new = '''    const holderDiagnostic = await Promise.race([\n      holder,\n      new Promise((resolve) => setTimeout(() => resolve({ diagnosticTimeout: true }), 20_000)),\n    ]);\n    console.error("HOLDER_DIAGNOSTIC=" + JSON.stringify(holderDiagnostic));\n    console.error("SERVER_STDERR=" + client.stderr);\n    assert.fail("diagnostic stop after holder response capture");\n    const startedAt = Date.now();'''
+          if text.count(old) != 1:
+              raise SystemExit(f'match count: {text.count(old)}')
+          path.write_text(text.replace(old, new, 1), encoding='utf-8', newline='\n')
+      - name: Capture holder response
+        run: node --test --test-name-pattern="a cross-process lock waiter obeys the delegation deadline" plugins/Hylouis233/cli-agent-bridge/tests/server.test.mjs
