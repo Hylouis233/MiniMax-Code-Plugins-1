@@ -1,0 +1,53 @@
+name: One-shot cli-agent-bridge Windows targeted
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/one-shot-cli-agent-bridge-windows-targeted.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  targeted-server:
+    strategy:
+      fail-fast: false
+      matrix:
+        pattern:
+          - 'a cross-process lock waiter obeys the delegation deadline'
+          - 'provenance reads are bounded and interruptible'
+          - 'successive fetches are detected even after FETCH_HEAD is overwritten'
+          - 'a partially successful nonzero fetch makes provenance uncertain'
+    runs-on: windows-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b18
+        with:
+          ref: plugin/cli-agent-bridge
+          fetch-depth: 0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Run exact review case
+        shell: pwsh
+        run: node --test --test-name-pattern="$env:TEST_PATTERN" plugins/Hylouis233/cli-agent-bridge/tests/server.test.mjs
+        env:
+          TEST_PATTERN: ${{ matrix.pattern }}
+
+  windows-process-tree:
+    runs-on: windows-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b18
+        with:
+          ref: plugin/cli-agent-bridge
+          fetch-depth: 0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: node --test plugins/Hylouis233/cli-agent-bridge/tests/process-tree.test.mjs
