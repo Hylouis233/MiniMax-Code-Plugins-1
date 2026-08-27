@@ -28,7 +28,7 @@ def check(name, cond, extra=""):
 
 # Execute the canonical package.md snippet itself so fixtures cannot drift from the Skill.
 package_reference = (
-    Path(__file__).resolve().parents[1] / "skills" / "xlsx" / "references" / "package.md"
+    Path(__file__).resolve().parents[1] / "skills" / "document-skills-xlsx" / "references" / "package.md"
 )
 package_markdown = package_reference.read_text(encoding="utf-8")
 package_code = package_markdown.split("```python", 1)[1].split("```", 1)[0]
