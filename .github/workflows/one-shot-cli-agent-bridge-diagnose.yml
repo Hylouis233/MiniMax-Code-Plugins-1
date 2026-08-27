@@ -1,0 +1,39 @@
+name: One-shot cli-agent-bridge diagnose
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/one-shot-cli-agent-bridge-diagnose.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b18 # v7.0.1
+        with:
+          ref: plugin/cli-agent-bridge
+          fetch-depth: 0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Plugin server suite
+        run: node --test plugins/Hylouis233/cli-agent-bridge/tests/server.test.mjs
+      - name: Process-tree suite
+        if: always()
+        run: node --test plugins/Hylouis233/cli-agent-bridge/tests/process-tree.test.mjs
+      - name: Workspace-lock suite
+        if: always()
+        run: node --test plugins/Hylouis233/cli-agent-bridge/tests/workspace-lock.test.mjs
+      - name: Original integration suite
+        if: always()
+        run: node --test plugins/Hylouis233/cli-agent-bridge/test/server.test.mjs
