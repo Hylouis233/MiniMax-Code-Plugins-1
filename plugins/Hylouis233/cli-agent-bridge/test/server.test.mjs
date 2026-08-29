@@ -6,13 +6,23 @@
 // child process - a leaked server holds stdin/stdout pipes and would keep the
 // node --test runner from ever exiting when an assertion fails.
 
-import { test } from "node:test";
+import { after, before, test } from "node:test";
+import { acquireCliAgentBridgeTestLock } from "../tests/plugin-test-lock.mjs";
 import assert from "node:assert/strict";
 import { spawn, execSync } from "node:child_process";
 import { mkdtempSync, writeFileSync, mkdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+
+let releasePluginTestLock = async () => {};
+before(async () => {
+  releasePluginTestLock = await acquireCliAgentBridgeTestLock();
+});
+after(async () => {
+  await releasePluginTestLock();
+});
+
 
 const server = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "server.mjs");
 
