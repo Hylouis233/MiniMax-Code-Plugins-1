@@ -319,6 +319,9 @@ async function runGit(cwd, args, {
     }
   }
   checkInterrupted(cancel, deadline);
+  if (result.timedOut && deadline !== null && Date.now() >= deadline) {
+    throw new WorkspaceLockDeadlineError("workspace lock acquisition deadline exceeded");
+  }
   if (result.timedOut && !returnOnTimeout) {
     throw new Error("git " + args[0] + " timed out while managing the workspace lock");
   }
