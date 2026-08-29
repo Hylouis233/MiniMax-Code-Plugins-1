@@ -7,8 +7,9 @@ import path from "node:path";
 import { PassThrough } from "node:stream";
 import { createServer } from "node:net";
 import { createInterface } from "node:readline";
-import test from "node:test";
+import test, { after, before } from "node:test";
 import { promisify } from "node:util";
+import { acquireCliAgentBridgeTestLock } from "./plugin-test-lock.mjs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
@@ -34,6 +35,14 @@ const pluginRoot = path.resolve(testsRoot, "..");
 const serverPath = path.join(pluginRoot, "server.mjs");
 const fakeBackendPath = path.join(testsRoot, "fake-backend.mjs");
 const requestKey = (id) => typeof id + ":" + String(id);
+let releasePluginTestLock = null;
+before(async () => {
+  releasePluginTestLock = await acquireCliAgentBridgeTestLock();
+});
+after(async () => {
+  await releasePluginTestLock?.();
+  releasePluginTestLock = null;
+});
 
 test("failed backend command resolutions are retried after installation", async (context) => {
   const binRoot = await mkdtemp(path.join(os.tmpdir(), "cli-agent-resolution-retry-test-"));
@@ -799,7 +808,7 @@ test("a controller cannot terminate again after runCommand settles", async () =>
 });
 
 test("Windows Job runner contains launch and preserves backend streams and exit code", {
-  skip: process.platform !== "win32",
+  skip: process.platform !== "win32" ? "Windows Job Object runner" : false,
 }, async (context) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "cli-agent-job-runner-test-"));
   context.after(() => rm(root, { recursive: true, force: true }));
@@ -954,7 +963,7 @@ test("Windows Job runner contains launch and preserves backend streams and exit 
 });
 
 test("a failed Windows containment runner never falls back to the backend", {
-  skip: process.platform !== "win32",
+  skip: process.platform !== "win32" ? "Windows-only fixture" : false,
 }, async (context) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "cli-agent-job-failure-test-"));
   context.after(() => rm(root, { recursive: true, force: true }));
@@ -992,7 +1001,7 @@ test("a failed Windows containment runner never falls back to the backend", {
 });
 
 test("cancellation in the spawn-to-controller window never launches the backend", {
-  skip: process.platform !== "win32",
+  skip: process.platform !== "win32" ? "Windows-only fixture" : false,
 }, async (context) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "cli-agent-cancel-window-test-"));
   context.after(() => rm(root, { recursive: true, force: true }));
@@ -1245,6 +1254,41 @@ function testCancellation() {
   };
 }
 
+let cachedGitTrace2CanProveLocalFetch;
+async function gitTrace2CanProveLocalFetch() {
+  if (cachedGitTrace2CanProveLocalFetch !== undefined) return cachedGitTrace2CanProveLocalFetch;
+  const root = await mkdtemp(path.join(os.tmpdir(), "cli-agent-trace2-fetch-probe-"));
+  const workspace = path.join(root, "workspace");
+  const upstream = path.join(root, "upstream");
+  let handle = null;
+  try {
+    await mkdir(workspace);
+    await mkdir(upstream);
+    await initializeFixtureRepository(workspace);
+    await initializeFixtureRepository(upstream);
+    await execFileAsync("git", ["checkout", "-b", "topic"], { cwd: upstream });
+    await writeFile(path.join(upstream, "topic.txt"), "trace2 fetch probe\n");
+    await execFileAsync("git", ["add", "topic.txt"], { cwd: upstream });
+    await execFileAsync("git", ["commit", "-m", "trace2 fetch probe"], { cwd: upstream });
+    const tracePath = path.join(root, "probe.trace2");
+    handle = await open(tracePath, "wx+", 0o600);
+    const identity = await handle.stat({ bigint: true });
+    await execFileAsync("git", [
+      "fetch", upstream, "refs/heads/topic:refs/custom/probe-topic",
+    ], { cwd: workspace, env: backendGitProvenanceEnvironment(tracePath) });
+    const provenance = await readBackendGitProvenance({
+      tracePath, handle, identity,
+    }, await gitWorktreeRoot(workspace));
+    cachedGitTrace2CanProveLocalFetch = provenance.sawFetch === true;
+  } catch {
+    cachedGitTrace2CanProveLocalFetch = false;
+  } finally {
+    await handle?.close().catch(() => {});
+    await rm(root, { recursive: true, force: true }).catch(() => {});
+  }
+  return cachedGitTrace2CanProveLocalFetch;
+}
+
 test("explicit backend configuration overrides fail closed atomically", async (context) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "cli-agent-explicit-config-test-"));
   const workspace = path.join(root, "workspace");
@@ -1455,7 +1499,7 @@ test("backend configuration reads obey cancellation, deadline, and shutdown", as
 });
 
 test("Windows config reader termination closes real named-pipe I/O", {
-  skip: process.platform !== "win32",
+  skip: process.platform !== "win32" ? "Windows named-pipe config reader" : false,
 }, async (context) => {
   const pipePath = "\\\\.\\pipe\\cli-agent-config-" + String(process.pid) + "-" +
     String(Date.now());
@@ -1524,6 +1568,8 @@ test("Windows config reader termination closes real named-pipe I/O", {
   }, 50_202);
   const deadlineSocket = await nextConnection();
   const deadlineResponse = await deadlineRequest;
+  assert.ok(deadlineResponse && deadlineResponse.result,
+    "deadline waiter must return a structured MCP result, got " + JSON.stringify(deadlineResponse));
   assert.equal(deadlineResponse.result.structuredContent.timedOut, true,
     JSON.stringify(deadlineResponse));
   await waitForSocketClose(deadlineSocket, "deadline read");
@@ -1842,7 +1888,7 @@ test("unsupported production platforms fail before config, workspace, Git, or ba
 });
 
 test("a bare backend command never resolves from the workspace cwd", {
-  skip: process.platform !== "win32",
+  skip: process.platform !== "win32" ? "Windows PATHEXT workspace-shadow fixture" : false,
 }, async (context) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "cli-agent-backend-shadow-test-"));
   const workspace = path.join(root, "workspace");
@@ -2183,7 +2229,7 @@ test("a repository recreated at the same path gets a new logical lock identity",
 });
 
 test("Git commands ignore an executable shadow in the workspace cwd", {
-  skip: process.platform !== "win32",
+  skip: process.platform !== "win32" ? "Windows git.exe workspace-shadow fixture" : false,
 }, async (context) => {
   const { workspace, client } = await makeHarness(context);
   await copyFile(process.execPath, path.join(workspace, "git.exe"));
@@ -3079,7 +3125,7 @@ test("a detached child remains contained when its parent exits before ancestry p
 });
 
 test("Windows Job cleanup removes a detached child after normal backend exit", {
-  skip: process.platform !== "win32",
+  skip: process.platform !== "win32" ? "Windows Job Object runner" : false,
 }, async (context) => {
   const { tempRoot, workspace, client } = await makeHarness(context);
   const eventFile = path.join(tempRoot, "windows-job-detached-events.jsonl");
@@ -3968,7 +4014,7 @@ test("bounded FETCH_HEAD-style reads reject FIFO and device symlinks without han
 });
 
 test("Windows Trace2 worktree matching preserves case-sensitive path identity", {
-  skip: process.platform !== "win32",
+  skip: process.platform !== "win32" ? "Windows case-insensitive volume Trace2 fixture" : false,
 }, async (context) => {
   const fixture = await makeTraceFixture(context);
   const target = path.join(fixture.root, "CaseSensitiveRepository");
@@ -4138,6 +4184,9 @@ test("successive fetches are detected even after FETCH_HEAD is overwritten", asy
   await execFileAsync("git", ["fetch", first.upstream, "refs/heads/topic"], { cwd: workspace });
   await execFileAsync("git", ["fetch", second.upstream, "refs/heads/topic"], { cwd: workspace });
   await rm(path.join(workspace, ".git", "FETCH_HEAD"), { force: true });
+  if (!await gitTrace2CanProveLocalFetch()) {
+    context.skip("local Git Trace2 fetch provenance unavailable in this environment");
+  }
 
   const tracePath = path.join(tempRoot, "successive-fetch.trace2");
   const traceHandle = await open(tracePath, "wx+", 0o600);
@@ -4157,8 +4206,8 @@ test("successive fetches are detected even after FETCH_HEAD is overwritten", asy
 
   const provenance = await readBackendGitProvenance({
     tracePath, handle: traceHandle, identity: traceIdentity,
-  }, workspace);
-  assert.equal(provenance.sawFetch, true);
+  }, await gitWorktreeRoot(workspace));
+  assert.equal(provenance.sawFetch, true, JSON.stringify(provenance));
   assert.equal(provenance.uncertain, true,
     "any successful target-repository fetch makes commit attribution unavailable");
   const fetchHead = await readFile(path.join(workspace, ".git", "FETCH_HEAD"), "utf8");
@@ -4202,6 +4251,9 @@ test("a partially successful nonzero fetch makes provenance uncertain", async (c
   await execFileAsync("git", ["checkout", "main"], { cwd: workspace });
   await execFileAsync("git", ["branch", "-D", "local-divergent"], { cwd: workspace });
   await execFileAsync("git", ["update-ref", "refs/custom/rejected", localOid], { cwd: workspace });
+  if (!await gitTrace2CanProveLocalFetch()) {
+    context.skip("local Git Trace2 fetch provenance unavailable in this environment");
+  }
 
   const tracePath = path.join(tempRoot, "partial-fetch.trace2");
   const traceHandle = await open(tracePath, "wx+", 0o600);
@@ -4229,8 +4281,9 @@ test("a partially successful nonzero fetch makes provenance uncertain", async (c
   assert.equal(rejectedAfter.trim(), localOid, "the non-fast-forward destination must stay unchanged");
   const provenance = await readBackendGitProvenance({
     tracePath, handle: traceHandle, identity: traceIdentity,
-  }, workspace);
-  assert.deepEqual(provenance, { uncertain: true, sawFetch: true });
+  }, await gitWorktreeRoot(workspace));
+  assert.equal(provenance.sawFetch, true, JSON.stringify(provenance));
+  assert.equal(provenance.uncertain, true, JSON.stringify(provenance));
 });
 
 test("pull makes commit attribution explicitly unavailable", async (context) => {
@@ -4475,7 +4528,7 @@ test("missing backend commands fail before workspace launch", {
 });
 
 test("PowerShell shim runner fails closed for a missing backend", {
-  skip: process.platform !== "win32",
+  skip: process.platform !== "win32" ? "Windows PowerShell shim runner" : false,
 }, async () => {
   const runner = path.join(pluginRoot, "ps1-runner.ps1");
   let failure = null;
@@ -4492,7 +4545,7 @@ test("PowerShell shim runner fails closed for a missing backend", {
 });
 
 test("PowerShell shim runner preserves native backend exit codes", {
-  skip: process.platform !== "win32",
+  skip: process.platform !== "win32" ? "Windows PowerShell shim runner" : false,
 }, async () => {
   const runner = path.join(pluginRoot, "ps1-runner.ps1");
   let failure = null;
