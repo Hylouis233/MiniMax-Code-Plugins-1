@@ -1301,6 +1301,35 @@ function snapshotFailure(label, result) {
 class OperationCancelledError extends Error {}
 class DeadlineExceededError extends Error {}
 class InvalidArgumentsError extends Error {}
+
+function isCancellationError(error) {
+  return error instanceof OperationCancelledError || error instanceof WorkspaceLockCancelledError;
+}
+
+function isDeadlineError(error) {
+  return error instanceof DeadlineExceededError || error instanceof WorkspaceLockDeadlineError;
+}
+
+async function provenanceWorktreeIdentity(value) {
+  const resolved = path.resolve(String(value ?? ""));
+  if (process.platform === "win32") {
+    let normalized = path.win32.normalize(resolved);
+    if (/^[a-zA-Z]:/u.test(normalized)) {
+      normalized = normalized[0].toUpperCase() + normalized.slice(1);
+    }
+    return { resolved: normalized, real: "" };
+  }
+  try {
+    return { resolved, real: await realpath(resolved) };
+  } catch {
+    return { resolved, real: "" };
+  }
+}
+
+function provenanceWorktreesMatch(left, right) {
+  return left.resolved === right.resolved || (Boolean(left.real) && left.real === right.real);
+}
+
 class BackendConfigurationCleanupError extends Error {}
 class GitProcessTreeUnconfirmedError extends Error {
   constructor(label, terminationError, quarantine = null) {
@@ -1545,10 +1574,7 @@ export async function readBackendGitProvenance(provenance, worktreeRoot, options
     throw new Error("Git fetch provenance trace changed while it was being read");
   }
   const sessions = new Map();
-  const normalizeWorktree = (value) => {
-    return path.resolve(String(value ?? ""));
-  };
-  const targetWorktree = normalizeWorktree(worktreeRoot);
+  const targetWorktree = await provenanceWorktreeIdentity(worktreeRoot);
   let offset = 0;
   let nextYield = TRACE_PARSE_YIELD_CHARS;
   checkTraceInterruption(options);
@@ -1575,7 +1601,7 @@ export async function readBackendGitProvenance(provenance, worktreeRoot, options
         }
       } else if (event?.event === "def_repo") {
         const session = sessions.get(event.sid);
-        if (session) session.worktree = normalizeWorktree(event.worktree);
+        if (session) session.worktree = String(event.worktree ?? "");
       } else if (event?.event === "exit") {
         const session = sessions.get(event.sid);
         if (session) {
@@ -1604,7 +1630,9 @@ export async function readBackendGitProvenance(provenance, worktreeRoot, options
     // later ref is rejected. Completion in the target repository is therefore
     // enough to make exact commit attribution unavailable; exit status cannot
     // prove that the repository was left untouched.
-    if (session.worktree === targetWorktree) {
+    if (provenanceWorktreesMatch(
+      await provenanceWorktreeIdentity(session.worktree), targetWorktree,
+    )) {
       sawFetch = true;
       uncertain = true;
     }
@@ -2566,9 +2594,11 @@ async function withWorkspaceLock(key, lockStoreRoot, fn, {
       if (workspaceLocks.get(key) === next) workspaceLocks.delete(key);
     });
     if (localResult === "cancelled") {
-      return typeof onCancelled === "function" ? onCancelled() : undefined;
+      if (typeof onCancelled === "function") return onCancelled();
+      throw new OperationCancelledError("operation cancelled by client");
     }
-    return typeof onDeadline === "function" ? onDeadline() : undefined;
+    if (typeof onDeadline === "function") return onDeadline();
+    throw new DeadlineExceededError("delegation deadline exceeded");
   }
   let lease = null;
   try {
@@ -2586,22 +2616,26 @@ async function withWorkspaceLock(key, lockStoreRoot, fn, {
         processIdentityProbe: processStartIdentity,
       });
     } catch (error) {
-      if (error instanceof WorkspaceLockCancelledError) {
-        return typeof onCancelled === "function" ? onCancelled() : undefined;
+      if (isCancellationError(error)) {
+        if (typeof onCancelled === "function") return onCancelled();
+        throw error;
       }
-      if (error instanceof WorkspaceLockDeadlineError) {
-        return typeof onDeadline === "function" ? onDeadline() : undefined;
+      if (isDeadlineError(error)) {
+        if (typeof onDeadline === "function") return onDeadline();
+        throw error;
       }
       throw error;
     }
     if (typeof onAcquired === "function") await onAcquired(lease);
     return await fn(lease);
   } catch (error) {
-    if (error instanceof OperationCancelledError) {
-      return typeof onCancelled === "function" ? onCancelled() : undefined;
+    if (isCancellationError(error)) {
+      if (typeof onCancelled === "function") return onCancelled();
+      throw error;
     }
-    if (error instanceof DeadlineExceededError) {
-      return typeof onDeadline === "function" ? onDeadline() : undefined;
+    if (isDeadlineError(error)) {
+      if (typeof onDeadline === "function") return onDeadline();
+      throw error;
     }
     throw error;
   } finally {
@@ -3294,10 +3328,10 @@ async function delegateTask(rawArgs, cancel) {
       ),
     });
   } catch (error) {
-    if (error instanceof OperationCancelledError) {
+    if (isCancellationError(error)) {
       return cancelledDelegation({ backend, workspacePath, worktreeRoot, spec });
     }
-    if (error instanceof DeadlineExceededError) {
+    if (isDeadlineError(error)) {
       return lockDeadlineDelegation({ backend, workspacePath, worktreeRoot, spec });
     }
     throw error;
@@ -3614,7 +3648,28 @@ async function handleMessage(message) {
           const cancel = createCancellation();
           const finishRequest = trackActiveRequest(message.id, cancel);
           try {
-            const out = await delegateTask(args, cancel);
+            let out;
+            try {
+              out = await delegateTask(args, cancel);
+            } catch (error) {
+              const pending = {
+                backend: typeof args?.backend === "string" ? args.backend.trim() : "",
+                workspacePath: typeof args?.workspacePath === "string" ? args.workspacePath : "",
+                worktreeRoot: "",
+                spec: {},
+              };
+              if (isCancellationError(error)) out = cancelledDelegation(pending);
+              else if (isDeadlineError(error)) out = lockDeadlineDelegation(pending);
+              else throw error;
+            }
+            if (!out || typeof out !== "object") {
+              out = lockDeadlineDelegation({
+                backend: typeof args?.backend === "string" ? args.backend.trim() : "",
+                workspacePath: typeof args?.workspacePath === "string" ? args.workspacePath : "",
+                worktreeRoot: "",
+                spec: {},
+              });
+            }
             return jsonRpcResult(message.id, {
               content: [{ type: "text", text: textResult("Delegated Task Result", out) }],
               structuredContent: out,
