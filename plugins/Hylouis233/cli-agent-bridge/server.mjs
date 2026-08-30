@@ -43,6 +43,7 @@ const KILL_GRACE_MS = Number.isInteger(TEST_KILL_GRACE_MS) && TEST_KILL_GRACE_MS
 const MAX_CAPTURE_CHARS = 5_000_000;
 const MAX_TRACE_EVENT_CHARS = 256_000;
 const TRACE_PARSE_YIELD_CHARS = 64 * 1024;
+const TRACE_SESSION_YIELD_COUNT = 64;
 const TRACE_CLEANUP_TIMEOUT_MS = 1_000;
 const backgroundFinalizers = new Set();
 let quarantineReadTestCallCount = 0;
@@ -1310,7 +1311,7 @@ function isDeadlineError(error) {
   return error instanceof DeadlineExceededError || error instanceof WorkspaceLockDeadlineError;
 }
 
-async function provenanceWorktreeIdentity(value) {
+async function provenanceWorktreeIdentity(value, options = {}) {
   const resolved = path.resolve(String(value ?? ""));
   if (process.platform === "win32") {
     let normalized = path.win32.normalize(resolved);
@@ -1319,11 +1320,10 @@ async function provenanceWorktreeIdentity(value) {
     }
     return { resolved: normalized, real: "" };
   }
-  try {
-    return { resolved, real: await realpath(resolved) };
-  } catch {
-    return { resolved, real: "" };
-  }
+  return {
+    resolved,
+    real: await interruptibleFilesystemOperation(() => realpath(resolved), options),
+  };
 }
 
 function provenanceWorktreesMatch(left, right) {
@@ -1574,7 +1574,7 @@ export async function readBackendGitProvenance(provenance, worktreeRoot, options
     throw new Error("Git fetch provenance trace changed while it was being read");
   }
   const sessions = new Map();
-  const targetWorktree = await provenanceWorktreeIdentity(worktreeRoot);
+  const targetWorktree = await provenanceWorktreeIdentity(worktreeRoot, options);
   let offset = 0;
   let nextYield = TRACE_PARSE_YIELD_CHARS;
   checkTraceInterruption(options);
@@ -1621,7 +1621,15 @@ export async function readBackendGitProvenance(provenance, worktreeRoot, options
   }
   let uncertain = false;
   let sawFetch = false;
+  const worktreeIdentities = new Map();
+  let sessionCount = 0;
   for (const session of sessions.values()) {
+    checkTraceInterruption(options);
+    sessionCount += 1;
+    if (sessionCount % TRACE_SESSION_YIELD_COUNT === 0) {
+      await new Promise((resolve) => setImmediate(resolve));
+      checkTraceInterruption(options);
+    }
     if (session.worktree === null || !session.exited) {
       uncertain = true;
       continue;
@@ -1630,8 +1638,14 @@ export async function readBackendGitProvenance(provenance, worktreeRoot, options
     // later ref is rejected. Completion in the target repository is therefore
     // enough to make exact commit attribution unavailable; exit status cannot
     // prove that the repository was left untouched.
+    const identityKey = path.resolve(String(session.worktree ?? ""));
+    let sessionWorktree = worktreeIdentities.get(identityKey);
+    if (!sessionWorktree) {
+      sessionWorktree = await provenanceWorktreeIdentity(session.worktree, options);
+      worktreeIdentities.set(identityKey, sessionWorktree);
+    }
     if (provenanceWorktreesMatch(
-      await provenanceWorktreeIdentity(session.worktree), targetWorktree,
+      sessionWorktree, targetWorktree,
     )) {
       sawFetch = true;
       uncertain = true;

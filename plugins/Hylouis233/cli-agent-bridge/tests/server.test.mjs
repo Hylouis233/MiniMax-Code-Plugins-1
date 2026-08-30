@@ -1255,6 +1255,30 @@ function testCancellation() {
 }
 
 let cachedGitTrace2CanProveLocalFetch;
+function rawTrace2ContainsCompletedFetch(trace, workspace) {
+  const fetchSessions = new Set();
+  const workspaceSessions = new Set();
+  const completedSessions = new Set();
+  const resolvedWorkspace = path.resolve(workspace);
+  for (const line of trace.split(/\r?\n/u)) {
+    if (!line) continue;
+    const event = JSON.parse(line);
+    const sid = typeof event?.sid === "string" ? event.sid : "";
+    if (!sid) continue;
+    if (event.event === "start" && Array.isArray(event.argv) &&
+        event.argv.some((argument) => argument === "fetch")) {
+      fetchSessions.add(sid);
+    } else if (event.event === "def_repo" &&
+               path.resolve(String(event.worktree ?? "")) === resolvedWorkspace) {
+      workspaceSessions.add(sid);
+    } else if (event.event === "exit") {
+      completedSessions.add(sid);
+    }
+  }
+  return [...fetchSessions].some((sid) =>
+    workspaceSessions.has(sid) && completedSessions.has(sid));
+}
+
 async function gitTrace2CanProveLocalFetch() {
   if (cachedGitTrace2CanProveLocalFetch !== undefined) return cachedGitTrace2CanProveLocalFetch;
   const root = await mkdtemp(path.join(os.tmpdir(), "cli-agent-trace2-fetch-probe-"));
@@ -1272,16 +1296,12 @@ async function gitTrace2CanProveLocalFetch() {
     await execFileAsync("git", ["commit", "-m", "trace2 fetch probe"], { cwd: upstream });
     const tracePath = path.join(root, "probe.trace2");
     handle = await open(tracePath, "wx+", 0o600);
-    const identity = await handle.stat({ bigint: true });
     await execFileAsync("git", [
       "fetch", upstream, "refs/heads/topic:refs/custom/probe-topic",
     ], { cwd: workspace, env: backendGitProvenanceEnvironment(tracePath) });
-    const provenance = await readBackendGitProvenance({
-      tracePath, handle, identity,
-    }, await gitWorktreeRoot(workspace));
-    cachedGitTrace2CanProveLocalFetch = provenance.sawFetch === true;
-  } catch {
-    cachedGitTrace2CanProveLocalFetch = false;
+    const trace = await readFile(tracePath, "utf8");
+    const emittedWorkspace = await realpath(workspace).catch(() => path.resolve(workspace));
+    cachedGitTrace2CanProveLocalFetch = rawTrace2ContainsCompletedFetch(trace, emittedWorkspace);
   } finally {
     await handle?.close().catch(() => {});
     await rm(root, { recursive: true, force: true }).catch(() => {});
@@ -4030,6 +4050,23 @@ test("Windows Trace2 worktree matching preserves case-sensitive path identity", 
   });
 });
 
+test("unresolved Trace2 worktree identities fail commit attribution closed", {
+  skip: process.platform === "win32" ? "Windows uses exact resolved Trace2 identities" : false,
+}, async (context) => {
+  const fixture = await makeTraceFixture(context);
+  const missingWorktree = path.join(fixture.root, "missing-worktree");
+  const trace = [
+    { event: "start", sid: "missing-session", argv: ["git", "fetch"] },
+    { event: "def_repo", sid: "missing-session", worktree: missingWorktree },
+    { event: "exit", sid: "missing-session", code: 0 },
+  ].map((event) => JSON.stringify(event)).join("\n") + "\n";
+  await fixture.handle.write(Buffer.from(trace), 0, Buffer.byteLength(trace), 0);
+  await assert.rejects(
+    readBackendGitProvenance(fixture, pluginRoot),
+    /ENOENT|no such file/iu,
+  );
+});
+
 test("provenance reads reject FIFO and device symlink replacements without hanging", {
   skip: process.platform !== "linux",
 }, async () => {
@@ -4101,10 +4138,46 @@ test("provenance reads are bounded and interruptible", async (context) => {
   await denseFixture.handle.write(denseTrace, 0, denseTrace.length, 0);
   const parsingAt = Date.now();
   await assert.rejects(readBackendGitProvenance(
-    denseFixture, pluginRoot, { deadline: parsingAt + 100 },
+    denseFixture, pluginRoot, { deadline: parsingAt + 10 },
   ), /deadline/iu);
   assert.ok(Date.now() - parsingAt < 1_500,
     "parsing a dense bounded trace must continue to observe the request deadline");
+
+  const sessionsFixture = await makeTraceFixture(context);
+  const sessionEvents = [];
+  for (let index = 0; index < 128; index += 1) {
+    const sid = "session-" + String(index);
+    sessionEvents.push(
+      { event: "start", sid, argv: ["git", "fetch"] },
+      { event: "def_repo", sid, worktree: pluginRoot },
+      { event: "exit", sid, code: 0 },
+    );
+  }
+  const sessionsTrace = Buffer.from(
+    sessionEvents.map((event) => JSON.stringify(event)).join("\n") + "\n",
+  );
+  assert.ok(sessionsTrace.length < 64 * 1024,
+    "the fixture must reach session resolution before the parser's own event-loop yield");
+  await sessionsFixture.handle.write(sessionsTrace, 0, sessionsTrace.length, 0);
+  let interruptionChecks = 0;
+  let cancellationArmed = false;
+  let cancellationDelivered = false;
+  const loopCancellation = {
+    get cancelled() {
+      interruptionChecks += 1;
+      if (!cancellationArmed && interruptionChecks >= 32) {
+        cancellationArmed = true;
+        setImmediate(() => { cancellationDelivered = true; });
+      }
+      return cancellationDelivered;
+    },
+  };
+  await assert.rejects(readBackendGitProvenance(
+    sessionsFixture, pluginRoot, { cancel: loopCancellation },
+  ), /cancelled/iu);
+  assert.equal(cancellationArmed, true);
+  assert.equal(cancellationDelivered, true,
+    "session resolution must yield so an asynchronously delivered cancellation can run");
 });
 
 test("a replaced backend provenance path degrades attribution and is cleaned up", async (context) => {
@@ -4186,6 +4259,7 @@ test("successive fetches are detected even after FETCH_HEAD is overwritten", asy
   await rm(path.join(workspace, ".git", "FETCH_HEAD"), { force: true });
   if (!await gitTrace2CanProveLocalFetch()) {
     context.skip("local Git Trace2 fetch provenance unavailable in this environment");
+    return;
   }
 
   const tracePath = path.join(tempRoot, "successive-fetch.trace2");
@@ -4253,6 +4327,7 @@ test("a partially successful nonzero fetch makes provenance uncertain", async (c
   await execFileAsync("git", ["update-ref", "refs/custom/rejected", localOid], { cwd: workspace });
   if (!await gitTrace2CanProveLocalFetch()) {
     context.skip("local Git Trace2 fetch provenance unavailable in this environment");
+    return;
   }
 
   const tracePath = path.join(tempRoot, "partial-fetch.trace2");
