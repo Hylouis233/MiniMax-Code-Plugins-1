@@ -1,0 +1,102 @@
+name: Windows bridge startup diagnosis
+on:
+  push:
+    branches: [audit/bridge-stability-20260911]
+    paths: [.github/workflows/bridge-windows-startup-diagnosis.yml]
+permissions:
+  contents: read
+jobs:
+  diagnose:
+    if: github.repository == 'Hylouis233/MiniMax-Code-Plugins-1' && github.actor == 'Hylouis233'
+    strategy:
+      fail-fast: false
+      matrix:
+        revision: [baseline, candidate]
+    runs-on: windows-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 22
+      - name: Prepare inspected source and timing-only wrapper
+        env:
+          REVISION: ${{ matrix.revision }}
+        run: |
+          set -euo pipefail
+          git show HEAD:.github/maintenance/bridge-reparent-race.patch > "$RUNNER_TEMP/repair.patch"
+          git checkout --detach 53b51f22a5b8af235183b2eb10ae89cf112b646f
+          if test "$REVISION" = candidate; then
+            git apply --cached "$RUNNER_TEMP/repair.patch"
+            git checkout -- plugins/Hylouis233/cli-agent-bridge/process-tree.mjs plugins/Hylouis233/cli-agent-bridge/tests/process-tree.test.mjs
+            test "$(git write-tree)" = c72e5b43d7c087fc35bd63abfdc498ab975446ee
+          fi
+          python - <<'PY'
+          from pathlib import Path
+          root = Path('plugins/Hylouis233/cli-agent-bridge')
+          p = root / 'tests/server.test.mjs'
+          text = p.read_text(encoding='utf-8')
+          old = '  runCommand, runGitCommand, startStdioServer,'
+          assert text.count(old) == 1
+          text = text.replace(old, '  runCommand as originalRunCommand, runGitCommand, startStdioServer,')
+          pos = 'const execFileAsync = promisify(execFile);'
+          wrapper = '''async function runCommand(command, args, options = {}) {
+            const started = performance.now();
+            const result = await originalRunCommand(command, args, options);
+            console.error('TIMING ' + JSON.stringify({command: path.basename(command), elapsedMs: Math.round(performance.now() - started), timeoutMs: options.timeoutMs, exitCode: result.exitCode, timedOut: result.timedOut, treeTerminated: result.treeTerminated, stderr: result.stderr}));
+            return result;
+          }
+          '''
+          assert text.count(pos) == 1
+          p.write_text(text.replace(pos, wrapper + pos), encoding='utf-8')
+          script = '''import {runCommand} from './server.mjs';
+          import {mkdtemp,writeFile,rm} from 'node:fs/promises';
+          import path from 'node:path';
+          import os from 'node:os';
+          const dir=await mkdtemp(path.join(os.tmpdir(),'bridge-exit-diagnostic-'));
+          const script=path.join(dir,'stderr-and-exit.ps1');
+          await writeFile(script,"Write-Error 'fixture-nonterminating-error'\\r\\nexit 37\\r\\n");
+          try {
+            for(let i=0;i<6;i++) {
+              const start=performance.now();
+              const result=await runCommand(script,[],{cwd:dir,manageProcessTree:true,timeoutMs:30000});
+              console.log(JSON.stringify({diagnosticOnly:true,iteration:i,elapsedMs:Math.round(performance.now()-start),timeoutMs:30000,result}));
+              if(result.exitCode!==37 || !result.treeTerminated) process.exitCode=1;
+            }
+          } finally {await rm(dir,{recursive:true,force:true});}
+          '''
+          (root/'startup-diagnostic.mjs').write_text(script,encoding='utf-8')
+          PY
+      - name: Preserve the original 5000 ms test budget and assertions
+        run: |
+          set -u
+          failures=0
+          for i in 1 2 3; do
+            node --test --test-name-pattern='^Windows Job runner contains launch and preserves backend streams and exit code$' plugins/Hylouis233/cli-agent-bridge/tests/server.test.mjs > "original-budget-${i}.tap" 2>&1
+            status=$?
+            echo "original test iteration=$i exit=$status" | tee -a summary.txt
+            cat "original-budget-${i}.tap"
+            if test "$status" -ne 0; then failures=$((failures+1)); fi
+          done
+          echo "original_budget_failures=$failures" >> summary.txt
+      - name: Measure script startup separately using the existing default command budget
+        run: |
+          set -euo pipefail
+          node plugins/Hylouis233/cli-agent-bridge/startup-diagnostic.mjs > startup-measurements.jsonl 2>&1
+          cat startup-measurements.jsonl
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: windows-startup-${{ matrix.revision }}
+          path: |
+            original-budget-*.tap
+            startup-measurements.jsonl
+            summary.txt
+          retention-days: 7
+          if-no-files-found: error
