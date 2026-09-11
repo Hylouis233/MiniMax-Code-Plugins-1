@@ -1,0 +1,163 @@
+name: Bridge final integration
+on:
+  push:
+    branches: [audit/bridge-stability-20260911]
+    paths: [.github/workflows/bridge-final-integration.yml]
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  validate:
+    if: github.repository == 'Hylouis233/MiniMax-Code-Plugins-1' && github.actor == 'Hylouis233'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Apply only the assertion-observation repair to the inspected follow-up
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain)"
+          git show HEAD:.github/maintenance/deferred-rejections.patch > "$RUNNER_TEMP/assertion.patch"
+          git checkout --detach a71f9622ef8ca9896434737dfd7b7706ca3c8ccd
+          test "$(git rev-parse HEAD^{tree})" = d5e0e45cd0dc11ec34aedfbda1f860bef55ef07e
+          git apply --cached --check "$RUNNER_TEMP/assertion.patch"
+          git apply --cached "$RUNNER_TEMP/assertion.patch"
+          file=plugins/Hylouis233/cli-agent-bridge/tests/workspace-lock.test.mjs
+          git checkout -- "$file"
+          test "$(git diff --cached --name-only)" = "$file"
+          tree=$(git write-tree)
+          test "$(git rev-parse "$tree:plugins/Hylouis233/cli-agent-bridge")" = eac2902a283b73cbc431d91f5648ecbbc4c6a827
+          git diff --exit-code
+          git diff --cached --check
+          printf '%s\n%s\n%s\n' a71f9622ef8ca9896434737dfd7b7706ca3c8ccd "$tree" eac2902a283b73cbc431d91f5648ecbbc4c6a827 > verified-refs.txt
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 22
+          cache: npm
+      - name: Prove the harness timing failure without changing production code
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          import subprocess, re
+          p=Path('plugins/Hylouis233/cli-agent-bridge/tests/workspace-lock.test.mjs')
+          old=subprocess.check_output(['git','show','HEAD:'+p.as_posix()],text=True)
+          new=p.read_text()
+          assert re.findall(r'assert\.\w+\(',old)==re.findall(r'assert\.\w+\(',new)
+          def delayed(text):
+              name='test("interrupted state CAS cleanup covers both exact commit outcomes"'
+              start=text.index(name); end=text.index('\ntest(',start+len(name))
+              block=text[start:end]
+              target='  await writeFile(releaseFile, "release\\n");'
+              assert block.count(target)==1
+              block=block.replace(target,target+'\n  await new Promise((resolve) => setTimeout(resolve, 100));')
+              return text[:start]+block+text[end:]
+          for name,text in [('baseline-deferred-diagnostic.mjs',old),('candidate-deferred-diagnostic.mjs',new)]:
+              (p.parent/name).write_text(delayed(text))
+          PY
+          trap 'rm -f plugins/Hylouis233/cli-agent-bridge/tests/baseline-deferred-diagnostic.mjs plugins/Hylouis233/cli-agent-bridge/tests/candidate-deferred-diagnostic.mjs' EXIT
+          set +e
+          node --test --test-name-pattern='^interrupted state CAS cleanup covers both exact commit outcomes$' plugins/Hylouis233/cli-agent-bridge/tests/baseline-deferred-diagnostic.mjs > deferred-baseline.tap 2>&1
+          status=$?
+          set -e
+          test "$status" -eq 1
+          grep -q 'unhandledRejection' deferred-baseline.tap
+          node --test --test-name-pattern='^interrupted state CAS cleanup covers both exact commit outcomes$' plugins/Hylouis233/cli-agent-bridge/tests/candidate-deferred-diagnostic.mjs > deferred-candidate.tap 2>&1
+      - name: Run the complete changed workspace-lock test file
+        run: |
+          set -euo pipefail
+          node --test plugins/Hylouis233/cli-agent-bridge/tests/workspace-lock.test.mjs 2>&1 | tee workspace-lock.tap
+      - name: Run the unchanged full root check on Linux
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run check 2>&1 | tee final-root.tap
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c
+        if: runner.os == 'Linux'
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: plugins/Hylouis233/document-skills/tests/requirements-fixtures.txt
+      - name: Recheck the merged document fixtures
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libreoffice-writer
+          python -m pip install -r plugins/Hylouis233/document-skills/tests/requirements-fixtures.txt
+          node --test plugins/Hylouis233/document-skills/tests/fixtures.integration.mjs 2>&1 | tee final-document.tap
+      - name: Verify no tested source was altered
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          test "$(git write-tree)" = "$(sed -n '2p' verified-refs.txt)"
+      - name: Preserve exact-tree evidence and the negative control
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: bridge-final-${{ matrix.os }}
+          path: |
+            verified-refs.txt
+            workspace-lock.tap
+            deferred-baseline.tap
+            deferred-candidate.tap
+            final-root.tap
+            final-document.tap
+          retention-days: 7
+          if-no-files-found: error
+  publish:
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Publish the validated test-only follow-up without force
+        env:
+          PUSH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git show HEAD:.github/maintenance/deferred-rejections.patch > "$RUNNER_TEMP/assertion.patch"
+          git checkout --detach a71f9622ef8ca9896434737dfd7b7706ca3c8ccd
+          git apply --cached "$RUNNER_TEMP/assertion.patch"
+          file=plugins/Hylouis233/cli-agent-bridge/tests/workspace-lock.test.mjs
+          git checkout -- "$file"
+          test "$(git diff --cached --name-only)" = "$file"
+          tree=$(git write-tree)
+          test "$(git rev-parse "$tree:plugins/Hylouis233/cli-agent-bridge")" = eac2902a283b73cbc431d91f5648ecbbc4c6a827
+          git diff --exit-code
+          git diff --cached --check
+          git config user.name 'Hong Liu'
+          git config user.email '88263959+Hylouis233@users.noreply.github.com'
+          git config core.hooksPath /dev/null
+          git commit -m 'test(cli-agent-bridge): observe expected rejections before fixture I/O' -m 'Register immediate allSettled observation while preserving the original outcome for assert.rejects. Keep all error-type assertions and production lease behavior unchanged. A controlled post-cancellation yield reproduces the old unhandled rejection and passes after this test-harness repair.'
+          auth=$(printf 'x-access-token:%s' "$PUSH_TOKEN" | base64 -w0)
+          echo "::add-mask::$auth"
+          ref=refs/heads/fix/bridge-stability-20260911
+          current=$(git -c http.https://github.com/.extraheader="AUTHORIZATION: basic $auth" ls-remote origin "$ref" | cut -f1)
+          test "$current" = a71f9622ef8ca9896434737dfd7b7706ca3c8ccd
+          git -c http.https://github.com/.extraheader="AUTHORIZATION: basic $auth" push origin "HEAD:$ref"
+          unset auth PUSH_TOKEN
+          git rev-parse HEAD HEAD^{tree} HEAD:plugins/Hylouis233/cli-agent-bridge > final-commit.txt
+          cat final-commit.txt >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: bridge-final-commit
+          path: final-commit.txt
+          retention-days: 7
+          if-no-files-found: error
