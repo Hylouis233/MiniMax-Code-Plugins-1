@@ -1,0 +1,99 @@
+name: Windows bridge repair validation
+
+on:
+  push:
+    branches: [audit/plugin-validation-20260911]
+    paths:
+      - '.github/workflows/bridge-repair-validation-20260911.yml'
+      - '.github/audits/bridge-repair-20260911.patch'
+
+permissions:
+  contents: read
+
+jobs:
+  prepare-candidate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    outputs:
+      candidate_sha: ${{ steps.prepare.outputs.candidate_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Apply only the reviewed repair to exact contribution and upstream commits
+        id: prepare
+        shell: bash
+        env:
+          PUSH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cp .github/audits/bridge-repair-20260911.patch "$RUNNER_TEMP/bridge-repair.patch"
+          git config user.name 'Hong Liu'
+          git config user.email '88263959+Hylouis233@users.noreply.github.com'
+          mkdir -p "$RUNNER_TEMP/empty-hooks"
+          git config core.hooksPath "$RUNNER_TEMP/empty-hooks"
+          git checkout --detach 902b194f0624a1e287a3ba5ee962ba5fc97fb276
+          if ! git merge --no-commit --no-ff f19cd52a44cf8f59c18c0bad0ed2d7da9dfef5fd; then
+            test "$(git diff --name-only --diff-filter=U)" = '.github/workflows/ci.yml'
+            git checkout f19cd52a44cf8f59c18c0bad0ed2d7da9dfef5fd -- .github/workflows/ci.yml
+          fi
+          git apply --index --check "$RUNNER_TEMP/bridge-repair.patch"
+          git apply --index "$RUNNER_TEMP/bridge-repair.patch"
+          test "$(git write-tree)" = 9122412a0e898ef6b402f02acf322335a2e97341
+          git diff --cached --check f19cd52a44cf8f59c18c0bad0ed2d7da9dfef5fd -- plugins/Hylouis233/cli-agent-bridge .github/workflows/cli-agent-bridge-windows.yml
+          git commit -m 'Merge upstream main and fix restricted Windows Job runner startup' -m 'Qualify the built-in Add-Type command without relaxing control/worker environment filtering. Compare short and long runtime paths by filesystem identity, bound test RPC/named-pipe waits, retain raw diagnostics, and isolate the complete Windows suite from root CI.'
+          candidate=$(git rev-parse HEAD)
+          echo "candidate_sha=$candidate" >> "$GITHUB_OUTPUT"
+          echo "Candidate $candidate; tree $(git rev-parse HEAD^{tree})"
+          auth=$(printf 'x-access-token:%s' "$PUSH_TOKEN" | base64 -w0)
+          echo "::add-mask::$auth"
+          git -c http.https://github.com/.extraheader="AUTHORIZATION: basic $auth" push origin HEAD:refs/heads/audit/bridge-repair-20260911
+          unset auth PUSH_TOKEN
+
+  regression:
+    needs: prepare-candidate
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    name: bridge-regression (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.prepare-candidate.outputs.candidate_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run validate
+      - name: Verify candidate identity and run all four test files
+        shell: bash
+        run: |
+          set -euo pipefail
+          git log -1 --format='%H %T'
+          node --check plugins/Hylouis233/cli-agent-bridge/server.mjs
+          node --check plugins/Hylouis233/cli-agent-bridge/tests/server.test.mjs
+          node --check plugins/Hylouis233/cli-agent-bridge/test/server.test.mjs
+          node --test --test-concurrency=1 \
+            plugins/Hylouis233/cli-agent-bridge/tests/process-tree.test.mjs \
+            plugins/Hylouis233/cli-agent-bridge/tests/server.test.mjs \
+            plugins/Hylouis233/cli-agent-bridge/tests/workspace-lock.test.mjs \
+            plugins/Hylouis233/cli-agent-bridge/test/server.test.mjs \
+            2>&1 | tee bridge-regression.tap
+      - name: Preserve actual test output
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: bridge-regression-${{ matrix.os }}
+          path: bridge-regression.tap
+          if-no-files-found: warn
+          retention-days: 7
