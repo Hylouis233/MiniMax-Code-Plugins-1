@@ -22,19 +22,18 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Prepare the exact two-file candidate
+      - name: Prepare the exact three-file candidate
         run: |
           set -euo pipefail
           test -z "$(git status --porcelain)"
           git show HEAD:.github/maintenance/bridge-reparent-race.patch > "$RUNNER_TEMP/repair.patch"
+          git show HEAD:.github/maintenance/windows-smoke-budget.patch > "$RUNNER_TEMP/smoke.patch"
           git -c core.hooksPath=/dev/null checkout --detach 53b51f22a5b8af235183b2eb10ae89cf112b646f
-          # Patch canonical index blobs, then let Git preserve the platform's
-          # native working-tree line endings. Do not weaken patch matching.
-          git apply --cached --check "$RUNNER_TEMP/repair.patch"
-          git apply --cached "$RUNNER_TEMP/repair.patch"
-          git checkout -- plugins/Hylouis233/cli-agent-bridge/process-tree.mjs plugins/Hylouis233/cli-agent-bridge/tests/process-tree.test.mjs
+          git apply --cached --check "$RUNNER_TEMP/repair.patch" "$RUNNER_TEMP/smoke.patch"
+          git apply --cached "$RUNNER_TEMP/repair.patch" "$RUNNER_TEMP/smoke.patch"
+          git checkout -- plugins/Hylouis233/cli-agent-bridge/process-tree.mjs plugins/Hylouis233/cli-agent-bridge/tests/process-tree.test.mjs plugins/Hylouis233/cli-agent-bridge/tests/server.test.mjs
           git diff --exit-code
-          test "$(git write-tree)" = c72e5b43d7c087fc35bd63abfdc498ab975446ee
+          test "$(git write-tree)" = 1bd5b91444984d11e86f28b827bbfa238fd094d5
           git diff --cached --check
           git write-tree > candidate-tree.txt
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
@@ -86,11 +85,19 @@ jobs:
             node --test --test-name-pattern='a worker commit reachable only through a new tag remains attributed|a cross-process lock waiter obeys the delegation deadline' \
               plugins/Hylouis233/cli-agent-bridge/tests/server.test.mjs 2>&1 | tee "focused-${i}.tap"
           done
+      - name: Repeat Windows semantic smoke without modifying production timeout behavior
+        if: runner.os == 'Windows'
+        run: |
+          set -euo pipefail
+          for i in 1 2; do
+            node --test --test-name-pattern='^Windows Job runner contains launch and preserves backend streams and exit code$' \
+              plugins/Hylouis233/cli-agent-bridge/tests/server.test.mjs 2>&1 | tee "windows-smoke-${i}.tap"
+          done
       - name: Verify the final tested tracked tree
         run: |
           set -euo pipefail
           git diff --exit-code
-          test "$(git write-tree)" = c72e5b43d7c087fc35bd63abfdc498ab975446ee
+          test "$(git write-tree)" = 1bd5b91444984d11e86f28b827bbfa238fd094d5
       - name: Preserve exact-tree test evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -102,6 +109,7 @@ jobs:
             process-regressions.tap
             full-suite.tap
             focused-*.tap
+            windows-smoke-*.tap
           retention-days: 7
           if-no-files-found: error
   publish:
@@ -121,15 +129,16 @@ jobs:
         run: |
           set -euo pipefail
           git show HEAD:.github/maintenance/bridge-reparent-race.patch > "$RUNNER_TEMP/repair.patch"
+          git show HEAD:.github/maintenance/windows-smoke-budget.patch > "$RUNNER_TEMP/smoke.patch"
           git -c core.hooksPath=/dev/null checkout --detach 53b51f22a5b8af235183b2eb10ae89cf112b646f
-          git apply "$RUNNER_TEMP/repair.patch"
-          git add -- plugins/Hylouis233/cli-agent-bridge/process-tree.mjs plugins/Hylouis233/cli-agent-bridge/tests/process-tree.test.mjs
-          test "$(git write-tree)" = c72e5b43d7c087fc35bd63abfdc498ab975446ee
+          git apply "$RUNNER_TEMP/repair.patch" "$RUNNER_TEMP/smoke.patch"
+          git add -- plugins/Hylouis233/cli-agent-bridge/process-tree.mjs plugins/Hylouis233/cli-agent-bridge/tests/process-tree.test.mjs plugins/Hylouis233/cli-agent-bridge/tests/server.test.mjs
+          test "$(git write-tree)" = 1bd5b91444984d11e86f28b827bbfa238fd094d5
           git diff --cached --check
           git config user.name 'Hong Liu'
           git config user.email '88263959+Hylouis233@users.noreply.github.com'
           git config core.hooksPath /dev/null
-          git commit -m 'fix: recover independently verified Linux reparenting races' -m 'Require two stable marker scans and a final immutable start-identity recheck. Preserve prior uncertainty and fail closed on absent markers or recycled PIDs. Add seven deterministic regression cases; leave Windows containment and root concurrency unchanged.'
+          git commit -m 'fix: recover verified reparenting races and bound semantic smoke tests' -m 'Require stable marker observations and a final immutable start-identity check. Add seven deterministic race regressions. Use the existing command default budget only for Windows argv/stream/exit semantic smoke, add explicit no-timeout assertions and a whole-test bound. Dedicated cancellation/deadline tests, production timeout behavior, Windows containment, and root concurrency stay unchanged.'
           auth=$(printf 'x-access-token:%s' "$PUSH_TOKEN" | base64 -w0)
           echo "::add-mask::$auth"
           ref=refs/heads/audit/bridge-stability-candidate-20260911
