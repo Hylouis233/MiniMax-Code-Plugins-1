@@ -1,0 +1,35 @@
+name: Bridge stability source snapshot
+on:
+  push:
+    branches: [audit/bridge-stability-20260911]
+    paths: [.github/workflows/bridge-stability-source.yml]
+permissions:
+  contents: read
+jobs:
+  snapshot:
+    if: github.repository == 'Hylouis233/MiniMax-Code-Plugins-1' && github.actor == 'Hylouis233'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 53b51f22a5b8af235183b2eb10ae89cf112b646f
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Export inspected revision without executing repository code
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 53b51f22a5b8af235183b2eb10ae89cf112b646f
+          test "$(git rev-parse HEAD^{tree})" = 57e47ca6d6c3c8c392c7b533056f7b9ffb591b1d
+          git update-ref refs/audit/current-bridge HEAD
+          git bundle create "$RUNNER_TEMP/bridge-current.bundle" refs/audit/current-bridge
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/bridge-current-refs.txt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: bridge-current-source
+          path: |
+            ${{ runner.temp }}/bridge-current.bundle
+            ${{ runner.temp }}/bridge-current-refs.txt
+          retention-days: 1
+          if-no-files-found: error
