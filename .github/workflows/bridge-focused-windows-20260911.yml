@@ -1,0 +1,46 @@
+name: Focused Windows bridge diagnosis
+on:
+  push:
+    branches: [audit/plugin-validation-20260911]
+    paths: ['.github/workflows/bridge-focused-windows-20260911.yml']
+permissions:
+  contents: read
+jobs:
+  original-failures:
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [rpc-delegation, job-and-configuration]
+    name: windows-diagnosis (${{ matrix.group }})
+    runs-on: windows-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 53b51f22a5b8af235183b2eb10ae89cf112b646f
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 22
+      - name: Run the original failing groups without modifying test expectations
+        shell: bash
+        env:
+          TEST_GROUP: ${{ matrix.group }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 53b51f22a5b8af235183b2eb10ae89cf112b646f
+          git log -1 --format='%H %T'
+          if [ "$TEST_GROUP" = rpc-delegation ]; then
+            node --test plugins/Hylouis233/cli-agent-bridge/test/server.test.mjs 2>&1 | tee focused.tap
+          else
+            node --test --test-name-pattern='Windows Job runner|backend configuration|Windows config reader|delegated workers ignore inherited Git routing' \
+              plugins/Hylouis233/cli-agent-bridge/tests/server.test.mjs 2>&1 | tee focused.tap
+          fi
+      - name: Preserve diagnostic output even on failures
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: windows-focused-${{ matrix.group }}
+          path: focused.tap
+          if-no-files-found: warn
+          retention-days: 7
