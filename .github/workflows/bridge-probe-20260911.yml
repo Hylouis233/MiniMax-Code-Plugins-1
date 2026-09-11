@@ -1,0 +1,61 @@
+name: Windows bridge startup probe
+
+on:
+  push:
+    branches: [audit/plugin-validation-20260911]
+    paths: ['.github/workflows/bridge-probe-20260911.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 22
+      - name: Compare control environments without exposing credentials
+        shell: bash
+        run: |
+          node --input-type=module <<'JS'
+          import { readFile, writeFile, rm } from 'node:fs/promises';
+          import path from 'node:path';
+          import { runCommand, backendConfigurationControlEnvironment, backendConfigurationReaderEnvironment } from './plugins/Hylouis233/cli-agent-bridge/server.mjs';
+          const root = path.resolve('plugins/Hylouis233/cli-agent-bridge');
+          const tracePath = path.join(root, 'audit-job-runner.ps1');
+          const trace = label => `[Console]::Error.WriteLine("TRACE ${label} " + [DateTime]::UtcNow.ToString("o"))\n`;
+          let source = await readFile(path.join(root, 'windows-job-runner.ps1'), 'utf8');
+          source = source.replace('$ErrorActionPreference = "Stop"', '$ErrorActionPreference = "Stop"\n' + trace('entry'));
+          source = source.replace("Add-Type -TypeDefinition @'", trace('before-add-type') + "Add-Type -TypeDefinition @'");
+          source = source.replace('$jobHandle = [IntPtr]::Zero', trace('after-add-type') + '$jobHandle = [IntPtr]::Zero');
+          source = source.replace('$utf8NoBom = New-Object', trace('before-encoding') + '$utf8NoBom = New-Object');
+          source = source.replace('$payloadText = [Console]::In.ReadToEnd()', trace('before-payload') + '$payloadText = [Console]::In.ReadToEnd()\n' + trace('after-payload'));
+          source = source.replace('$payloadText | & $NodeExecutable $NodeRunner', trace('before-node') + '$payloadText | & $NodeExecutable $NodeRunner\n' + trace('after-node'));
+          await writeFile(tracePath, source);
+          const control = backendConfigurationControlEnvironment();
+          const exact = backendConfigurationReaderEnvironment();
+          const systemRoot = process.env.SystemRoot;
+          const noEmptyControl = Object.fromEntries(Object.entries(control).filter(([, value]) => value !== ''));
+          const variants = [
+            ['ambient-control', process.env],
+            ['restricted-control', control],
+            ['trusted-path', {...control, PATH: path.win32.join(systemRoot, 'System32')}],
+            ['system-drive', {...control, SYSTEMDRIVE: path.win32.parse(systemRoot).root.replace(/\\$/, '')}],
+            ['omit-empty-control-only', noEmptyControl],
+          ];
+          try {
+            for (const [label, env] of variants) {
+              const started = Date.now();
+              const result = await runCommand(process.execPath, ['-e', 'process.stdout.write("child-ok")'], {
+                env, exactEnvironment: exact, forwardExactEnvironment: true,
+                manageProcessTree: true, timeoutMs: 5000, windowsJobRunnerPath: tracePath,
+              });
+              console.log(JSON.stringify({label, elapsedMs: Date.now() - started, ...result}));
+            }
+          } finally { await rm(tracePath, {force: true}); }
+          JS
