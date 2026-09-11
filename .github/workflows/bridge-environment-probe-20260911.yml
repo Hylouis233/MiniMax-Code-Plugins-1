@@ -1,0 +1,51 @@
+name: Windows bridge environment isolation
+on:
+  push:
+    branches: [audit/plugin-validation-20260911]
+    paths: ['.github/workflows/bridge-environment-probe-20260911.yml']
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 22
+      - shell: bash
+        run: |
+          node --input-type=module <<'JS'
+          import {readFile, writeFile, rm} from 'node:fs/promises';
+          import path from 'node:path';
+          import {runCommand, backendConfigurationControlEnvironment, backendConfigurationReaderEnvironment} from './plugins/Hylouis233/cli-agent-bridge/server.mjs';
+          const root=path.resolve('plugins/Hylouis233/cli-agent-bridge');
+          const control=backendConfigurationControlEnvironment();
+          const exact=backendConfigurationReaderEnvironment();
+          const original=await readFile(path.join(root,'windows-job-runner.ps1'),'utf8');
+          const trace=label=>`[Console]::Error.WriteLine('TRACE ${label}')\n`;
+          let source=original.replace("Add-Type -TypeDefinition @'",trace('before-add-type')+"Add-Type -TypeDefinition @'");
+          source=source.replace('$jobHandle = [IntPtr]::Zero',trace('after-add-type')+'$jobHandle = [IntPtr]::Zero');
+          const envFields=names=>Object.fromEntries(names.map(name=>[name,process.env[name]??'']));
+          const variants=[
+            ['comspec',{...control,COMSPEC:path.win32.join(process.env.SystemRoot,'System32','cmd.exe')},source],
+            ['profile-directories',{...control,...envFields(['APPDATA','LOCALAPPDATA','HOMEDRIVE','HOMEPATH'])},source],
+            ['identity',{...control,...envFields(['USERNAME','USERDOMAIN','COMPUTERNAME','LOGONSERVER'])},source],
+            ['processor',{...control,...envFields(['PROCESSOR_ARCHITECTURE','PROCESSOR_IDENTIFIER','NUMBER_OF_PROCESSORS','PROCESSOR_LEVEL','PROCESSOR_REVISION'])},source],
+            ['program-directories',{...control,...envFields(['ProgramFiles','ProgramFiles(x86)','ProgramW6432','ProgramData','CommonProgramFiles','CommonProgramFiles(x86)','CommonProgramW6432'])},source],
+            ['qualified-add-type',control,source.replace("Add-Type -TypeDefinition @'","Microsoft.PowerShell.Utility\\Add-Type -TypeDefinition @'")],
+            ['disable-shared-compilation',control,source.replace("Add-Type -TypeDefinition @'","Add-Type -CompilerParameters ([System.CodeDom.Compiler.CompilerParameters]@{CompilerOptions='/shared-'; GenerateInMemory=$true}) -TypeDefinition @'")],
+          ];
+          for(const [label,env,script] of variants){
+            const scriptPath=path.join(root,`audit-${label}.ps1`);
+            await writeFile(scriptPath,script);
+            try{
+              const started=Date.now();
+              const result=await runCommand(process.execPath,['-e','process.stdout.write("child-ok")'],{env,exactEnvironment:exact,forwardExactEnvironment:true,manageProcessTree:true,timeoutMs:5000,windowsJobRunnerPath:scriptPath});
+              console.log(JSON.stringify({label,elapsedMs:Date.now()-started,...result}));
+            }finally{await rm(scriptPath,{force:true});}
+          }
+          JS
