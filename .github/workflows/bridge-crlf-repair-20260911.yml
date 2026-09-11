@@ -1,0 +1,80 @@
+name: Verify bridge prerequisite CRLF repair
+on:
+  push:
+    branches: [audit/plugin-validation-20260911]
+    paths: ['.github/workflows/bridge-crlf-repair-20260911.yml']
+permissions:
+  contents: read
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: audit/bridge-repair-20260911
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 22
+      - name: Correct CRLF handling and prove strict validation remains
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = ec5a0b7902a6e7ba6a2833c4743db497ba11182a
+          python3 - <<'PY'
+          from pathlib import Path
+          target = Path('scripts/lib/validation.mjs')
+          text = target.read_text()
+          anchor = "export function validateSkillText(text, expectedName, label = 'SKILL.md') {\n"
+          assert text.count(anchor) == 1
+          text = text.replace(anchor, anchor + "  // Git for Windows may check out valid Skill files with CRLF line endings.\n  // Normalize only CRLF; retain all frontmatter, name, and body validation.\n  text = text.replace(/\\r\\n/gu, '\\n');\n")
+          target.write_text(text)
+          test = Path('test/validation-crlf.test.mjs')
+          assert not test.exists()
+          test.write_text('''import assert from 'node:assert/strict';
+          import test from 'node:test';
+          import { validateSkillText } from '../scripts/lib/validation.mjs';
+
+          const valid = '---\\nname: crlf-skill\\ndescription: Validate portable line endings.\\n---\\n\\n# Instructions\\n';
+          for (const eol of ['\\n', '\\r\\n']) {
+            const source = valid.replaceAll('\\n', eol);
+            test(`Skill frontmatter accepts ${JSON.stringify(eol)} line endings`, () => {
+              assert.deepEqual(validateSkillText(source, 'crlf-skill'), {
+                name: 'crlf-skill', description: 'Validate portable line endings.',
+              });
+            });
+            test(`Skill validation remains strict with ${JSON.stringify(eol)}`, () => {
+              assert.throws(() => validateSkillText(source, 'another-skill'), /must equal/);
+              assert.throws(() => validateSkillText(source.replace('---' + eol, ''), 'crlf-skill'), /frontmatter is required/);
+              assert.throws(() => validateSkillText(source.replace(eol + '---' + eol, eol), 'crlf-skill'), /not closed/);
+              assert.throws(() => validateSkillText(source.replace(/# Instructions[\\r\\n]*$/, ''), 'crlf-skill'), /instructions are required/);
+            });
+          }
+          ''')
+          PY
+          node --test test/validation.test.mjs test/validation-crlf.test.mjs
+          npm run validate
+          git diff --check
+          test "$(git diff --name-only)" = scripts/lib/validation.mjs
+          test "$(git ls-files --others --exclude-standard)" = test/validation-crlf.test.mjs
+      - name: Publish the code-only correction to the author-owned candidate
+        shell: bash
+        env:
+          PUSH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/empty-hooks"
+          git config core.hooksPath "$RUNNER_TEMP/empty-hooks"
+          git config user.name 'Hong Liu'
+          git config user.email '88263959+Hylouis233@users.noreply.github.com'
+          git add scripts/lib/validation.mjs test/validation-crlf.test.mjs
+          git commit -m 'fix: validate Skill frontmatter after Windows CRLF checkout' -m 'Normalize CRLF only, with LF/CRLF positive cases and negative cases for missing delimiters, mismatched names, and missing instructions. Keep all validation and containment checks enabled.'
+          git log -1 --format='%H %T'
+          auth=$(printf 'x-access-token:%s' "$PUSH_TOKEN" | base64 -w0)
+          echo "::add-mask::$auth"
+          git -c http.https://github.com/.extraheader="AUTHORIZATION: basic $auth" push origin HEAD:refs/heads/audit/bridge-repair-20260911
+          unset auth PUSH_TOKEN
