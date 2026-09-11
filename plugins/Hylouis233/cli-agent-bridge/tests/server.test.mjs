@@ -810,10 +810,21 @@ test("a controller cannot terminate again after runCommand settles", async () =>
 });
 
 test("Windows Job runner contains launch and preserves backend streams and exit code", {
+  timeout: 180_000,
   skip: process.platform !== "win32" ? "Windows Job Object runner" : false,
 }, async (context) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "cli-agent-job-runner-test-"));
   context.after(() => rm(root, { recursive: true, force: true }));
+  // This test checks containment, argv, streams, and exit semantics, not a
+  // five-second startup SLO. Cold Windows PowerShell startup can consume that
+  // artificial budget even on the unmodified implementation. Use runCommand's
+  // bounded default here; dedicated deadline/cancellation tests keep theirs.
+  const runSmokeCommand = async (command, args, options) => {
+    const result = await runCommand(command, args, options);
+    assert.equal(result.timedOut, false,
+      "semantic smoke command timed out: " + path.basename(command) + " " + JSON.stringify(result));
+    return result;
+  };
   const backend = path.join(root, "backend-fixture.cmd");
   await writeFile(path.join(root, "powershell.exe"), "workspace shadow must not execute\n");
   await writeFile(backend, [
@@ -823,8 +834,8 @@ test("Windows Job runner contains launch and preserves backend streams and exit 
     "exit /b 37",
     "",
   ].join("\r\n"));
-  const result = await runCommand(backend, [], {
-    cwd: root, manageProcessTree: true, timeoutMs: 5_000,
+  const result = await runSmokeCommand(backend, [], {
+    cwd: root, manageProcessTree: true,
   });
   assert.equal(result.exitCode, 37, JSON.stringify(result));
   assert.match(result.stdout, /job-stdout-ok/u);
@@ -832,9 +843,9 @@ test("Windows Job runner contains launch and preserves backend streams and exit 
   assert.equal(result.treeTerminated, true);
 
   const exactArgument = "任务 \"quoted\" % (x) & caret^";
-  const exact = await runCommand(process.execPath, [
+  const exact = await runSmokeCommand(process.execPath, [
     "-e", "process.stdout.write(process.argv[1])", exactArgument,
-  ], { cwd: root, manageProcessTree: true, timeoutMs: 5_000 });
+  ], { cwd: root, manageProcessTree: true });
   assert.equal(exact.exitCode, 0, JSON.stringify(exact));
   assert.equal(exact.stdout, exactArgument,
     "the PowerShell containment layer must preserve UTF-8 and option-like task text exactly");
@@ -845,8 +856,8 @@ test("Windows Job runner contains launch and preserves backend streams and exit 
     "[Console]::Out.Write($Value)",
     "",
   ].join("\r\n"));
-  const fallbackExact = await runCommand(scriptBackend, [exactArgument], {
-    cwd: root, manageProcessTree: true, timeoutMs: 5_000,
+  const fallbackExact = await runSmokeCommand(scriptBackend, [exactArgument], {
+    cwd: root, manageProcessTree: true,
   });
   assert.equal(fallbackExact.exitCode, 0, JSON.stringify(fallbackExact));
   assert.equal(fallbackExact.stdout, exactArgument,
@@ -881,8 +892,8 @@ test("Windows Job runner contains launch and preserves backend streams and exit 
   const exactArguments = [
     "", " ", exactArgument, "tail\\", "two\\\\", "line1\nline2", "crlf1\r\ncrlf2", "汉🙂",
   ];
-  const shimExact = await runCommand(cmdShim, exactArguments, {
-    cwd: root, manageProcessTree: true, timeoutMs: 5_000,
+  const shimExact = await runSmokeCommand(cmdShim, exactArguments, {
+    cwd: root, manageProcessTree: true,
   });
   assert.equal(shimExact.exitCode, 0, JSON.stringify(shimExact));
   assert.deepEqual(JSON.parse(shimExact.stdout), exactArguments,
@@ -891,8 +902,8 @@ test("Windows Job runner contains launch and preserves backend streams and exit 
   const adjacentNode = path.join(root, "node.exe");
   await copyFile(process.execPath, adjacentNode);
   await writeFile(argvFixture, "process.stdout.write(process.execPath);\n");
-  const adjacentRuntime = await runCommand(cmdShim, [], {
-    cwd: root, manageProcessTree: true, timeoutMs: 5_000,
+  const adjacentRuntime = await runSmokeCommand(cmdShim, [], {
+    cwd: root, manageProcessTree: true,
   });
   assert.equal(adjacentRuntime.exitCode, 0, JSON.stringify(adjacentRuntime));
   assert.equal(
@@ -906,8 +917,8 @@ test("Windows Job runner contains launch and preserves backend streams and exit 
   assert.equal(actualRuntimeStat.ino, expectedRuntimeStat.ino,
     "short/long path aliases must identify the same runtime file, not merely similar names");
 
-  const customCmd = await runCommand(backend, [exactArgument], {
-    cwd: root, manageProcessTree: true, timeoutMs: 5_000,
+  const customCmd = await runSmokeCommand(backend, [exactArgument], {
+    cwd: root, manageProcessTree: true,
   });
   assert.equal(customCmd.exitCode, 127, JSON.stringify(customCmd));
   assert.match(customCmd.stderr, /non-standard \.cmd\/\.bat backend/iu);
@@ -918,8 +929,8 @@ test("Windows Job runner contains launch and preserves backend streams and exit 
     "exit 37",
     "",
   ].join("\r\n"));
-  const errorResult = await runCommand(errorBackend, [], {
-    cwd: root, manageProcessTree: true, timeoutMs: 5_000,
+  const errorResult = await runSmokeCommand(errorBackend, [], {
+    cwd: root, manageProcessTree: true,
   });
   assert.equal(errorResult.exitCode, 37, JSON.stringify(errorResult));
   assert.match(errorResult.stderr, /fixture-nonterminating-error/iu);
@@ -930,8 +941,8 @@ test("Windows Job runner contains launch and preserves backend streams and exit 
     "[Console]::Out.Write('handled')",
     "",
   ].join("\r\n"));
-  const handledResult = await runCommand(handledNativeFailure, [], {
-    cwd: root, manageProcessTree: true, timeoutMs: 5_000,
+  const handledResult = await runSmokeCommand(handledNativeFailure, [], {
+    cwd: root, manageProcessTree: true,
   });
   assert.equal(handledResult.exitCode, 0, JSON.stringify(handledResult));
   assert.equal(handledResult.stdout, "handled",
@@ -939,23 +950,23 @@ test("Windows Job runner contains launch and preserves backend streams and exit 
 
   const throwingBackend = path.join(root, "throwing-backend.ps1");
   await writeFile(throwingBackend, "throw 'fixture-terminating-error'\r\n");
-  const throwingResult = await runCommand(throwingBackend, [], {
-    cwd: root, manageProcessTree: true, timeoutMs: 5_000,
+  const throwingResult = await runSmokeCommand(throwingBackend, [], {
+    cwd: root, manageProcessTree: true,
   });
   assert.equal(throwingResult.exitCode, 127, JSON.stringify(throwingResult));
   assert.match(throwingResult.stderr, /fixture-terminating-error/iu);
 
   const invalidMarker = path.join(root, "invalid-argv-started.txt");
-  const invalidArgument = await runCommand(process.execPath, [
+  const invalidArgument = await runSmokeCommand(process.execPath, [
     "-e", `require('node:fs').writeFileSync(${JSON.stringify(invalidMarker)}, 'started')`,
     "A\0B", "tail",
-  ], { cwd: root, manageProcessTree: true, timeoutMs: 5_000 });
+  ], { cwd: root, manageProcessTree: true });
   assert.equal(invalidArgument.exitCode, 127, JSON.stringify(invalidArgument));
   assert.match(invalidArgument.stderr, /invalid process-tree runner command/iu);
   await assert.rejects(access(invalidMarker), /ENOENT/u);
 
-  const earlyExit = await runCommand(process.execPath, ["-e", "process.exit(0)"], {
-    cwd: root, manageProcessTree: true, stdinText: "x".repeat(1_000_000), timeoutMs: 5_000,
+  const earlyExit = await runSmokeCommand(process.execPath, ["-e", "process.exit(0)"], {
+    cwd: root, manageProcessTree: true, stdinText: "x".repeat(1_000_000),
   });
   assert.equal(earlyExit.exitCode, 0, JSON.stringify(earlyExit));
 

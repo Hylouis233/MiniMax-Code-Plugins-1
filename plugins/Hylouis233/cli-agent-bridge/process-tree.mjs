@@ -492,6 +492,7 @@ async function linuxTrackedProcessSnapshot(
       if (!expected) treeState.knownStarts.set(marked.pid, marked.startIdentity);
       enqueue(marked.pid);
     }
+    return markedProcesses;
   };
   for (let index = 0; index < queue.length; index += 1) {
     const { pid, parentPid, parentStartIdentity } = queue[index];
@@ -517,11 +518,33 @@ async function linuxTrackedProcessSnapshot(
       if (pid === rootPid) await enqueueMarkedProcesses();
       continue;
     }
-    if (parentPid !== null && (item.parentPid !== parentPid ||
-        !parentStartIdentity || BigInt(item.startIdentity) < BigInt(parentStartIdentity))) {
+    if (parentPid !== null &&
+        (!parentStartIdentity || BigInt(item.startIdentity) < BigInt(parentStartIdentity))) {
       treeState.processIdentityUncertain = true;
       await enqueueMarkedProcesses();
       continue;
+    }
+    if (parentPid !== null && item.parentPid !== parentPid) {
+      // The verified parent can exit after its final stat read but before the
+      // child is inspected. Recover that child only through the independent
+      // run-marker proof already used for detached descendants. Never clear
+      // prior uncertainty or trust a changed PPID by itself.
+      const marked = await enqueueMarkedProcesses({ stable: true });
+      if (!marked?.some((candidate) =>
+        candidate.pid === pid && candidate.startIdentity === item.startIdentity)) {
+        treeState.processIdentityUncertain = true;
+        continue;
+      }
+      let confirmed;
+      try { confirmed = await readLinuxStat(pid, procRoot, fsOps); }
+      catch { return null; }
+      if (confirmed === undefined) continue;
+      if (confirmed === null) return null;
+      if (confirmed.startIdentity !== item.startIdentity) {
+        treeState.processIdentityUncertain = true;
+        continue;
+      }
+      item = confirmed;
     }
     treeState.knownPids.add(pid);
     if (item.startIdentity) treeState.knownStarts.set(pid, item.startIdentity);
