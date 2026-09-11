@@ -68,6 +68,9 @@ export function validatePluginManifest(value, label = 'plugin.json') {
 }
 
 export function validateSkillText(text, expectedName, label = 'SKILL.md') {
+  // Git for Windows may check out valid Skill files with CRLF line endings.
+  // Normalize only CRLF; retain all frontmatter, name, and body validation.
+  text = text.replace(/\r\n/gu, '\n');
   assert(text.startsWith('---\n'), `${label}: YAML frontmatter is required`);
   const end = text.indexOf('\n---\n', 4);
   assert(end > 4, `${label}: YAML frontmatter is not closed`);
