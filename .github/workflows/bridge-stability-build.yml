@@ -1,0 +1,146 @@
+name: Bridge reparenting stability validation
+on:
+  push:
+    branches: [audit/bridge-stability-20260911]
+    paths: [.github/workflows/bridge-stability-build.yml]
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  validate:
+    if: github.repository == 'Hylouis233/MiniMax-Code-Plugins-1' && github.actor == 'Hylouis233'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Prepare the exact two-file candidate
+        run: |
+          set -euo pipefail
+          git show HEAD:.github/maintenance/bridge-reparent-race.patch > "$RUNNER_TEMP/repair.patch"
+          git config core.autocrlf false
+          git -c core.hooksPath=/dev/null checkout --detach 53b51f22a5b8af235183b2eb10ae89cf112b646f
+          git checkout-index --all --force
+          git apply --check "$RUNNER_TEMP/repair.patch"
+          git apply "$RUNNER_TEMP/repair.patch"
+          git add -- plugins/Hylouis233/cli-agent-bridge/process-tree.mjs plugins/Hylouis233/cli-agent-bridge/tests/process-tree.test.mjs
+          test "$(git write-tree)" = c72e5b43d7c087fc35bd63abfdc498ab975446ee
+          git diff --cached --check
+          git write-tree > candidate-tree.txt
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Prove the new regression cases fail on the unmodified implementation
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          target=plugins/Hylouis233/cli-agent-bridge/process-tree.mjs
+          cp "$target" "$RUNNER_TEMP/candidate-process-tree.mjs"
+          git show HEAD:"$target" > "$target"
+          set +e
+          node --test plugins/Hylouis233/cli-agent-bridge/tests/process-tree.test.mjs > baseline-regressions.tap 2>&1
+          code=$?
+          set -e
+          cp "$RUNNER_TEMP/candidate-process-tree.mjs" "$target"
+          test "$code" -eq 1
+          grep -q '^# fail 2$' baseline-regressions.tap
+          grep -q 'not ok.*marker-verified child reparented after parent validation' baseline-regressions.tap
+          grep -q 'not ok.*verified child exiting before enrollment' baseline-regressions.tap
+      - name: Run all process identity and reparenting regressions
+        run: |
+          set -euo pipefail
+          node --test plugins/Hylouis233/cli-agent-bridge/tests/process-tree.test.mjs 2>&1 | tee process-regressions.tap
+      - name: Complete unmodified root test command on Linux
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          npm run check 2>&1 | tee full-suite.tap
+      - name: Complete four-file bridge suite on Windows
+        if: runner.os == 'Windows'
+        run: |
+          set -euo pipefail
+          npm run validate
+          node --test --test-concurrency=1 \
+            plugins/Hylouis233/cli-agent-bridge/tests/process-tree.test.mjs \
+            plugins/Hylouis233/cli-agent-bridge/tests/server.test.mjs \
+            plugins/Hylouis233/cli-agent-bridge/tests/workspace-lock.test.mjs \
+            plugins/Hylouis233/cli-agent-bridge/test/server.test.mjs \
+            2>&1 | tee full-suite.tap
+      - name: Repeat the historical Linux failing cases without changing expectations
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          for i in 1 2 3; do
+            node --test --test-name-pattern='a worker commit reachable only through a new tag remains attributed|a cross-process lock waiter obeys the delegation deadline' \
+              plugins/Hylouis233/cli-agent-bridge/tests/server.test.mjs 2>&1 | tee "focused-${i}.tap"
+          done
+      - name: Verify the final tested tracked tree
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          test "$(git write-tree)" = c72e5b43d7c087fc35bd63abfdc498ab975446ee
+      - name: Preserve exact-tree test evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: bridge-stability-${{ matrix.os }}
+          path: |
+            candidate-tree.txt
+            baseline-regressions.tap
+            process-regressions.tap
+            full-suite.tap
+            focused-*.tap
+          retention-days: 7
+          if-no-files-found: error
+  publish:
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Publish only the verified candidate branch
+        env:
+          PUSH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git show HEAD:.github/maintenance/bridge-reparent-race.patch > "$RUNNER_TEMP/repair.patch"
+          git -c core.hooksPath=/dev/null checkout --detach 53b51f22a5b8af235183b2eb10ae89cf112b646f
+          git apply "$RUNNER_TEMP/repair.patch"
+          git add -- plugins/Hylouis233/cli-agent-bridge/process-tree.mjs plugins/Hylouis233/cli-agent-bridge/tests/process-tree.test.mjs
+          test "$(git write-tree)" = c72e5b43d7c087fc35bd63abfdc498ab975446ee
+          git diff --cached --check
+          git config user.name 'Hong Liu'
+          git config user.email '88263959+Hylouis233@users.noreply.github.com'
+          git config core.hooksPath /dev/null
+          git commit -m 'fix: recover independently verified Linux reparenting races' -m 'Require two stable marker scans and a final immutable start-identity recheck. Preserve prior uncertainty and fail closed on absent markers or recycled PIDs. Add seven deterministic regression cases; leave Windows containment and root concurrency unchanged.'
+          auth=$(printf 'x-access-token:%s' "$PUSH_TOKEN" | base64 -w0)
+          echo "::add-mask::$auth"
+          ref=refs/heads/audit/bridge-stability-candidate-20260911
+          current=$(git -c http.https://github.com/.extraheader="AUTHORIZATION: basic $auth" ls-remote origin "$ref" | cut -f1)
+          test "$current" = 53b51f22a5b8af235183b2eb10ae89cf112b646f
+          git -c http.https://github.com/.extraheader="AUTHORIZATION: basic $auth" push origin "HEAD:$ref"
+          unset auth PUSH_TOKEN
+          git rev-parse HEAD HEAD^{tree} > candidate-commit.txt
+          cat candidate-commit.txt >> "$GITHUB_STEP_SUMMARY"
+          echo 'Candidate only; no contribution-branch update, merge, release, or deployment.' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: bridge-stability-candidate-commit
+          path: candidate-commit.txt
+          retention-days: 7
+          if-no-files-found: error
