@@ -1,0 +1,38 @@
+name: Plugin repair audit 2026-09-11
+
+on:
+  push:
+    branches: [audit/plugin-validation-20260911]
+
+permissions:
+  contents: read
+
+jobs:
+  source-bundle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Capture public contribution and upstream refs
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin \
+            refs/heads/plugin/cli-agent-bridge:refs/audit/bridge \
+            refs/heads/plugin/document-skills:refs/audit/documents
+          git fetch --no-tags https://github.com/MiniMax-AI/MiniMax-Code-Plugins.git \
+            refs/heads/main:refs/audit/upstream
+          git for-each-ref --format='%(refname) %(objectname)' refs/audit > audit-refs.txt
+          git bundle create plugin-audit.bundle refs/audit/bridge refs/audit/documents refs/audit/upstream
+          git bundle verify plugin-audit.bundle
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: plugin-audit-source
+          path: |
+            plugin-audit.bundle
+            audit-refs.txt
+          if-no-files-found: error
+          retention-days: 3
