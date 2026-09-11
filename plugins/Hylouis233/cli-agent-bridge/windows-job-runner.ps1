@@ -7,7 +7,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-Add-Type -TypeDefinition @'
+# Avoid unqualified command discovery under the deliberately restricted
+# configuration-reader control environment. Keep that environment restricted;
+# identify the built-in module rather than restoring ambient search paths.
+Microsoft.PowerShell.Utility\Add-Type -TypeDefinition @'
 using System;
 using System.ComponentModel;
 using System.Runtime.InteropServices;

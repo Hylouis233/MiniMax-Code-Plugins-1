@@ -248,6 +248,8 @@ test("delegated workers ignore inherited Git routing while preserving authentica
     commitMessage: "commit in requested workspace",
     environmentFile,
   }));
+  assert.ok(response.result?.structuredContent,
+    JSON.stringify({ response, stderr: client.stderr }));
   const out = response.result.structuredContent;
   assert.equal(out.ok, true, JSON.stringify(out));
   assert.match(out.commits.log, /commit in requested workspace/u);
@@ -894,10 +896,15 @@ test("Windows Job runner contains launch and preserves backend streams and exit 
   });
   assert.equal(adjacentRuntime.exitCode, 0, JSON.stringify(adjacentRuntime));
   assert.equal(
-    path.normalize(adjacentRuntime.stdout).toLowerCase(),
+    path.normalize(await realpath(adjacentRuntime.stdout)).toLowerCase(),
     path.normalize(await realpath(adjacentNode)).toLowerCase(),
     "a standard npm shim must honor its adjacent node.exe runtime",
   );
+  const actualRuntimeStat = await stat(adjacentRuntime.stdout, { bigint: true });
+  const expectedRuntimeStat = await stat(adjacentNode, { bigint: true });
+  assert.equal(actualRuntimeStat.dev, expectedRuntimeStat.dev);
+  assert.equal(actualRuntimeStat.ino, expectedRuntimeStat.ino,
+    "short/long path aliases must identify the same runtime file, not merely similar names");
 
   const customCmd = await runCommand(backend, [exactArgument], {
     cwd: root, manageProcessTree: true, timeoutMs: 5_000,
@@ -1537,9 +1544,18 @@ test("Windows config reader termination closes real named-pipe I/O", {
     pipeServer.once("error", reject);
     pipeServer.listen(pipePath, resolve);
   });
-  const nextConnection = () => queued.length > 0
-    ? Promise.resolve(queued.shift())
-    : new Promise((resolve) => waiters.push(resolve));
+  const nextConnection = () => {
+    if (queued.length > 0) return Promise.resolve(queued.shift());
+    return new Promise((resolve, reject) => {
+      const waiter = (socket) => { clearTimeout(timer); resolve(socket); };
+      const timer = setTimeout(() => {
+        const index = waiters.indexOf(waiter);
+        if (index !== -1) waiters.splice(index, 1);
+        reject(new Error("configuration helper did not connect to the named pipe within 15 seconds"));
+      }, 15_000);
+      waiters.push(waiter);
+    });
+  };
   const waitForSocketClose = async (socket, label) => {
     if (!socket.destroyed) {
       let timer;
