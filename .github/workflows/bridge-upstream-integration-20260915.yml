@@ -1,0 +1,124 @@
+name: Bridge current upstream integration
+
+on:
+  push:
+    branches: [audit/bridge-upstream-integration-20260915]
+    paths: [.github/workflows/bridge-upstream-integration-20260915.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bridge-upstream-integration-20260915
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: github.repository == 'Hylouis233/MiniMax-Code-Plugins-1'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Preserve repository byte identity across platforms
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: a3aa17c5a58b95e4b1a37bc603f4bff6ea5453a9
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Construct the exact integration tree without publishing a merge
+        env:
+          GIT_TERMINAL_PROMPT: '0'
+        run: |
+          set -euo pipefail
+          source=a3aa17c5a58b95e4b1a37bc603f4bff6ea5453a9
+          upstream=2c4e2e66c19c2ddfce9bf5fac479e518f2365788
+          test "$(git rev-parse HEAD)" = "$source"
+          test -z "$(git status --porcelain)"
+          git -c credential.helper= fetch --no-tags --no-recurse-submodules https://github.com/MiniMax-AI/MiniMax-Code-Plugins.git "$upstream"
+          test "$(git rev-parse FETCH_HEAD)" = "$upstream"
+          test "$(git merge-base HEAD "$upstream")" = dda9e0b4e72e0fc4ff10c7cf938e89a732d25f2c
+          git config user.name 'Hong Liu'
+          git config user.email '88263959+Hylouis233@users.noreply.github.com'
+          git -c core.hooksPath=/dev/null merge --no-commit --no-ff "$upstream"
+          git diff --exit-code
+          git diff --cached --check "$upstream"
+          export EVIDENCE_DIR="$RUNNER_TEMP/bridge-upstream-evidence"
+          mkdir -p "$EVIDENCE_DIR"
+          python - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          def git(*args):
+              return subprocess.check_output(['git', *args], text=True).strip()
+          source = 'a3aa17c5a58b95e4b1a37bc603f4bff6ea5453a9'
+          upstream = '2c4e2e66c19c2ddfce9bf5fac479e518f2365788'
+          root = Path(os.environ['EVIDENCE_DIR'])
+          expected = sorted('plugins/Hylouis233/cli-agent-bridge/' + path for path in (
+              'process-tree.mjs', 'tests/process-tree.test.mjs', 'tests/server.test.mjs', 'tests/workspace-lock.test.mjs'))
+          actual = sorted(git('diff', '--cached', '--name-only', upstream).splitlines())
+          assert actual == expected, actual
+          tree = git('write-tree')
+          plugin = git('rev-parse', tree + ':plugins/Hylouis233/cli-agent-bridge')
+          assert plugin == git('rev-parse', source + ':plugins/Hylouis233/cli-agent-bridge')
+          evidence = {'source': source, 'upstream': upstream, 'merge_tree': tree,
+                      'plugin_tree': plugin, 'changed_files_from_upstream': actual,
+                      'runner_os': os.environ['RUNNER_OS'], 'workflow_sha': os.environ['GITHUB_SHA']}
+          (root/'identity.json').write_text(json.dumps(evidence, indent=2)+'\n', encoding='utf-8')
+          (root/'proposed.patch').write_bytes(subprocess.check_output(['git','diff','--cached',upstream,'--',*actual]))
+          print(json.dumps(evidence, indent=2))
+          PY
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install the unchanged locked dependencies
+        run: |
+          set -euo pipefail
+          node --version | tee "$RUNNER_TEMP/bridge-upstream-evidence/node-version.txt"
+          npm ci 2>&1 | tee "$RUNNER_TEMP/bridge-upstream-evidence/npm-ci.log"
+      - name: Run the unchanged official root check on Linux
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          npm run check 2>&1 | tee "$RUNNER_TEMP/bridge-upstream-evidence/root-check.log"
+      - name: Run the official Windows validation and complete bridge suite
+        if: runner.os == 'Windows'
+        run: |
+          set -euo pipefail
+          npm run validate 2>&1 | tee "$RUNNER_TEMP/bridge-upstream-evidence/windows-validate.log"
+          node --test --test-concurrency=1 \
+            plugins/Hylouis233/cli-agent-bridge/tests/process-tree.test.mjs \
+            plugins/Hylouis233/cli-agent-bridge/tests/server.test.mjs \
+            plugins/Hylouis233/cli-agent-bridge/tests/workspace-lock.test.mjs \
+            plugins/Hylouis233/cli-agent-bridge/test/server.test.mjs \
+            2>&1 | tee "$RUNNER_TEMP/bridge-upstream-evidence/windows-bridge.tap"
+      - name: Verify that tests did not change the candidate
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          export EVIDENCE_DIR="$RUNNER_TEMP/bridge-upstream-evidence"
+          python - <<'PY'
+          import hashlib, json, os, subprocess
+          from pathlib import Path
+          root = Path(os.environ['EVIDENCE_DIR'])
+          evidence = json.loads((root/'identity.json').read_text())
+          tree = subprocess.check_output(['git','write-tree'],text=True).strip()
+          assert tree == evidence['merge_tree']
+          (root/'checks-completed.txt').write_text('All applicable checks completed; candidate unchanged.\n', encoding='utf-8')
+          lines = [hashlib.sha256(p.read_bytes()).hexdigest()+'  '+p.name for p in sorted(root.iterdir()) if p.is_file() and p.name != 'SHA256SUMS']
+          (root/'SHA256SUMS').write_text('\n'.join(lines)+'\n', encoding='utf-8')
+          PY
+      - name: Preserve complete evidence including any failure
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: bridge-upstream-integration-${{ matrix.os }}
+          path: ${{ runner.temp }}/bridge-upstream-evidence/
+          retention-days: 14
+          if-no-files-found: error
