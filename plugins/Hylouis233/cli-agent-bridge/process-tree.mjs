@@ -492,6 +492,7 @@ async function linuxTrackedProcessSnapshot(
       if (!expected) treeState.knownStarts.set(marked.pid, marked.startIdentity);
       enqueue(marked.pid);
     }
+    return markedProcesses;
   };
   for (let index = 0; index < queue.length; index += 1) {
     const { pid, parentPid, parentStartIdentity } = queue[index];
@@ -517,11 +518,33 @@ async function linuxTrackedProcessSnapshot(
       if (pid === rootPid) await enqueueMarkedProcesses();
       continue;
     }
-    if (parentPid !== null && (item.parentPid !== parentPid ||
-        !parentStartIdentity || BigInt(item.startIdentity) < BigInt(parentStartIdentity))) {
+    if (parentPid !== null &&
+        (!parentStartIdentity || BigInt(item.startIdentity) < BigInt(parentStartIdentity))) {
       treeState.processIdentityUncertain = true;
       await enqueueMarkedProcesses();
       continue;
+    }
+    if (parentPid !== null && item.parentPid !== parentPid) {
+      // An exited parent may still have its original identity in /proc as a
+      // zombie, even though its child has already been reparented. Recover only
+      // through independent, stable run-marker evidence; changed PPID alone is
+      // not ownership proof and prior uncertainty must remain sticky.
+      const marked = await enqueueMarkedProcesses({ stable: true });
+      if (!marked?.some(candidate =>
+        candidate.pid === pid && candidate.startIdentity === item.startIdentity)) {
+        treeState.processIdentityUncertain = true;
+        continue;
+      }
+      let confirmed;
+      try { confirmed = await readLinuxStat(pid, procRoot, fsOps); }
+      catch { return null; }
+      if (confirmed === undefined) continue;
+      if (confirmed === null) return null;
+      if (confirmed.startIdentity !== item.startIdentity) {
+        treeState.processIdentityUncertain = true;
+        continue;
+      }
+      item = confirmed;
     }
     treeState.knownPids.add(pid);
     if (item.startIdentity) treeState.knownStarts.set(pid, item.startIdentity);

@@ -1116,3 +1116,110 @@ test("Linux early child binding rejects a parent whose PID identity changed", as
   assert.equal(state.knownStarts.get(200), undefined);
   assert.equal(state.processIdentityUncertain, true);
 });
+
+function reparentedZombieFixture({ marker = "owned-run", mutation, uncertain = false } = {}) {
+  const directory = pid => ({ name: String(pid), isDirectory: () => true });
+  let parentExited = false;
+  let markerScans = 0;
+  let environmentRead = false;
+  let stableScanFinished = false;
+  const treeState = {
+    knownPids: new Set([100]), knownStarts: new Map([[100, "10"]]), runMarker: "owned-run",
+    ...(uncertain ? { processIdentityUncertain: true } : {}),
+  };
+  const fsOps = {
+    readdir: async target => {
+      if (target === "/fixture-proc/100/task") return [directory(100)];
+      if (target === "/fixture-proc/200/task") return [directory(200)];
+      if (target === "/fixture-proc") {
+        markerScans += 1;
+        environmentRead = false;
+        return [directory(200)];
+      }
+      throw missingProcessError();
+    },
+    readFile: async target => {
+      if (target === "/fixture-proc/100/stat") {
+        // Reparenting happens at exit, before the original parent is reaped.
+        return procStatLine(100, {
+          state: parentExited ? "Z" : "S", parent: 1, group: 100, startIdentity: 10,
+        });
+      }
+      if (target === "/fixture-proc/100/task/100/children") return "200\n";
+      if (target === "/fixture-proc/200/stat") {
+        parentExited = true;
+        if (stableScanFinished && mutation === "exit-after-scans") throw missingProcessError();
+        const reused = (mutation === "reuse-during-scan" && environmentRead) ||
+          (mutation === "reuse-after-scans" && stableScanFinished);
+        const result = procStatLine(200, { parent: 1, group: 200, startIdentity: reused ? 21 : 20 });
+        if (markerScans === 2 && environmentRead) stableScanFinished = true;
+        return result;
+      }
+      if (target === "/fixture-proc/200/environ") {
+        environmentRead = true;
+        return Buffer.from(`CLI_AGENT_BRIDGE_RUN_ID=${marker}\0`);
+      }
+      if (target === "/fixture-proc/200/task/200/children") return "\n";
+      throw missingProcessError();
+    },
+  };
+  return {
+    treeState,
+    refresh: () => refreshProcessTree({ pid: 100 }, treeState, {
+      platform: "linux", procRoot: "/fixture-proc", fsOps,
+    }),
+    get markerScans() { return markerScans; },
+  };
+}
+
+test("Linux recovers a marked child while its exited parent remains a zombie", async () => {
+  const fixture = reparentedZombieFixture();
+  const snapshot = await fixture.refresh();
+  assert.equal(fixture.treeState.processIdentityUncertain, undefined);
+  assert.equal(fixture.markerScans, 2, "reparent recovery requires consecutive stable marker scans");
+  assert.ok(fixture.treeState.knownPids.has(200));
+  assert.equal(fixture.treeState.knownStarts.get(200), "20");
+  assert.ok(snapshot.some(item => item.pid === 200), "the reparented live child stays observable");
+});
+
+test("Linux zombie-parent recovery rejects a different or unavailable run marker", async () => {
+  for (const marker of ["another-run", undefined]) {
+    const fixture = reparentedZombieFixture({ marker });
+    if (marker === undefined) delete fixture.treeState.runMarker;
+    await fixture.refresh();
+    assert.equal(fixture.treeState.processIdentityUncertain, true);
+    assert.equal(fixture.treeState.knownPids.has(200), false);
+  }
+});
+
+test("Linux zombie-parent recovery rejects PID reuse during marker inspection", async () => {
+  const fixture = reparentedZombieFixture({ mutation: "reuse-during-scan" });
+  await assert.rejects(fixture.refresh(), /identity changed/u);
+  assert.equal(fixture.treeState.processIdentityUncertain, true);
+  assert.equal(fixture.treeState.knownPids.has(200), false);
+});
+
+test("Linux zombie-parent recovery rechecks identity after stable marker scans", async () => {
+  const fixture = reparentedZombieFixture({ mutation: "reuse-after-scans" });
+  const snapshot = await fixture.refresh();
+  assert.equal(fixture.markerScans, 2);
+  assert.equal(fixture.treeState.processIdentityUncertain, true);
+  assert.equal(fixture.treeState.knownPids.has(200), false);
+  assert.equal(fixture.treeState.knownStarts.get(200), "20", "the original identity is immutable");
+  assert.equal(snapshot.some(item => item.pid === 200), false);
+});
+
+test("Linux zombie-parent recovery tolerates a verified child exiting before enrollment", async () => {
+  const fixture = reparentedZombieFixture({ mutation: "exit-after-scans" });
+  const snapshot = await fixture.refresh();
+  assert.equal(fixture.markerScans, 2);
+  assert.equal(fixture.treeState.processIdentityUncertain, undefined);
+  assert.equal(fixture.treeState.knownPids.has(200), false);
+  assert.equal(snapshot.some(item => item.pid === 200), false);
+});
+
+test("Linux zombie-parent recovery never clears prior identity uncertainty", async () => {
+  const fixture = reparentedZombieFixture({ uncertain: true });
+  await fixture.refresh();
+  assert.equal(fixture.treeState.processIdentityUncertain, true);
+});
